@@ -14,7 +14,9 @@ from bot.handlers import (
     start_handler, mode1_handler, mode2_handler, finish_handler,
     media_handler, schedule_handler, cancel_handler, help_handler,
     callback_query_handler, channels_handler, stats_handler, reset_handler,
-    clearqueue_handler, clearscheduled_handler, multibatch_handler, retry_handler
+    clearqueue_handler, clearscheduled_handler, multibatch_handler, retry_handler,
+    bulkedit_handler, recurring_mode_handler as recurring_handler,
+    backup_handler, restore_handler, overdue_handler
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
@@ -43,13 +45,13 @@ def main():
     # Initialize database
     init_database()
     
-    # Create HTTP request with improved connection pooling
+    # Create HTTP request optimized for heavy file uploads
     request = HTTPXRequest(
-        connection_pool_size=20,  # Increased from default 1
-        pool_timeout=30.0,        # Increased from default 1.0
-        read_timeout=30.0,        # Increased from default 5.0
-        write_timeout=30.0,       # Increased from default 5.0
-        connect_timeout=30.0      # Increased from default 5.0
+        connection_pool_size=50,   # Increased for heavy concurrent uploads
+        pool_timeout=120.0,        # Extended timeout for large files
+        read_timeout=300.0,        # 5 minutes for large file downloads
+        write_timeout=300.0,       # 5 minutes for large file uploads
+        connect_timeout=60.0       # 1 minute connection timeout
     )
     
     # Create the Application with custom HTTP request
@@ -70,7 +72,12 @@ def main():
     application.add_handler(CommandHandler("reset", reset_handler))
     application.add_handler(CommandHandler("clearqueue", clearqueue_handler))
     application.add_handler(CommandHandler("clearscheduled", clearscheduled_handler))
+    application.add_handler(CommandHandler("bulkedit", bulkedit_handler))
+    application.add_handler(CommandHandler("recurring", recurring_handler))
+    application.add_handler(CommandHandler("backup", backup_handler))
+    application.add_handler(CommandHandler("restore", restore_handler))
     application.add_handler(CommandHandler("retry", retry_handler))
+    application.add_handler(CommandHandler("overdue", overdue_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(CommandHandler("help", help_handler))
     
