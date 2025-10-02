@@ -33,7 +33,8 @@ def init_database():
             recurring_count INTEGER DEFAULT NULL,
             recurring_posted_count INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            posted_at TIMESTAMP NULL
+            posted_at TIMESTAMP NULL,
+            cleanup_date TIMESTAMP NULL
         )
     ''')
     
@@ -66,6 +67,37 @@ def init_database():
     try:
         cursor.execute('ALTER TABLE posts ADD COLUMN media_type TEXT DEFAULT "photo"')
         logger.info("Added media_type column to posts table")
+    except sqlite3.OperationalError:
+        # Column already exists, this is fine
+        pass
+    
+    # Add cleanup_date column if it doesn't exist (migration)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN cleanup_date TIMESTAMP NULL')
+        logger.info("Added cleanup_date column to posts table")
+    except sqlite3.OperationalError:
+        # Column already exists, this is fine
+        pass
+    
+    # Add retry tracking columns if they don't exist (migration)
+    retry_columns = [
+        ('retry_count', 'INTEGER DEFAULT 0'),
+        ('last_retry_at', 'TEXT'),
+        ('failure_reason', 'TEXT')
+    ]
+    
+    for column_name, column_def in retry_columns:
+        try:
+            cursor.execute(f'ALTER TABLE posts ADD COLUMN {column_name} {column_def}')
+            logger.info(f"Added {column_name} column to posts table")
+        except sqlite3.OperationalError:
+            # Column already exists, this is fine
+            pass
+    
+    # Add media_bundle_json column if it doesn't exist (migration for album support)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN media_bundle_json TEXT')
+        logger.info("Added media_bundle_json column to posts table")
     except sqlite3.OperationalError:
         # Column already exists, this is fine
         pass
@@ -152,17 +184,25 @@ class Database:
     def add_post(user_id: int, file_path: str, media_type: str = 'photo', description: Optional[str] = None, 
                  scheduled_time: Optional[datetime] = None, mode: int = 1, channel_id: Optional[str] = None,
                  is_recurring: bool = False, recurring_interval_hours: Optional[int] = None,
-                 recurring_end_date: Optional[datetime] = None, recurring_count: Optional[int] = None) -> int:
+                 recurring_end_date: Optional[datetime] = None, recurring_count: Optional[int] = None,
+                 media_bundle_json: Optional[str] = None) -> int:
         """Add a new post to the database"""
+        
+        # SECURITY CHECK: Verify user owns the channel before creating the post
+        if channel_id and not Database.user_has_channel(user_id, channel_id):
+            error_msg = f"Security violation: User {user_id} attempted to create post for channel {channel_id} they don't own"
+            logger.error(f"SECURITY ALERT: {error_msg}")
+            raise ValueError("Channel access denied - you don't have permission to post to this channel")
+        
         conn = Database.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             INSERT INTO posts (user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-                             is_recurring, recurring_interval_hours, recurring_end_date, recurring_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, media_bundle_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count))
+              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, media_bundle_json))
         
         post_id = cursor.lastrowid
         conn.commit()
@@ -171,6 +211,36 @@ class Database:
         logger.info(f"Added post {post_id} for user {user_id} (recurring: {is_recurring})")
         return post_id
     
+    @staticmethod
+    def get_post_by_id(post_id: int) -> Optional[Dict]:
+        """Get a complete post by ID"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, 
+                   channel_id, is_recurring, recurring_interval_hours, recurring_end_date, 
+                   recurring_count, media_bundle_json, status, created_at, posted_at, 
+                   batch_id, retry_count, last_retry_at, failure_reason, cleanup_date
+            FROM posts 
+            WHERE id = ?
+        ''', (post_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'id': row[0], 'user_id': row[1], 'file_path': row[2], 'media_type': row[3],
+                'description': row[4], 'scheduled_time': row[5], 'mode': row[6], 
+                'channel_id': row[7], 'is_recurring': row[8], 'recurring_interval_hours': row[9],
+                'recurring_end_date': row[10], 'recurring_count': row[11], 'media_bundle_json': row[12],
+                'status': row[13], 'created_at': row[14], 'posted_at': row[15], 'batch_id': row[16],
+                'retry_count': row[17], 'last_retry_at': row[18], 'failure_reason': row[19], 
+                'cleanup_date': row[20]
+            }
+        return None
+
     @staticmethod
     def get_pending_posts(user_id: Optional[int] = None, channel_id: Optional[str] = None, unscheduled_only: bool = False) -> List[Dict]:
         """Get all pending posts, optionally filtered by user, channel, or unscheduled status"""
@@ -196,7 +266,7 @@ class Database:
         
         cursor.execute(f'''
             SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-                   is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, recurring_posted_count
+                   is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, recurring_posted_count, media_bundle_json
             FROM posts 
             WHERE {where_clause}
             ORDER BY scheduled_time ASC
@@ -217,7 +287,8 @@ class Database:
                 'recurring_interval_hours': row[9],
                 'recurring_end_date': datetime.fromisoformat(row[10]) if row[10] else None,
                 'recurring_count': row[11],
-                'recurring_posted_count': row[12] or 0
+                'recurring_posted_count': row[12] or 0,
+                'media_bundle_json': row[13]
             })
         
         conn.close()
@@ -241,21 +312,21 @@ class Database:
         logger.info(f"Marked post {post_id} as posted")
     
     @staticmethod
-    def mark_post_as_failed(post_id: int):
+    def mark_post_as_failed(post_id: int, failure_reason: Optional[str] = None):
         """Mark a post as failed"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
             UPDATE posts 
-            SET status = 'failed'
+            SET status = 'failed', failure_reason = ?
             WHERE id = ?
-        ''', (post_id,))
+        ''', (failure_reason, post_id))
         
         conn.commit()
         conn.close()
         
-        logger.warning(f"Marked post {post_id} as failed")
+        logger.warning(f"Marked post {post_id} as failed: {failure_reason}")
     
     @staticmethod
     def get_failed_posts(user_id: int, channel_id: Optional[str] = None) -> List[Dict]:
@@ -299,6 +370,175 @@ class Database:
         return posts
     
     @staticmethod
+    def increment_retry_count(post_id: int) -> int:
+        """Increment retry count for a post and return new count"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE posts 
+            SET retry_count = retry_count + 1, 
+                last_retry_at = ?,
+                status = 'pending'
+            WHERE id = ?
+        ''', (datetime.now().isoformat(), post_id))
+        
+        # Get the new retry count
+        cursor.execute('SELECT retry_count FROM posts WHERE id = ?', (post_id,))
+        result = cursor.fetchone()
+        retry_count = result[0] if result else 0
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
+        return retry_count
+    
+    @staticmethod
+    def get_posts_for_retry(max_retries: int = 3) -> List[Dict]:
+        """Get failed posts that are eligible for retry"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT id, user_id, file_path, media_type, description, scheduled_time, 
+                   mode, channel_id, retry_count, failure_reason
+            FROM posts 
+            WHERE status = 'failed' AND retry_count < ?
+            ORDER BY last_retry_at ASC
+        ''', (max_retries,))
+        
+        posts = []
+        for row in cursor.fetchall():
+            posts.append({
+                'id': row[0],
+                'user_id': row[1],
+                'file_path': row[2],
+                'media_type': row[3] or 'photo',
+                'description': row[4],
+                'scheduled_time': datetime.fromisoformat(row[5]) if row[5] else None,
+                'mode': row[6],
+                'channel_id': row[7],
+                'retry_count': row[8] or 0,
+                'failure_reason': row[9]
+            })
+        
+        conn.close()
+        return posts
+    
+    @staticmethod
+    def reschedule_all_posts_from_today(user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: Optional[str] = None) -> int:
+        """Reschedule all pending posts starting from today with custom hours, interleaving channels"""
+        from .utils import get_kyiv_timezone, calculate_schedule_times
+        from collections import defaultdict
+        
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Get all pending posts for the user with their channel info
+            conditions = ["user_id = ?", "status = 'pending'"]
+            params = [user_id]
+            
+            if channel_id:
+                conditions.append("channel_id = ?")
+                params.append(channel_id)
+            
+            where_clause = " AND ".join(conditions)
+            
+            cursor.execute(f'''
+                SELECT id, channel_id FROM posts 
+                WHERE {where_clause}
+                ORDER BY created_at ASC
+            ''', params)
+            
+            posts_data = cursor.fetchall()
+            
+            if not posts_data:
+                conn.close()
+                return 0
+            
+            # Group posts by channel for simultaneous scheduling
+            posts_by_channel = defaultdict(list)
+            for post_id, channel_id_val in posts_data:
+                posts_by_channel[channel_id_val].append(post_id)
+            
+            # Calculate how many time slots we need (based on max posts per channel)
+            max_posts_per_channel = max(len(posts) for posts in posts_by_channel.values())
+            
+            # Calculate schedule times for the number of time slots we need
+            kyiv_tz = get_kyiv_timezone()
+            current_time = datetime.now(kyiv_tz)
+            
+            # First, try to use remaining slots today
+            next_slot = current_time.replace(minute=0, second=0, microsecond=0)
+            
+            # Find next available slot (round up to next interval)
+            while next_slot <= current_time or next_slot.hour % interval_hours != 0 or next_slot.hour < start_hour or next_slot.hour > end_hour:
+                next_slot += timedelta(hours=1)
+                # If we've gone past end_hour, move to tomorrow's start_hour
+                if next_slot.hour > end_hour:
+                    next_slot = (next_slot + timedelta(days=1)).replace(hour=start_hour, minute=0, second=0, microsecond=0)
+                    break
+            
+            # Start scheduling from the next available slot (today if possible, tomorrow if not)
+            today = next_slot
+            
+            # Generate time slots starting from the next available slot
+            today_naive = today.replace(tzinfo=None)
+            
+            # Use a custom schedule generation that respects our starting point
+            time_slot_times = []
+            current_slot = today
+            
+            for i in range(max_posts_per_channel):
+                time_slot_times.append(current_slot)
+                
+                # Calculate next slot
+                current_slot += timedelta(hours=interval_hours)
+                
+                # If we go past end_hour, move to next day's start_hour
+                if current_slot.hour > end_hour:
+                    days_to_add = 1
+                    current_slot = current_slot.replace(hour=start_hour, minute=0, second=0, microsecond=0) + timedelta(days=days_to_add)
+                    
+                    # Ensure it's on the correct interval
+                    while current_slot.hour % interval_hours != 0 or current_slot.hour < start_hour:
+                        current_slot += timedelta(hours=1)
+            
+            # Already timezone-aware, no need to localize
+            
+            # Schedule all channels simultaneously at each time slot
+            total_posts_scheduled = 0
+            for time_slot_index in range(max_posts_per_channel):
+                scheduled_time = time_slot_times[time_slot_index]
+                
+                # At each time slot, schedule one post from each channel (if available)
+                for channel, posts in posts_by_channel.items():
+                    if time_slot_index < len(posts):
+                        post_id = posts[time_slot_index]
+                        cursor.execute('''
+                            UPDATE posts 
+                            SET scheduled_time = ?, retry_count = 0, failure_reason = NULL
+                            WHERE id = ?
+                        ''', (scheduled_time.isoformat(), post_id))
+                        total_posts_scheduled += 1
+            
+            logger.info(f"Scheduled {total_posts_scheduled} posts across {len(posts_by_channel)} channels for simultaneous posting - all channels post at same time slots")
+            
+            conn.commit()
+            conn.close()
+            
+            logger.info(f"Rescheduled {total_posts_scheduled} posts for user {user_id} starting from {today} with simultaneous channel scheduling")
+            return total_posts_scheduled
+            
+        except Exception as e:
+            logger.error(f"Error rescheduling posts: {e}")
+            conn.rollback()
+            conn.close()
+            return 0
+    
+    @staticmethod
     def get_overdue_posts(user_id: int, channel_id: Optional[str] = None) -> List[Dict]:
         """Get all overdue posts for a user (scheduled time is in the past but status is still pending)"""
         from .utils import get_kyiv_timezone
@@ -324,7 +564,7 @@ class Database:
         where_clause = " AND ".join(conditions)
         
         cursor.execute(f'''
-            SELECT id, file_path, media_type, description, scheduled_time, mode, 
+            SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, 
                    channel_id, created_at, is_recurring
             FROM posts 
             WHERE {where_clause}
@@ -333,9 +573,10 @@ class Database:
         
         posts = []
         for row in cursor.fetchall():
-            post_id, file_path, media_type, description, scheduled_time, mode, channel_id, created_at, is_recurring = row
+            post_id, user_id, file_path, media_type, description, scheduled_time, mode, channel_id, created_at, is_recurring = row
             posts.append({
                 'id': post_id,
+                'user_id': user_id,
                 'file_path': file_path,
                 'media_type': media_type or 'photo',
                 'description': description,
@@ -475,40 +716,6 @@ class Database:
         finally:
             conn.close()
     
-    @staticmethod
-    def get_post_by_id(post_id: int) -> Dict:
-        """Get a single post by its ID"""
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, user_id, file_path, media_type, description, scheduled_time, 
-                   status, mode, channel_id, is_recurring, created_at, posted_at
-            FROM posts 
-            WHERE id = ?
-        ''', (post_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if not row:
-            return None
-            
-        post_id, user_id, file_path, media_type, description, scheduled_time, status, mode, channel_id, is_recurring, created_at, posted_at = row
-        return {
-            'id': post_id,
-            'user_id': user_id,
-            'file_path': file_path,
-            'media_type': media_type or 'photo',
-            'description': description,
-            'scheduled_time': datetime.fromisoformat(scheduled_time) if scheduled_time else None,
-            'status': status,
-            'mode': mode,
-            'channel_id': channel_id,
-            'is_recurring': bool(is_recurring) if is_recurring is not None else False,
-            'created_at': created_at,
-            'posted_at': posted_at
-        }
     
     @staticmethod
     def retry_failed_post(post_id: int) -> bool:
@@ -796,6 +1003,146 @@ class Database:
         return DEFAULT_START_HOUR, DEFAULT_END_HOUR, DEFAULT_INTERVAL_HOURS
     
     @staticmethod
+    def get_reminder_settings(user_id: int) -> Tuple[bool, int, Optional[datetime]]:
+        """Get reminder settings for a user"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT reminder_enabled, reminder_threshold, last_reminder_sent 
+            FROM scheduling_config WHERE user_id = ?
+        ''', (user_id,))
+        
+        settings = cursor.fetchone()
+        conn.close()
+        
+        if settings:
+            enabled, threshold, last_sent = settings
+            last_sent_dt = datetime.fromisoformat(last_sent) if last_sent else None
+            return enabled if enabled is not None else True, threshold if threshold is not None else 5, last_sent_dt
+        else:
+            # Return default values
+            return True, 5, None
+    
+    @staticmethod
+    def update_reminder_settings(user_id: int, enabled: bool = None, threshold: int = None):
+        """Update reminder settings for a user"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        # Get current settings
+        cursor.execute('SELECT user_id FROM scheduling_config WHERE user_id = ?', (user_id,))
+        exists = cursor.fetchone()
+        
+        if exists:
+            # Update existing settings
+            updates = []
+            params = []
+            
+            if enabled is not None:
+                updates.append("reminder_enabled = ?")
+                params.append(enabled)
+            if threshold is not None:
+                updates.append("reminder_threshold = ?")
+                params.append(threshold)
+            
+            if updates:
+                params.append(user_id)
+                query = f"UPDATE scheduling_config SET {', '.join(updates)} WHERE user_id = ?"
+                cursor.execute(query, params)
+        else:
+            # Create new settings with defaults
+            cursor.execute('''
+                INSERT INTO scheduling_config (user_id, reminder_enabled, reminder_threshold)
+                VALUES (?, ?, ?)
+            ''', (user_id, enabled if enabled is not None else True, 
+                  threshold if threshold is not None else 5))
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def update_last_reminder_sent(user_id: int):
+        """Update the timestamp of the last reminder sent"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE scheduling_config 
+            SET last_reminder_sent = ? 
+            WHERE user_id = ?
+        ''', (datetime.now().isoformat(), user_id))
+        
+        conn.commit()
+        conn.close()
+    
+    @staticmethod
+    def get_all_overdue_posts() -> List[dict]:
+        """Get all posts that should have been posted but are still pending (system-wide)"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        # Get posts that are overdue by more than 5 minutes
+        cutoff_time = (datetime.now() - timedelta(minutes=5)).isoformat()
+        
+        cursor.execute('''
+            SELECT id, user_id, scheduled_time, channel_id, description
+            FROM posts
+            WHERE status = 'pending' 
+            AND scheduled_time IS NOT NULL
+            AND scheduled_time < ?
+            AND is_recurring = 0
+        ''', (cutoff_time,))
+        
+        posts = []
+        for row in cursor.fetchall():
+            posts.append({
+                'id': row[0],
+                'user_id': row[1],
+                'scheduled_time': datetime.fromisoformat(row[2]),
+                'channel_id': row[3],
+                'description': row[4]
+            })
+        
+        conn.close()
+        return posts
+    
+    @staticmethod
+    def get_users_for_reminders() -> List[Tuple[int, int]]:
+        """Get all users who have reminder enabled and check their post counts"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        # Get users with reminders enabled
+        cursor.execute('''
+            SELECT sc.user_id, sc.reminder_threshold, sc.last_reminder_sent,
+                   COUNT(p.id) as post_count
+            FROM scheduling_config sc
+            LEFT JOIN posts p ON sc.user_id = p.user_id 
+                AND p.status = 'pending' 
+                AND p.scheduled_time IS NULL
+            WHERE sc.reminder_enabled = 1
+            GROUP BY sc.user_id
+        ''')
+        
+        users_to_remind = []
+        now = datetime.now()
+        
+        for row in cursor.fetchall():
+            user_id, threshold, last_sent, post_count = row
+            # Only remind if post count is below threshold
+            if post_count <= threshold:
+                # Check if we haven't sent a reminder recently (within 24 hours)
+                if last_sent:
+                    last_sent_dt = datetime.fromisoformat(last_sent)
+                    if (now - last_sent_dt).total_seconds() < 86400:  # 24 hours
+                        continue
+                users_to_remind.append((user_id, post_count))
+        
+        conn.close()
+        return users_to_remind
+    
+    @staticmethod
     def add_user_channel(user_id: int, channel_id: str, channel_name: str, is_default: bool = False) -> bool:
         """Add a new channel for a user"""
         conn = Database.get_connection()
@@ -850,8 +1197,42 @@ class Database:
 
     
     @staticmethod
+    def user_has_channel(user_id: int, channel_id: str) -> bool:
+        """Verify that a user owns/has access to a specific channel"""
+        if not channel_id:  # None or empty string
+            return False
+            
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT COUNT(*) FROM user_channels 
+                WHERE user_id = ? AND channel_id = ? AND is_active = TRUE
+            ''', (user_id, channel_id))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            has_channel = bool(result and result[0] > 0)
+            if not has_channel:
+                logger.warning(f"Security check failed: User {user_id} does not have access to channel {channel_id}")
+            
+            return has_channel
+            
+        except Exception as e:
+            logger.error(f"Error checking channel ownership: {e}")
+            conn.close()
+            return False
+    
+    @staticmethod
     def remove_user_channel(user_id: int, channel_id: str) -> bool:
         """Remove a channel for a user"""
+        # Security check: verify user owns the channel before removal
+        if not Database.user_has_channel(user_id, channel_id):
+            logger.error(f"Security violation: User {user_id} attempted to remove channel {channel_id} they don't own")
+            return False
+            
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -1030,20 +1411,18 @@ class Database:
                    uc.channel_name
             FROM posts p
             LEFT JOIN user_channels uc ON p.channel_id = uc.channel_id AND p.user_id = uc.user_id
-            WHERE p.user_id = ? AND p.status = 'pending'
+            WHERE p.user_id = ? AND p.status = 'pending' AND p.scheduled_time IS NOT NULL
             ORDER BY p.scheduled_time ASC
         ''', (user_id,))
         
         posts_by_channel = {}
         for row in cursor.fetchall():
             channel_id = row[5]
-            channel_name = row[10] if row[10] else channel_id
-            channel_key = f"{channel_name} ({channel_id})"
             
-            if channel_key not in posts_by_channel:
-                posts_by_channel[channel_key] = []
+            if channel_id not in posts_by_channel:
+                posts_by_channel[channel_id] = []
             
-            posts_by_channel[channel_key].append({
+            posts_by_channel[channel_id].append({
                 'id': row[0],
                 'file_path': row[1],
                 'media_type': row[2],
@@ -1109,6 +1488,13 @@ class Database:
     @staticmethod
     def create_batch(user_id: int, batch_name: str, channel_id: str) -> int:
         """Create a new post batch"""
+        
+        # SECURITY CHECK: Verify user owns the channel before creating the batch
+        if not Database.user_has_channel(user_id, channel_id):
+            error_msg = f"Security violation: User {user_id} attempted to create batch for channel {channel_id} they don't own"
+            logger.error(f"SECURITY ALERT: {error_msg}")
+            raise ValueError("Channel access denied - you don't have permission to create batches for this channel")
+        
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -1198,14 +1584,28 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        # Get batch info to set channel_id
-        cursor.execute('SELECT channel_id FROM post_batches WHERE id = ?', (batch_id,))
+        # Get batch info and verify user owns the batch
+        cursor.execute('SELECT channel_id, user_id FROM post_batches WHERE id = ?', (batch_id,))
         batch_info = cursor.fetchone()
         if not batch_info:
             conn.close()
             raise ValueError(f"Batch {batch_id} not found")
         
-        channel_id = batch_info[0]
+        channel_id, batch_owner_id = batch_info
+        
+        # SECURITY CHECK: Verify user owns the batch
+        if batch_owner_id != user_id:
+            conn.close()
+            error_msg = f"Security violation: User {user_id} attempted to add post to batch {batch_id} owned by user {batch_owner_id}"
+            logger.error(f"SECURITY ALERT: {error_msg}")
+            raise ValueError("Batch access denied - you don't have permission to add posts to this batch")
+        
+        # Additional security check: Verify user still owns the channel (in case permissions changed)
+        if not Database.user_has_channel(user_id, channel_id):
+            conn.close()
+            error_msg = f"Security violation: User {user_id} attempted to add post to batch {batch_id} for channel {channel_id} they no longer own"
+            logger.error(f"SECURITY ALERT: {error_msg}")
+            raise ValueError("Channel access denied - you no longer have permission to post to this channel")
         
         cursor.execute('''
             INSERT INTO posts (user_id, file_path, media_type, description, mode, channel_id, batch_id)
@@ -1312,6 +1712,48 @@ class Database:
             logger.error(f"Error updating post description for post {post_id}: {e}")
             conn.close()
             return False
+
+    @staticmethod
+    def delete_all_captions(user_id: int) -> int:
+        """Delete all captions (set description to NULL) for all posts of a user
+        
+        Returns:
+            Number of posts that had their captions deleted
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Count posts with captions first
+            cursor.execute('''
+                SELECT COUNT(*) FROM posts 
+                WHERE user_id = ? AND description IS NOT NULL AND description != ''
+            ''', (user_id,))
+            
+            posts_with_captions = cursor.fetchone()[0]
+            
+            if posts_with_captions == 0:
+                conn.close()
+                return 0
+            
+            # Delete all captions for this user
+            cursor.execute('''
+                UPDATE posts 
+                SET description = NULL
+                WHERE user_id = ? AND description IS NOT NULL AND description != ''
+            ''', (user_id,))
+            
+            conn.commit()
+            rows_affected = cursor.rowcount
+            conn.close()
+            
+            logger.info(f"Deleted captions from {rows_affected} posts for user {user_id}")
+            return rows_affected
+                
+        except Exception as e:
+            logger.error(f"Error deleting captions for user {user_id}: {e}")
+            conn.close()
+            return 0
 
     @staticmethod
     def get_channel_posts(user_id: int, channel_id: str) -> List[Dict]:
@@ -1500,6 +1942,34 @@ class Database:
         
         conn.close()
         return posts
+
+    @staticmethod
+    def get_latest_scheduled_time(user_id: int, channel_id: str = None) -> Optional[datetime]:
+        """Get the latest scheduled time for a user's posts, optionally filtered by channel"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        # Build query conditions
+        conditions = ["user_id = ?", "status = 'pending'", "scheduled_time IS NOT NULL"]
+        params = [user_id]
+        
+        if channel_id:
+            conditions.append("channel_id = ?")
+            params.append(channel_id)
+        
+        where_clause = " AND ".join(conditions)
+        
+        cursor.execute(f'''
+            SELECT MAX(scheduled_time) FROM posts 
+            WHERE {where_clause}
+        ''', params)
+        
+        result = cursor.fetchone()[0]
+        conn.close()
+        
+        if result:
+            return datetime.fromisoformat(result)
+        return None
 
     @staticmethod
     def bulk_update_post_schedules(post_schedules: List[tuple]) -> int:

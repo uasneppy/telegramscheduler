@@ -29,9 +29,111 @@ def generate_unique_filename(original_filename: str) -> str:
     unique_id = str(uuid.uuid4())
     return f"{unique_id}{file_extension}"
 
-async def save_media_streaming(telegram_file, filename: str, media_type: str = 'photo') -> str:
+def get_organized_media_path(user_id: int, media_type: str = 'photo') -> tuple[str, str]:
+    """
+    Generate organized path for media storage with date-based folders
+    Returns: (full_path, relative_path_for_db)
+    """
+    current_date = get_current_kyiv_time()
+    year_month = current_date.strftime('%Y-%m')
+    day = current_date.strftime('%d')
+    
+    # Create organized folder structure: uploads/YYYY-MM/DD/user_id/media_type/
+    folder_structure = os.path.join(year_month, day, str(user_id), media_type)
+    full_folder_path = os.path.join(UPLOADS_DIR, folder_structure)
+    
+    # Create directories if they don't exist
+    os.makedirs(full_folder_path, exist_ok=True)
+    
+    return full_folder_path, folder_structure
+
+def cleanup_old_media_files():
+    """
+    Clean up media files that are 7+ days old and have been successfully posted
+    This function should be called periodically
+    """
+    from bot.database import Database
+    
+    current_time = get_current_kyiv_time()
+    cleanup_cutoff = current_time - timedelta(days=7)
+    
+    logger.info(f"Starting media cleanup for files older than {cleanup_cutoff}")
+    
+    # Get all posted files that are ready for cleanup
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, file_path, user_id, media_type, posted_at
+        FROM posts 
+        WHERE status = 'posted' 
+        AND posted_at < ? 
+        AND cleanup_date IS NULL
+    ''', (cleanup_cutoff,))
+    
+    cleanup_candidates = cursor.fetchall()
+    cleaned_count = 0
+    
+    for post_id, file_path, user_id, media_type, posted_at in cleanup_candidates:
+        try:
+            # Check if file exists and delete it
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.info(f"Cleaned up media file: {file_path}")
+                cleaned_count += 1
+            
+            # Mark as cleaned up in database
+            cursor.execute('''
+                UPDATE posts 
+                SET cleanup_date = ? 
+                WHERE id = ?
+            ''', (current_time, post_id))
+            
+        except Exception as e:
+            logger.error(f"Failed to cleanup file {file_path}: {e}")
+    
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"Media cleanup completed: {cleaned_count} files cleaned up")
+    return cleaned_count
+
+async def cleanup_empty_directories(base_path: str = None):
+    """
+    Clean up empty directories in the organized media structure
+    """
+    if base_path is None:
+        base_path = UPLOADS_DIR
+    
+    cleaned_dirs = 0
+    
+    # Walk through directory tree from bottom up
+    for root, dirs, files in os.walk(base_path, topdown=False):
+        for directory in dirs:
+            dir_path = os.path.join(root, directory)
+            try:
+                # Try to remove directory if it's empty
+                if not os.listdir(dir_path):
+                    os.rmdir(dir_path)
+                    logger.info(f"Cleaned up empty directory: {dir_path}")
+                    cleaned_dirs += 1
+            except OSError:
+                # Directory not empty or permission error, skip
+                continue
+    
+    logger.info(f"Directory cleanup completed: {cleaned_dirs} empty directories removed")
+    return cleaned_dirs
+
+async def save_media_streaming(telegram_file, filename: str, media_type: str = 'photo', user_id: int = None) -> str:
     """Stream download and save media directly to disk for heavy files (memory optimized)"""
-    file_path = os.path.join(UPLOADS_DIR, filename)
+    if user_id:
+        # Use organized storage
+        organized_folder, relative_path = get_organized_media_path(user_id, media_type)
+        file_path = os.path.join(organized_folder, filename)
+        logger.info(f"Organized storage path: {relative_path}/{filename}")
+    else:
+        # Fallback to old method
+        file_path = os.path.join(UPLOADS_DIR, filename)
     
     try:
         # Stream download directly to file to avoid loading into memory
@@ -52,17 +154,20 @@ async def save_media_streaming(telegram_file, filename: str, media_type: str = '
             os.remove(file_path)
         raise ValueError(f"Could not download file: {e}")
 
-def save_media(file_data: bytes, filename: str, media_type: str = 'photo') -> str:
+def save_media(file_data: bytes, filename: str, media_type: str = 'photo', user_id: int = None) -> str:
     """Save media data to the uploads directory with optimized heavy file handling (fallback method)"""
-    # File size limit removed for unlimited uploads
-    # if len(file_data) > MAX_FILE_SIZE:
-    #     raise ValueError(f"File size exceeds maximum limit of {MAX_FILE_SIZE} bytes")
-    
     # Log file size for monitoring (but don't restrict)
     file_size_mb = len(file_data) / (1024 * 1024)
     logger.info(f"Processing {media_type} file: {file_size_mb:.2f} MB")
     
-    file_path = os.path.join(UPLOADS_DIR, filename)
+    if user_id:
+        # Use organized storage
+        organized_folder, relative_path = get_organized_media_path(user_id, media_type)
+        file_path = os.path.join(organized_folder, filename)
+        logger.info(f"Organized storage path: {relative_path}/{filename}")
+    else:
+        # Fallback to old method
+        file_path = os.path.join(UPLOADS_DIR, filename)
     
     # Use buffered writing for large files to prevent memory issues
     try:
@@ -130,10 +235,16 @@ def get_media_type_from_extension(filename: str) -> str:
 
 def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int, 
                            num_posts: int, start_date: Optional[datetime] = None) -> List[datetime]:
-    """Calculate schedule times for posts"""
+    """Calculate schedule times for posts with proper timezone handling"""
+    kyiv_tz = get_kyiv_timezone()
+    
     if start_date is None:
         start_date = get_current_kyiv_time().replace(hour=0, minute=0, second=0, microsecond=0)
         start_date += timedelta(days=1)  # Start from tomorrow
+    
+    # Ensure start_date is timezone-aware
+    if start_date.tzinfo is None:
+        start_date = kyiv_tz.localize(start_date)
     
     schedule_times = []
     current_time = start_date.replace(hour=start_hour, minute=0, second=0, microsecond=0)
@@ -148,8 +259,8 @@ def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int
             current_time += timedelta(hours=interval_hours)
         else:
             # Move to the next day at start hour
-            current_time = current_time.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-            current_time += timedelta(days=1)
+            next_day = current_time + timedelta(days=1)
+            current_time = next_day.replace(hour=start_hour, minute=0, second=0, microsecond=0)
     
     return schedule_times
 
@@ -475,7 +586,9 @@ def get_media_icon(media_type: str) -> str:
         'video': '🎥',
         'audio': '🎵',
         'animation': '🎬',
-        'document': '📄'
+        'document': '📄',
+        'document_image': '🖼️',  # Uncompressed image
+        'document_video': '🎬'   # Uncompressed video
     }
     return icons.get(media_type, '📎')
 
@@ -512,6 +625,19 @@ def generate_mini_calendar(year: int, month: int, posts_by_date: Dict[str, List[
     
     return calendar_str
 
+def escape_markdown(text: str) -> str:
+    """Escape markdown special characters to prevent parsing errors"""
+    if not text:
+        return text
+    
+    # Characters that need to be escaped in Telegram markdown
+    escape_chars = ['*', '_', '`', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    
+    for char in escape_chars:
+        text = text.replace(char, f'\\{char}')
+    
+    return text
+
 def format_daily_schedule(date_str: str, posts: List[Dict]) -> str:
     """Format posts for a specific day"""
     if not posts:
@@ -538,11 +664,15 @@ def format_daily_schedule(date_str: str, posts: List[Dict]) -> str:
         for post in time_posts:
             icon = get_media_icon(post['media_type'])
             recurring_icon = "🔄 " if post['is_recurring'] else ""
+            
+            # Escape markdown in channel name and description
             channel_name = post['channel_name'][:15] + "..." if len(post['channel_name']) > 15 else post['channel_name']
+            channel_name = escape_markdown(channel_name)
             
             desc_preview = ""
             if post['description']:
                 desc_preview = post['description'][:30] + "..." if len(post['description']) > 30 else post['description']
+                desc_preview = escape_markdown(desc_preview)
                 desc_preview = f" - {desc_preview}"
             
             schedule_str += f"  {icon} {recurring_icon}→ {channel_name}{desc_preview}\n"

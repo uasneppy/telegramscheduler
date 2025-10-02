@@ -16,7 +16,9 @@ from bot.handlers import (
     callback_query_handler, channels_handler, stats_handler, reset_handler,
     clearqueue_handler, clearscheduled_handler, multibatch_handler, retry_handler,
     bulkedit_handler, recurring_mode_handler as recurring_handler,
-    backup_handler, restore_handler, overdue_handler
+    backup_handler, restore_handler, overdue_handler, preview_handler, settings_handler,
+    recover_captions_handler, recover_captions_interactive_handler, delete_all_captions_handler,
+    edit_captions_handler
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
@@ -27,6 +29,11 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+# SECURITY: Suppress HTTPX request logging to prevent bot token exposure in logs
+# HTTPX logs full URLs at INFO level which includes the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 async def post_init(application):
@@ -76,8 +83,14 @@ def main():
     application.add_handler(CommandHandler("recurring", recurring_handler))
     application.add_handler(CommandHandler("backup", backup_handler))
     application.add_handler(CommandHandler("restore", restore_handler))
+    application.add_handler(CommandHandler("settings", settings_handler))
     application.add_handler(CommandHandler("retry", retry_handler))
     application.add_handler(CommandHandler("overdue", overdue_handler))
+    application.add_handler(CommandHandler("preview", preview_handler))
+    application.add_handler(CommandHandler("recover_captions", recover_captions_handler))
+    application.add_handler(CommandHandler("recover_interactive", recover_captions_interactive_handler))
+    application.add_handler(CommandHandler("delete_all_captions", delete_all_captions_handler))
+    application.add_handler(CommandHandler("edit_captions", edit_captions_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(CommandHandler("help", help_handler))
     
