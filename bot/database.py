@@ -8,7 +8,9 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
+
 from config import DATABASE_PATH
+from .utils import get_kyiv_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -212,34 +214,70 @@ class Database:
         return post_id
     
     @staticmethod
+    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+        """Parse datetime values stored as ISO strings into timezone-aware datetimes."""
+        if not value:
+            return None
+
+        if isinstance(value, datetime):
+            # Ensure timezone-awareness
+            if value.tzinfo is None:
+                return get_kyiv_timezone().localize(value)
+            return value
+
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = get_kyiv_timezone().localize(parsed)
+            return parsed
+        except (ValueError, TypeError):
+            logger.warning(f"Unable to parse datetime value: {value}")
+            return None
+
+    @staticmethod
     def get_post_by_id(post_id: int) -> Optional[Dict]:
         """Get a complete post by ID"""
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('''
-            SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, 
-                   channel_id, is_recurring, recurring_interval_hours, recurring_end_date, 
-                   recurring_count, media_bundle_json, status, created_at, posted_at, 
+            SELECT id, user_id, file_path, media_type, description, scheduled_time, mode,
+                   channel_id, is_recurring, recurring_interval_hours, recurring_end_date,
+                   recurring_count, media_bundle_json, status, created_at, posted_at,
                    batch_id, retry_count, last_retry_at, failure_reason, cleanup_date
-            FROM posts 
+            FROM posts
             WHERE id = ?
         ''', (post_id,))
-        
+
         row = cursor.fetchone()
         conn.close()
-        
-        if row:
-            return {
-                'id': row[0], 'user_id': row[1], 'file_path': row[2], 'media_type': row[3],
-                'description': row[4], 'scheduled_time': row[5], 'mode': row[6], 
-                'channel_id': row[7], 'is_recurring': row[8], 'recurring_interval_hours': row[9],
-                'recurring_end_date': row[10], 'recurring_count': row[11], 'media_bundle_json': row[12],
-                'status': row[13], 'created_at': row[14], 'posted_at': row[15], 'batch_id': row[16],
-                'retry_count': row[17], 'last_retry_at': row[18], 'failure_reason': row[19], 
-                'cleanup_date': row[20]
-            }
-        return None
+
+        if not row:
+            return None
+
+        return {
+            'id': row[0],
+            'user_id': row[1],
+            'file_path': row[2],
+            'media_type': row[3],
+            'description': row[4],
+            'scheduled_time': Database._parse_datetime(row[5]),
+            'mode': row[6],
+            'channel_id': row[7],
+            'is_recurring': bool(row[8]) if row[8] is not None else False,
+            'recurring_interval_hours': row[9],
+            'recurring_end_date': Database._parse_datetime(row[10]),
+            'recurring_count': row[11],
+            'media_bundle_json': row[12],
+            'status': row[13],
+            'created_at': Database._parse_datetime(row[14]),
+            'posted_at': Database._parse_datetime(row[15]),
+            'batch_id': row[16],
+            'retry_count': row[17],
+            'last_retry_at': Database._parse_datetime(row[18]),
+            'failure_reason': row[19],
+            'cleanup_date': Database._parse_datetime(row[20])
+        }
 
     @staticmethod
     def get_pending_posts(user_id: Optional[int] = None, channel_id: Optional[str] = None, unscheduled_only: bool = False) -> List[Dict]:
