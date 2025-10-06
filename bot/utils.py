@@ -359,26 +359,22 @@ def calculate_evenly_distributed_schedule(start_hour: int, end_hour: int, num_po
     
     # If interval is specified, use it; otherwise auto-calculate
     if interval_hours and interval_hours > 0:
-        # Use fixed interval scheduling
-        posts_per_day = max(1, daily_window_hours // interval_hours + 1)
+        # Use fixed interval scheduling while allowing a slot exactly at end_hour
         current_date = start_date
         posts_scheduled = 0
-        
+        current_hour = start_hour
+
         while posts_scheduled < num_posts:
-            posts_today = min(num_posts - posts_scheduled, posts_per_day)
-            current_hour = start_hour
-            
-            for i in range(posts_today):
-                if current_hour <= end_hour:
-                    schedule_time = current_date.replace(hour=current_hour, minute=0, second=0, microsecond=0)
-                    schedule_times.append(schedule_time)
-                    posts_scheduled += 1
-                    current_hour += interval_hours
-                else:
-                    break
-            
-            # Move to next day
-            current_date += timedelta(days=1)
+            if current_hour > end_hour:
+                # Reset to start of next day once we go past the end hour window
+                current_date += timedelta(days=1)
+                current_hour = start_hour
+                continue
+
+            schedule_time = current_date.replace(hour=current_hour, minute=0, second=0, microsecond=0)
+            schedule_times.append(schedule_time)
+            posts_scheduled += 1
+            current_hour += interval_hours
     else:
         # Auto-distribute evenly
         daily_window_minutes = daily_window_hours * 60
