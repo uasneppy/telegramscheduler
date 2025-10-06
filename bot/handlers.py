@@ -8394,41 +8394,26 @@ async def handle_reschedule_action_callback(query, user, data):
     if action == "all":
         # Reschedule all posts with default settings
         try:
-            # Update database with new schedule times (10 AM - 8 PM, 2 hours)
-            rescheduled_count = Database.reschedule_all_posts_from_today(
-                user.id, 
-                start_hour=10, 
-                end_hour=20, 
-                interval_hours=2
-            )
-            
+            scheduler = query.get_bot().application.bot_data.get('scheduler')
+
+            if scheduler:
+                rescheduled_count = await scheduler.reschedule_all_posts_from_today(
+                    user.id,
+                    start_hour=10,
+                    end_hour=20,
+                    interval_hours=2
+                )
+            else:
+                logger.warning("Scheduler not available in bot_data during reschedule_all action; falling back to database-only update")
+                rescheduled_count = Database.reschedule_all_posts_from_today(
+                    user.id,
+                    start_hour=10,
+                    end_hour=20,
+                    interval_hours=2
+                )
+
             if rescheduled_count > 0:
-                # Update scheduler jobs with new times
-                try:
-                    # Get scheduler from application context
-                    scheduler = query.get_bot().application.bot_data.get('scheduler')
-                    if scheduler:
-                        # Get updated posts from database
-                        pending_posts = Database.get_pending_posts(user.id)
-                        
-                        # Reschedule all jobs with new times
-                        for post in pending_posts:
-                            if post['scheduled_time']:
-                                from datetime import datetime
-                                if isinstance(post['scheduled_time'], str):
-                                    scheduled_time = datetime.fromisoformat(post['scheduled_time'])
-                                else:
-                                    scheduled_time = post['scheduled_time']
-                                
-                                # Cancel existing job if it exists
-                                await scheduler.cancel_post_job(post['id'])
-                                
-                                # Schedule with new time
-                                await scheduler.schedule_single_post(post['id'], scheduled_time)
-                                
-                        logger.info(f"Updated scheduler jobs for {rescheduled_count} posts")
-                except Exception as scheduler_error:
-                    logger.error(f"Error updating scheduler jobs: {scheduler_error}")
+                logger.info(f"Rescheduled {rescheduled_count} posts for user {user.id} with default settings")
                 
                 keyboard = [
                     [InlineKeyboardButton("📊 View Stats", callback_data="main_stats")],
@@ -8544,41 +8529,26 @@ async def handle_reschedule_settings_input(update, user, text):
         # Clear user session
         Database.update_user_session(user.id, "idle", {})
         
-        # Perform rescheduling
-        rescheduled_count = Database.reschedule_all_posts_from_today(
-            user.id, 
-            start_hour=start_hour, 
-            end_hour=end_hour, 
-            interval_hours=interval_hours
-        )
-        
-        # Update scheduler jobs with new times
+        scheduler = update.get_bot().application.bot_data.get('scheduler')
+
+        if scheduler:
+            rescheduled_count = await scheduler.reschedule_all_posts_from_today(
+                user.id,
+                start_hour=start_hour,
+                end_hour=end_hour,
+                interval_hours=interval_hours
+            )
+        else:
+            logger.warning("Scheduler not available in bot_data during custom reschedule; falling back to database-only update")
+            rescheduled_count = Database.reschedule_all_posts_from_today(
+                user.id,
+                start_hour=start_hour,
+                end_hour=end_hour,
+                interval_hours=interval_hours
+            )
+
         if rescheduled_count > 0:
-            try:
-                # Get scheduler from application context
-                scheduler = update.get_bot().application.bot_data.get('scheduler')
-                if scheduler:
-                    # Get updated posts from database
-                    pending_posts = Database.get_pending_posts(user.id)
-                    
-                    # Reschedule all jobs with new times
-                    for post in pending_posts:
-                        if post['scheduled_time']:
-                            from datetime import datetime
-                            if isinstance(post['scheduled_time'], str):
-                                scheduled_time = datetime.fromisoformat(post['scheduled_time'])
-                            else:
-                                scheduled_time = post['scheduled_time']
-                            
-                            # Cancel existing job if it exists
-                            await scheduler.cancel_post_job(post['id'])
-                            
-                            # Schedule with new time
-                            await scheduler.schedule_single_post(post['id'], scheduled_time)
-                            
-                    logger.info(f"Updated scheduler jobs for {rescheduled_count} posts")
-            except Exception as scheduler_error:
-                logger.error(f"Error updating scheduler jobs: {scheduler_error}")
+            logger.info(f"Rescheduled {rescheduled_count} posts for user {user.id} with custom settings {start_hour}-{end_hour}/{interval_hours}h")
         
         keyboard = [
             [InlineKeyboardButton("📊 View Stats", callback_data="main_stats")],
