@@ -7431,6 +7431,7 @@ async def prompt_bulk_edit_settings(query, user, posts, scope_name):
 *⚡ How it works:*
 • Auto intervals: Posts spread evenly across time range
 • Fixed intervals: Posts every X hours within range
+• End hour is inclusive (last post can be right at that time)
 • If no date specified, starts tomorrow
 • Times are in Kyiv timezone
 """
