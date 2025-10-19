@@ -16,7 +16,8 @@ from .utils import (
     format_schedule_summary, parse_schedule_input, get_current_kyiv_time,
     parse_date_input, calculate_custom_date_schedule, generate_mini_calendar,
     format_daily_schedule, get_calendar_navigation_dates, get_media_icon,
-    calculate_evenly_distributed_schedule, parse_bulk_edit_input
+    calculate_evenly_distributed_schedule, parse_bulk_edit_input,
+    get_kyiv_timezone, escape_markdown
 )
 import asyncio
 from config import BotStates, CHANNEL_ID
@@ -3654,6 +3655,7 @@ async def help_channel_posts_handler(query, user, channel_id):
     scheduled_posts = [post for post in scheduled_posts if post['scheduled_time']]
     
     keyboard = [
+        [InlineKeyboardButton("🗑 Delete a Post", callback_data=f"help_delete_post|{channel_id}|0")],
         [InlineKeyboardButton("🔙 Back to Channels", callback_data="help_scheduled_posts")],
         [InlineKeyboardButton("🏠 Back to Help", callback_data="main_help")]
     ]
@@ -3697,22 +3699,232 @@ Use Mode 1 or Mode 2 to upload and schedule content.
         media_icon = media_icons.get(post['media_type'], '📁')
         
         # Show full description without truncation
-        description = post['description'] or 'No description'
-        
+        description = escape_markdown(post['description'] or 'No description')
+
         # Add recurring indicator
         recurring_indicator = " 🔄" if post['is_recurring'] else ""
-        
+
         message += f"{i}. {media_icon} *{date_str} {time_str}*{recurring_indicator}\n"
+        message += f"   ID: #{post['id']}\n"
         message += f"   {description}\n\n"
     
     message += "*💡 Tip:* Use /stats for detailed analytics"
-    
+
     await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+
+async def help_delete_post_handler(query, user, channel_id, page: int = 0):
+    """Display paginated scheduled posts for deletion"""
+    # SECURITY CHECK: Verify user owns the channel before showing posts
+    if not Database.user_has_channel(user.id, channel_id):
+        logger.error(
+            f"Security violation: User {user.id} attempted to access delete menu for channel {channel_id} they don't own"
+        )
+        await query.edit_message_text(
+            "❌ *Security Error*\n\nYou don't have access to this channel.",
+            parse_mode='Markdown'
+        )
+        return
+
+    scheduled_posts = Database.get_scheduled_posts_for_channel(user.id, channel_id)
+
+    if not scheduled_posts:
+        keyboard = [
+            [InlineKeyboardButton("🔙 Back to Channel", callback_data=f"help_channel_posts_{channel_id}")],
+            [InlineKeyboardButton("🏠 Back to Help", callback_data="main_help")]
+        ]
+        message = (
+            "📅 *No Scheduled Posts*\n\n"
+            "There are no scheduled posts to delete for this channel."
+        )
+        await query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+        return
+
+    kyiv_tz = get_kyiv_timezone()
+
+    def sort_key(post):
+        dt = post.get('scheduled_time')
+        if not dt:
+            return float('inf')
+        if dt.tzinfo is None:
+            dt = kyiv_tz.localize(dt)
+        else:
+            dt = dt.astimezone(kyiv_tz)
+        return dt.timestamp()
+
+    scheduled_posts.sort(key=sort_key)
+
+    page_size = 5
+    total_pages = (len(scheduled_posts) + page_size - 1) // page_size
+    page = max(0, min(page, max(total_pages - 1, 0)))
+    start_index = page * page_size
+    end_index = start_index + page_size
+    page_posts = scheduled_posts[start_index:end_index]
+
+    channels = Database.get_user_channels(user.id)
+    channel_info = next((ch for ch in channels if ch['channel_id'] == channel_id), {})
+    channel_name = escape_markdown(channel_info.get('channel_name', channel_id))
+
+    keyboard = []
+    for post in page_posts:
+        scheduled_time = post.get('scheduled_time')
+        if scheduled_time:
+            if scheduled_time.tzinfo is None:
+                scheduled_time = kyiv_tz.localize(scheduled_time)
+            else:
+                scheduled_time = scheduled_time.astimezone(kyiv_tz)
+            time_str = scheduled_time.strftime("%b %d %H:%M")
+        else:
+            time_str = "Not scheduled"
+
+        media_icon = get_media_icon(post.get('media_type'))
+        button_text = f"{media_icon} #{post['id']} • {time_str}"
+        keyboard.append([
+            InlineKeyboardButton(button_text, callback_data=f"help_delete_confirm|{channel_id}|{post['id']}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"help_delete_post|{channel_id}|{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"help_delete_post|{channel_id}|{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton("🔙 Back to Channel", callback_data=f"help_channel_posts_{channel_id}")])
+    keyboard.append([InlineKeyboardButton("🏠 Back to Help", callback_data="main_help")])
+
+    message = (
+        "🗑 *Delete Scheduled Post*\n\n"
+        f"*Channel:* {channel_name}\n"
+        f"*Scheduled Posts:* {len(scheduled_posts)}\n"
+        f"*Page:* {page + 1}/{total_pages}\n\n"
+        "Select a post to delete. This will remove the scheduled post and its media file."
+    )
+
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def help_delete_post_confirm(query, user, channel_id, post_id: int):
+    """Confirm deletion of a scheduled post"""
+    post = Database.get_post_by_id(post_id)
+
+    if not post or post['user_id'] != user.id or post.get('channel_id') != channel_id or not post.get('scheduled_time'):
+        await query.edit_message_text(
+            "❌ *Post Not Found*\n\nThe scheduled post could not be found. It may have already been deleted.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data=f"help_delete_post|{channel_id}|0")]
+            ]),
+            parse_mode='Markdown'
+        )
+        return
+
+    kyiv_tz = get_kyiv_timezone()
+    scheduled_time = post.get('scheduled_time')
+    if scheduled_time:
+        if scheduled_time.tzinfo is None:
+            scheduled_time = kyiv_tz.localize(scheduled_time)
+        else:
+            scheduled_time = scheduled_time.astimezone(kyiv_tz)
+        scheduled_str = scheduled_time.strftime("%Y-%m-%d %H:%M Kyiv")
+    else:
+        scheduled_str = "Not scheduled"
+
+    description = escape_markdown(post.get('description') or 'No description')
+
+    channels = Database.get_user_channels(user.id)
+    channel_info = next((ch for ch in channels if ch['channel_id'] == channel_id), {})
+    channel_name = escape_markdown(channel_info.get('channel_name', channel_id))
+
+    media_icon = get_media_icon(post.get('media_type'))
+
+    message = (
+        "🗑 *Confirm Deletion*\n\n"
+        f"Are you sure you want to delete scheduled post #{post_id}?\n\n"
+        f"*Channel:* {channel_name}\n"
+        f"*Scheduled:* {scheduled_str}\n"
+        f"*Type:* {media_icon}\n\n"
+        "*Caption:*\n"
+        f"{description}\n\n"
+        "This action permanently removes the post and its media file from the schedule."
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"help_delete_execute|{channel_id}|{post_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"help_delete_post|{channel_id}|0")]
+    ]
+
+    await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+
+async def help_delete_post_execute(query, user, channel_id, post_id: int):
+    """Execute deletion of a scheduled post"""
+    post = Database.get_post_by_id(post_id)
+
+    if not post or post['user_id'] != user.id or post.get('channel_id') != channel_id or not post.get('scheduled_time'):
+        await query.edit_message_text(
+            "❌ *Delete Failed*\n\nThe post could not be deleted because it was not found.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data=f"help_delete_post|{channel_id}|0")]
+            ]),
+            parse_mode='Markdown'
+        )
+        return
+
+    scheduler = None
+    try:
+        bot = query.get_bot()
+        if bot and bot.application and bot.application.bot_data:
+            scheduler = bot.application.bot_data.get('scheduler')
+    except AttributeError:
+        scheduler = None
+
+    if scheduler:
+        try:
+            await scheduler.cancel_post_job(post_id)
+        except Exception as e:
+            logger.error(f"Error cancelling scheduler job for post {post_id}: {e}")
+
+    deleted = Database.delete_scheduled_post(user.id, post_id)
+
+    if deleted:
+        try:
+            await query.answer("Post deleted", show_alert=False)
+        except Exception:
+            pass
+
+        await help_delete_post_handler(query, user, channel_id, page=0)
+    else:
+        await query.edit_message_text(
+            "❌ *Delete Failed*\n\nAn unexpected error occurred while deleting the post.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data=f"help_delete_post|{channel_id}|0")]
+            ]),
+            parse_mode='Markdown'
+        )
+
 
 async def handle_help_callback(query, user, data):
     """Handle help topic callbacks"""
     topic = data.replace("help_", "")
-    
+
+    if topic.startswith("delete_post|"):
+        _, channel_id, page = topic.split("|", 2)
+        await help_delete_post_handler(query, user, channel_id, int(page))
+        return
+    if topic.startswith("delete_confirm|"):
+        _, channel_id, post_id = topic.split("|", 2)
+        await help_delete_post_confirm(query, user, channel_id, int(post_id))
+        return
+    if topic.startswith("delete_execute|"):
+        _, channel_id, post_id = topic.split("|", 2)
+        await help_delete_post_execute(query, user, channel_id, int(post_id))
+        return
+
     if topic == "scheduled_posts":
         await help_scheduled_posts_handler(query, user)
         return
