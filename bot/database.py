@@ -1002,7 +1002,54 @@ class Database:
         
         logger.info(f"Cleared {count} scheduled posts for user {user_id}{channel_info}. {queued_remaining} queued posts remain.")
         return count
-    
+
+    @staticmethod
+    def delete_scheduled_post(user_id: int, post_id: int) -> bool:
+        """Delete a single scheduled post for a user"""
+        from .utils import delete_media_file
+
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT file_path, media_bundle_json
+            FROM posts
+            WHERE id = ? AND user_id = ? AND status = 'pending' AND scheduled_time IS NOT NULL
+        ''', (post_id, user_id))
+
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            logger.warning(f"Attempted to delete nonexistent scheduled post {post_id} for user {user_id}")
+            return False
+
+        file_path, media_bundle_json = row
+
+        file_paths = set()
+        if file_path:
+            file_paths.add(file_path)
+
+        if media_bundle_json:
+            try:
+                bundle = json.loads(media_bundle_json)
+                for item in bundle:
+                    bundle_path = item.get('file_path') if isinstance(item, dict) else None
+                    if bundle_path:
+                        file_paths.add(bundle_path)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode media bundle for post {post_id}: {e}")
+
+        for path in file_paths:
+            delete_media_file(path)
+
+        cursor.execute('DELETE FROM posts WHERE id = ? AND user_id = ?', (post_id, user_id))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Deleted scheduled post {post_id} for user {user_id}")
+        return True
+
     @staticmethod
     def update_scheduling_config(user_id: int, start_hour: int, end_hour: int, interval_hours: int):
         """Update scheduling configuration for a user"""
