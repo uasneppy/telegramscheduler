@@ -825,7 +825,8 @@ class Database:
         return 'idle', {}
     
     @staticmethod
-    def clear_user_posts(user_id: int, mode: int = None, channel_id: str = None, scheduled_only: bool = False):
+    def clear_user_posts(user_id: int, mode: Optional[int] = None, channel_id: Optional[str] = None,
+                         scheduled_only: bool = False):
         """Clear pending posts for a user, optionally filtered by mode and channel
         
         Args:
@@ -890,7 +891,7 @@ class Database:
         return Database.get_pending_posts(user_id=user_id, unscheduled_only=True)
     
     @staticmethod
-    def clear_queued_posts(user_id: int, channel_id: str = None) -> int:
+    def clear_queued_posts(user_id: int, channel_id: Optional[str] = None) -> int:
         """Clear all queued (pending) posts for a user and return count of cleared posts"""
         from .utils import delete_media_file
         conn = Database.get_connection()
@@ -1110,7 +1111,7 @@ class Database:
             return True, 5, None
     
     @staticmethod
-    def update_reminder_settings(user_id: int, enabled: bool = None, threshold: int = None):
+    def update_reminder_settings(user_id: int, enabled: Optional[bool] = None, threshold: Optional[int] = None):
         """Update reminder settings for a user"""
         conn = Database.get_connection()
         cursor = conn.cursor()
@@ -1990,7 +1991,7 @@ class Database:
         return posts_by_date
 
     @staticmethod
-    def get_scheduled_posts_for_channel(user_id: int, channel_id: str = None) -> List[Dict]:
+    def get_scheduled_posts_for_channel(user_id: int, channel_id: Optional[str] = None) -> List[Dict]:
         """Get all scheduled posts for a user, optionally filtered by channel"""
         conn = Database.get_connection()
         cursor = conn.cursor()
@@ -2029,7 +2030,7 @@ class Database:
         return posts
 
     @staticmethod
-    def get_latest_scheduled_time(user_id: int, channel_id: str = None) -> Optional[datetime]:
+    def get_latest_scheduled_time(user_id: int, channel_id: Optional[str] = None) -> Optional[datetime]:
         """Get the latest scheduled time for a user's posts, optionally filtered by channel"""
         conn = Database.get_connection()
         cursor = conn.cursor()
