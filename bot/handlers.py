@@ -1592,10 +1592,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await handle_clearqueue_callback(query, user, data)
     elif data.startswith("clearscheduled_"):
         await handle_clearscheduled_callback(query, user, data)
-    elif data.startswith("batch_"):
-        await handle_batch_callback(query, user, data)
     elif data.startswith("batch_mode"):
         await handle_batch_mode_callback(query, user, data)
+    elif data.startswith("batch_"):
+        await handle_batch_callback(query, user, data)
     elif data.startswith("retry_"):
         await handle_retry_callback(query, user, data)
     elif data.startswith("reschedule_"):
@@ -2457,11 +2457,19 @@ async def handle_channel_input(update: Update, user, text: str, session_data: di
     elif mode == BotStates.WAITING_CHANNEL_NAME:
         channel_name = text.strip()
         channel_id = session_data.get('new_channel_id')
-        
+
+        if not channel_id:
+            logger.error(f"Channel ID missing from session for user {user.id} during channel name entry")
+            await update.message.reply_text(
+                "❌ Channel ID missing from session. Please restart the channel setup with /channels."
+            )
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+
         if not channel_name:
             await update.message.reply_text("Please enter a valid channel name:")
             return
-        
+
         # Add the channel
         success = Database.add_user_channel(user.id, channel_id, channel_name, False)
         

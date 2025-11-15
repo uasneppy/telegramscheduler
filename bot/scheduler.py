@@ -154,7 +154,10 @@ class PostScheduler:
         """Post a single message to the channel with enhanced error handling and recovery"""
         retry_count = 0
         max_retries = 3
-        
+        user_id = None
+        file_path = None
+        channel_id = None
+
         while retry_count <= max_retries:
             try:
                 # Add a small delay at the start to prevent overwhelming Telegram API
@@ -322,18 +325,18 @@ class PostScheduler:
                     continue
                 else:
                     # Final failure - notify user with diagnosis
-                    if 'user_id' in locals():
+                    if user_id is not None:
                         await self._notify_post_failure(post_id, user_id, diagnosis)
                     Database.mark_post_as_failed(post_id, diagnosis['error_message'])
                     break
-                    
+
             except FileNotFoundError as e:
                 logger.error(f"File not found for post {post_id}: {e}")
-                if 'user_id' in locals():
-                    await self._notify_file_error(post_id, user_id, file_path if 'file_path' in locals() else None)
+                if user_id is not None:
+                    await self._notify_file_error(post_id, user_id, file_path)
                 Database.mark_post_as_failed(post_id, "File not found")
                 break
-                
+
             except Exception as e:
                 logger.error(f"Unexpected error posting {post_id} (attempt {retry_count + 1}/{max_retries + 1}): {e}")
                 
@@ -344,7 +347,7 @@ class PostScheduler:
                     await asyncio.sleep(wait_time)
                     continue
                 else:
-                    if 'user_id' in locals():
+                    if user_id is not None:
                         await self._notify_unexpected_error(post_id, user_id, str(e))
                     Database.mark_post_as_failed(post_id, f"Unexpected error: {e}")
                     break
