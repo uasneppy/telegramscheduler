@@ -18,7 +18,7 @@ from bot.handlers import (
     bulkedit_handler, recurring_mode_handler as recurring_handler,
     backup_handler, restore_handler, overdue_handler, preview_handler, settings_handler,
     recover_captions_handler, recover_captions_interactive_handler, delete_all_captions_handler,
-    edit_captions_handler
+    edit_captions_handler, editposts_handler
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
@@ -91,6 +91,7 @@ def main():
     application.add_handler(CommandHandler("recover_interactive", recover_captions_interactive_handler))
     application.add_handler(CommandHandler("delete_all_captions", delete_all_captions_handler))
     application.add_handler(CommandHandler("edit_captions", edit_captions_handler))
+    application.add_handler(CommandHandler("editposts", editposts_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(CommandHandler("help", help_handler))
     
