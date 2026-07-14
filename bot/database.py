@@ -104,6 +104,14 @@ def init_database():
         # Column already exists, this is fine
         pass
     
+    # Add caption_entities column if it doesn't exist (migration for native formatting support)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN caption_entities TEXT')
+        logger.info("Added caption_entities column to posts table")
+    except sqlite3.OperationalError:
+        # Column already exists, this is fine
+        pass
+    
     # Create user_sessions table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS user_sessions (
@@ -187,7 +195,7 @@ class Database:
                  scheduled_time: Optional[datetime] = None, mode: int = 1, channel_id: Optional[str] = None,
                  is_recurring: bool = False, recurring_interval_hours: Optional[int] = None,
                  recurring_end_date: Optional[datetime] = None, recurring_count: Optional[int] = None,
-                 media_bundle_json: Optional[str] = None) -> int:
+                 media_bundle_json: Optional[str] = None, caption_entities: Optional[str] = None) -> int:
         """Add a new post to the database"""
         
         # SECURITY CHECK: Verify user owns the channel before creating the post
@@ -201,10 +209,12 @@ class Database:
         
         cursor.execute('''
             INSERT INTO posts (user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-                             is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, media_bundle_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, 
+                             media_bundle_json, caption_entities)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, media_bundle_json))
+              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, 
+              media_bundle_json, caption_entities))
         
         post_id = cursor.lastrowid
         conn.commit()
@@ -244,7 +254,7 @@ class Database:
             SELECT id, user_id, file_path, media_type, description, scheduled_time, mode,
                    channel_id, is_recurring, recurring_interval_hours, recurring_end_date,
                    recurring_count, media_bundle_json, status, created_at, posted_at,
-                   batch_id, retry_count, last_retry_at, failure_reason, cleanup_date
+                   batch_id, retry_count, last_retry_at, failure_reason, cleanup_date, caption_entities
             FROM posts
             WHERE id = ?
         ''', (post_id,))
@@ -276,7 +286,8 @@ class Database:
             'retry_count': row[17],
             'last_retry_at': Database._parse_datetime(row[18]),
             'failure_reason': row[19],
-            'cleanup_date': Database._parse_datetime(row[20])
+            'cleanup_date': Database._parse_datetime(row[20]),
+            'caption_entities': row[21]
         }
 
     @staticmethod
@@ -365,6 +376,23 @@ class Database:
         conn.close()
         
         logger.warning(f"Marked post {post_id} as failed: {failure_reason}")
+    
+    @staticmethod
+    def set_post_cleanup_date(post_id: int, cleanup_date: datetime):
+        """Set the cleanup date for a posted file"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            UPDATE posts 
+            SET cleanup_date = ?
+            WHERE id = ?
+        ''', (cleanup_date, post_id))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"Set cleanup date for post {post_id} to {cleanup_date}")
     
     @staticmethod
     def get_failed_posts(user_id: int, channel_id: Optional[str] = None) -> List[Dict]:
@@ -470,6 +498,28 @@ class Database:
         from .utils import get_kyiv_timezone, calculate_schedule_times
         from collections import defaultdict
         
+        # Validate input parameters
+        if not isinstance(start_hour, int) or not (0 <= start_hour <= 23):
+            logger.error(f"Invalid start_hour: {start_hour}. Must be 0-23.")
+            return 0
+        
+        if not isinstance(end_hour, int) or not (0 <= end_hour <= 23):
+            logger.error(f"Invalid end_hour: {end_hour}. Must be 0-23.")
+            return 0
+        
+        if start_hour >= end_hour:
+            logger.error(f"Invalid schedule: start_hour ({start_hour}) must be less than end_hour ({end_hour})")
+            return 0
+        
+        if not isinstance(interval_hours, int) or interval_hours < 1:
+            logger.error(f"Invalid interval_hours: {interval_hours}. Must be >= 1.")
+            return 0
+        
+        time_window = end_hour - start_hour
+        if interval_hours > time_window:
+            logger.error(f"Invalid interval_hours: {interval_hours}. Cannot exceed time window ({time_window} hours)")
+            return 0
+        
         conn = Database.get_connection()
         cursor = conn.cursor()
         
@@ -512,18 +562,26 @@ class Database:
             next_slot = current_time.replace(minute=0, second=0, microsecond=0)
             
             # Find next available slot (round up to next interval)
-            while next_slot <= current_time or next_slot.hour % interval_hours != 0 or next_slot.hour < start_hour or next_slot.hour > end_hour:
+            max_iterations = 48  # Prevent infinite loop
+            iterations = 0
+            while iterations < max_iterations:
+                iterations += 1
+                
+                # Check if current slot is valid
+                if (next_slot > current_time and 
+                    start_hour <= next_slot.hour < end_hour and
+                    (next_slot.hour - start_hour) % interval_hours == 0):
+                    break
+                    
                 next_slot += timedelta(hours=1)
+                
                 # If we've gone past end_hour, move to tomorrow's start_hour
-                if next_slot.hour > end_hour:
+                if next_slot.hour >= end_hour:
                     next_slot = (next_slot + timedelta(days=1)).replace(hour=start_hour, minute=0, second=0, microsecond=0)
                     break
             
             # Start scheduling from the next available slot (today if possible, tomorrow if not)
             today = next_slot
-            
-            # Generate time slots starting from the next available slot
-            today_naive = today.replace(tzinfo=None)
             
             # Use a custom schedule generation that respects our starting point
             time_slot_times = []
@@ -535,14 +593,13 @@ class Database:
                 # Calculate next slot
                 current_slot += timedelta(hours=interval_hours)
                 
-                # If we go past end_hour, move to next day's start_hour
-                if current_slot.hour > end_hour:
-                    days_to_add = 1
-                    current_slot = current_slot.replace(hour=start_hour, minute=0, second=0, microsecond=0) + timedelta(days=days_to_add)
-                    
-                    # Ensure it's on the correct interval
-                    while current_slot.hour % interval_hours != 0 or current_slot.hour < start_hour:
-                        current_slot += timedelta(hours=1)
+                # If we go past or reach end_hour, move to next day's start_hour
+                if current_slot.hour >= end_hour or current_slot.hour < start_hour:
+                    # Move to the next day at start_hour
+                    current_slot = current_slot.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+                    # If we haven't actually moved forward a day yet, add a day
+                    if current_slot <= time_slot_times[-1]:
+                        current_slot += timedelta(days=1)
             
             # Already timezone-aware, no need to localize
             
@@ -583,9 +640,9 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        # Get current time in Kyiv timezone
+        # Get current time in Kyiv timezone (timezone-aware)
         kyiv_tz = get_kyiv_timezone()
-        current_time = datetime.now(kyiv_tz).replace(tzinfo=None)
+        current_time = datetime.now(kyiv_tz)
         
         conditions = [
             "user_id = ?", 
@@ -633,7 +690,13 @@ class Database:
         """Reschedule overdue posts to the next available time slots, moving the queue forward"""
         from .utils import get_kyiv_timezone
         
+        # Validate input
         if not overdue_post_ids:
+            logger.info("No overdue posts to reschedule")
+            return 0
+        
+        if not isinstance(overdue_post_ids, list):
+            logger.error(f"Invalid overdue_post_ids type: {type(overdue_post_ids)}. Must be a list.")
             return 0
             
         conn = Database.get_connection()
@@ -653,7 +716,7 @@ class Database:
             params = [user_id]
             
             kyiv_tz = get_kyiv_timezone()
-            current_time = datetime.now(kyiv_tz).replace(tzinfo=None)
+            current_time = datetime.now(kyiv_tz)
             conditions.append("scheduled_time >= ?")
             params.append(current_time.isoformat())
             
@@ -673,7 +736,7 @@ class Database:
             
             # Calculate new schedule times starting from the next available slot
             kyiv_tz = get_kyiv_timezone()
-            now = datetime.now(kyiv_tz).replace(tzinfo=None)
+            now = datetime.now(kyiv_tz)
             
             # Find next valid scheduling time
             next_time = now.replace(minute=0, second=0, microsecond=0)
@@ -687,7 +750,13 @@ class Database:
                 # Round up to the next interval
                 hours_since_start = next_time.hour - schedule_config['start_hour']
                 intervals_passed = hours_since_start // schedule_config['interval_hours']
-                next_time = next_time.replace(hour=schedule_config['start_hour'] + (intervals_passed + 1) * schedule_config['interval_hours'])
+                next_hour = schedule_config['start_hour'] + (intervals_passed + 1) * schedule_config['interval_hours']
+                
+                # If next_hour exceeds end_hour, move to next day
+                if next_hour >= schedule_config['end_hour']:
+                    next_time = next_time.replace(hour=schedule_config['start_hour']) + timedelta(days=1)
+                else:
+                    next_time = next_time.replace(hour=next_hour)
             
             # If there are existing scheduled posts, start after the last one
             if future_posts:
@@ -725,17 +794,22 @@ class Database:
                         if next_time.date() == (next_time - timedelta(hours=schedule_config['interval_hours'])).date():
                             next_time += timedelta(days=1)
             
-            # Now shift all existing future posts forward
-            shift_hours = len(overdue_post_ids) * schedule_config['interval_hours']
-            
+            # Now shift all existing future posts forward by calculating proper next slots
             for post_id, old_time_str in future_posts:
                 old_time = datetime.fromisoformat(old_time_str)
-                new_time = old_time + timedelta(hours=shift_hours)
                 
-                # Ensure the new time is within daily bounds, adjusting to next valid day if needed
-                while new_time.hour < schedule_config['start_hour'] or new_time.hour >= schedule_config['end_hour']:
-                    days_to_add = 1
-                    new_time = new_time.replace(hour=schedule_config['start_hour']) + timedelta(days=days_to_add)
+                # Calculate how many interval slots to shift
+                new_time = old_time
+                for _ in range(len(overdue_post_ids)):
+                    new_time += timedelta(hours=schedule_config['interval_hours'])
+                    
+                    # Handle day boundaries properly
+                    if new_time.hour >= schedule_config['end_hour'] or new_time.hour < schedule_config['start_hour']:
+                        # Move to next valid day at start_hour
+                        days_forward = 1
+                        new_time = new_time.replace(hour=schedule_config['start_hour'], minute=0, second=0, microsecond=0)
+                        if new_time.date() == old_time.date():
+                            new_time += timedelta(days=days_forward)
                 
                 cursor.execute('''
                     UPDATE posts SET scheduled_time = ? 
@@ -1572,6 +1646,113 @@ class Database:
         return posts
 
     @staticmethod
+    def get_user_recurring_posts(user_id: int, channel_id: str = None) -> List[Dict]:
+        """Get all active recurring posts for a specific user, optionally filtered by channel"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        if channel_id:
+            cursor.execute('''
+                SELECT p.id, p.file_path, p.media_type, p.description, p.scheduled_time, 
+                       p.channel_id, p.recurring_interval_hours, p.recurring_end_date, 
+                       p.recurring_count, p.recurring_posted_count, c.channel_name,
+                       p.caption_entities
+                FROM posts p
+                LEFT JOIN user_channels c ON p.channel_id = c.channel_id AND p.user_id = c.user_id
+                WHERE p.user_id = ? AND p.channel_id = ? AND p.is_recurring = TRUE AND p.status = 'pending'
+                ORDER BY p.scheduled_time ASC
+            ''', (user_id, channel_id))
+        else:
+            cursor.execute('''
+                SELECT p.id, p.file_path, p.media_type, p.description, p.scheduled_time, 
+                       p.channel_id, p.recurring_interval_hours, p.recurring_end_date, 
+                       p.recurring_count, p.recurring_posted_count, c.channel_name,
+                       p.caption_entities
+                FROM posts p
+                LEFT JOIN user_channels c ON p.channel_id = c.channel_id AND p.user_id = c.user_id
+                WHERE p.user_id = ? AND p.is_recurring = TRUE AND p.status = 'pending'
+                ORDER BY p.scheduled_time ASC
+            ''', (user_id,))
+        
+        posts = []
+        for row in cursor.fetchall():
+            posts.append({
+                'id': row[0],
+                'file_path': row[1],
+                'media_type': row[2],
+                'description': row[3],
+                'scheduled_time': datetime.fromisoformat(row[4]) if row[4] else None,
+                'channel_id': row[5],
+                'recurring_interval_hours': row[6],
+                'recurring_end_date': datetime.fromisoformat(row[7]) if row[7] else None,
+                'recurring_count': row[8],
+                'recurring_posted_count': row[9] or 0,
+                'channel_name': row[10] or row[5],
+                'caption_entities': row[11]
+            })
+        
+        conn.close()
+        return posts
+
+    @staticmethod
+    def update_recurring_post_interval(post_id: int, interval_hours: int, user_id: int = None) -> bool:
+        """Update the recurring interval for a post (with user isolation)"""
+        try:
+            conn = Database.get_connection()
+            cursor = conn.cursor()
+            
+            if user_id:
+                cursor.execute('''
+                    UPDATE posts 
+                    SET recurring_interval_hours = ?
+                    WHERE id = ? AND user_id = ?
+                ''', (interval_hours, post_id, user_id))
+            else:
+                cursor.execute('''
+                    UPDATE posts 
+                    SET recurring_interval_hours = ?
+                    WHERE id = ?
+                ''', (interval_hours, post_id))
+            
+            rows_affected = cursor.rowcount
+            conn.commit()
+            conn.close()
+            return rows_affected > 0
+        except Exception as e:
+            logger.error(f"Error updating recurring interval: {e}")
+            return False
+
+    @staticmethod
+    def update_recurring_post_end_condition(post_id: int, recurring_count: int = None, recurring_end_date = None, user_id: int = None) -> bool:
+        """Update the end condition for a recurring post (with user isolation)"""
+        try:
+            conn = Database.get_connection()
+            cursor = conn.cursor()
+            
+            end_date_str = recurring_end_date.isoformat() if recurring_end_date else None
+            
+            if user_id:
+                cursor.execute('''
+                    UPDATE posts 
+                    SET recurring_count = ?, recurring_end_date = ?
+                    WHERE id = ? AND user_id = ?
+                ''', (recurring_count, end_date_str, post_id, user_id))
+            else:
+                cursor.execute('''
+                    UPDATE posts 
+                    SET recurring_count = ?, recurring_end_date = ?
+                    WHERE id = ?
+                ''', (recurring_count, end_date_str, post_id))
+            
+            rows_affected = cursor.rowcount
+            conn.commit()
+            conn.close()
+            return rows_affected > 0
+        except Exception as e:
+            logger.error(f"Error updating recurring end condition: {e}")
+            return False
+
+    @staticmethod
     def create_batch(user_id: int, batch_name: str, channel_id: str) -> int:
         """Create a new post batch"""
         
@@ -1771,17 +1952,17 @@ class Database:
             return False
 
     @staticmethod
-    def update_post_description(post_id: int, description: str):
-        """Update the description for a specific post"""
+    def update_post_description(post_id: int, description: str, caption_entities: Optional[str] = None):
+        """Update the description and caption entities for a specific post"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
         try:
             cursor.execute('''
                 UPDATE posts 
-                SET description = ?
+                SET description = ?, caption_entities = ?
                 WHERE id = ?
-            ''', (description, post_id))
+            ''', (description, caption_entities, post_id))
             
             conn.commit()
             rows_affected = cursor.rowcount
@@ -1798,6 +1979,105 @@ class Database:
             logger.error(f"Error updating post description for post {post_id}: {e}")
             conn.close()
             return False
+    
+    @staticmethod
+    def update_post_media(post_id: int, file_path: str, media_type: str):
+        """Update the media file for a specific post"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE posts 
+                SET file_path = ?, media_type = ?
+                WHERE id = ?
+            ''', (file_path, media_type, post_id))
+            
+            conn.commit()
+            rows_affected = cursor.rowcount
+            conn.close()
+            
+            if rows_affected > 0:
+                logger.info(f"Updated media for post {post_id}")
+                return True
+            else:
+                logger.warning(f"No rows affected when updating media for post {post_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error updating post media for post {post_id}: {e}")
+            conn.close()
+            return False
+    
+    @staticmethod
+    def delete_post(post_id: int, user_id: int):
+        """Soft delete a post by marking its status as deleted"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                UPDATE posts 
+                SET status = 'deleted'
+                WHERE id = ? AND user_id = ?
+            ''', (post_id, user_id))
+            
+            conn.commit()
+            rows_affected = cursor.rowcount
+            conn.close()
+            
+            if rows_affected > 0:
+                logger.info(f"Deleted post {post_id} for user {user_id}")
+                return True
+            else:
+                logger.warning(f"No rows affected when deleting post {post_id}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error deleting post {post_id}: {e}")
+            conn.close()
+            return False
+    
+    @staticmethod
+    def get_user_mode2_scheduled_posts(user_id: int, channel_id: Optional[str] = None) -> List[Dict]:
+        """Get all scheduled Mode 2 posts for a user, optionally filtered by channel"""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        
+        if channel_id:
+            cursor.execute('''
+                SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, 
+                       channel_id, caption_entities, status
+                FROM posts 
+                WHERE user_id = ? AND mode = 2 AND status = 'pending' AND channel_id = ?
+                ORDER BY scheduled_time ASC
+            ''', (user_id, channel_id))
+        else:
+            cursor.execute('''
+                SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, 
+                       channel_id, caption_entities, status
+                FROM posts 
+                WHERE user_id = ? AND mode = 2 AND status = 'pending'
+                ORDER BY scheduled_time ASC
+            ''', (user_id,))
+        
+        posts = []
+        for row in cursor.fetchall():
+            posts.append({
+                'id': row[0],
+                'user_id': row[1],
+                'file_path': row[2],
+                'media_type': row[3] or 'photo',
+                'description': row[4],
+                'scheduled_time': Database._parse_datetime(row[5]),
+                'mode': row[6],
+                'channel_id': row[7],
+                'caption_entities': row[8],
+                'status': row[9]
+            })
+        
+        conn.close()
+        return posts
 
     @staticmethod
     def delete_all_captions(user_id: int) -> int:

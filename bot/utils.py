@@ -264,20 +264,48 @@ def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int
     
     return schedule_times
 
-def format_schedule_summary(schedule_times: List[datetime]) -> str:
-    """Format schedule times for display"""
+def format_schedule_summary(schedule_times: List[datetime], max_display: int = 15) -> str:
+    """Format schedule times for display, truncating for large batches"""
     if not schedule_times:
         return "No posts scheduled."
     
-    summary = f"📅 Schedule Summary ({len(schedule_times)} posts):\n\n"
+    total = len(schedule_times)
+    
+    if total <= max_display:
+        summary = f"📅 Schedule Summary ({total} posts):\n\n"
+        current_date = None
+        for i, time in enumerate(schedule_times):
+            if current_date != time.date():
+                current_date = time.date()
+                summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
+            summary += f"  {i+1}. {time.strftime('%I:%M %p')}\n"
+        return summary
+    
+    first_time = schedule_times[0]
+    last_time = schedule_times[-1]
+    
+    num_days = (last_time.date() - first_time.date()).days + 1
+    
+    summary = f"📅 Schedule Summary ({total} posts over {num_days} days):\n\n"
+    
+    show_first = 5
+    show_last = 3
     
     current_date = None
-    for i, time in enumerate(schedule_times):
+    for i, time in enumerate(schedule_times[:show_first]):
         if current_date != time.date():
             current_date = time.date()
             summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
-        
         summary += f"  {i+1}. {time.strftime('%I:%M %p')}\n"
+    
+    summary += f"\n  ... {total - show_first - show_last} more posts ...\n"
+    
+    current_date = None
+    for i, time in enumerate(schedule_times[-show_last:], total - show_last + 1):
+        if current_date != time.date():
+            current_date = time.date()
+            summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
+        summary += f"  {i}. {time.strftime('%I:%M %p')}\n"
     
     return summary
 

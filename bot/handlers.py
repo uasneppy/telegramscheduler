@@ -3,6 +3,7 @@ Telegram bot handlers for different commands and interactions
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,18 +33,66 @@ if not hasattr(BotStates, 'WAITING_BULK_EDIT_INPUT'):
 
 # Scheduler will be accessed from application context
 
+async def extract_and_save_media(update: Update, user_id: int, media_type: str) -> str:
+    """Extract media from update message and save to disk"""
+    message = update.message
+    
+    if media_type == 'photo':
+        if not message.photo:
+            return None
+        media_file = message.photo[-1]
+        filename = generate_unique_filename(f"photo_{media_file.file_id}.jpg")
+    elif media_type == 'video':
+        if not message.video:
+            return None
+        media_file = message.video
+        filename = generate_unique_filename(f"video_{media_file.file_id}.mp4")
+    elif media_type == 'audio':
+        if not message.audio:
+            return None
+        media_file = message.audio
+        filename = generate_unique_filename(f"audio_{media_file.file_id}.mp3")
+    elif media_type == 'animation':
+        if not message.animation:
+            return None
+        media_file = message.animation
+        filename = generate_unique_filename(f"animation_{media_file.file_id}.gif")
+    elif media_type in ['document', 'document_image', 'document_video']:
+        if not message.document:
+            return None
+        media_file = message.document
+        original_name = media_file.file_name or f"document_{media_file.file_id}"
+        filename = generate_unique_filename(original_name)
+        media_type = 'document'  # Normalize for storage
+    else:
+        return None
+    
+    file = await media_file.get_file()
+    file_data = await file.download_as_bytearray()
+    file_path = save_media(bytes(file_data), filename, media_type, user_id)
+    
+    return file_path
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
+    if not update or not update.effective_user or not update.message:
+        logger.error("Invalid update in start_handler")
+        return
+    
     user = update.effective_user
     
     # Create main menu keyboard
     keyboard = [
         [InlineKeyboardButton("📸 Mode 1: Bulk Upload", callback_data="main_mode1")],
         [InlineKeyboardButton("📝 Mode 2: Individual Upload", callback_data="main_mode2")],
+        [InlineKeyboardButton("🎯 Mode 3: Guided Captioning", callback_data="main_mode3")],
         [InlineKeyboardButton("🔄 Recurring Posts", callback_data="main_recurring")],
         [InlineKeyboardButton("👁️ Preview Posts", callback_data="main_preview")],
         [InlineKeyboardButton("📅 Calendar View", callback_data="main_calendar")],
         [InlineKeyboardButton("⏰ Manage Overdue", callback_data="main_overdue")],
+        [InlineKeyboardButton("✏️ Edit Posts", callback_data="main_editposts")],
+        [InlineKeyboardButton("🔄 Manage Recurring", callback_data="recurring_manage_menu")],
         [InlineKeyboardButton("🔁 Reschedule All", callback_data="main_reschedule")],
         [InlineKeyboardButton("📺 Manage Channels", callback_data="main_channels")],
         [InlineKeyboardButton("📊 View Statistics", callback_data="main_stats")],
@@ -77,6 +126,10 @@ Choose an option below to get started:
 
 async def mode1_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /mode1 command - bulk photo upload"""
+    if not update or not update.effective_user or not update.message:
+        logger.error("Invalid update in mode1_handler")
+        return
+    
     user = update.effective_user
     
     # Check if user has channels configured
@@ -191,6 +244,10 @@ Perfect! Now upload ONE photo or media file.
 
 async def mode2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /mode2 command - individual photo upload"""
+    if not update or not update.effective_user or not update.message:
+        logger.error("Invalid update in mode2_handler")
+        return
+    
     user = update.effective_user
     
     # Check if user has channels configured
@@ -284,11 +341,38 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_batch_media_upload_wrapper(update, context, user, mode, session_data, media_type)
         return
     
+    # Handle media replacement in edit posts menu
+    if mode == BotStates.EDIT_POST_MEDIA:
+        logger.info(f"Handling media replacement for user {user.id}")
+        try:
+            file_path = await extract_and_save_media(update, user.id, media_type)
+            if file_path:
+                handled = await handle_editposts_media_input(update, user, file_path, media_type, session_data)
+                if handled:
+                    return
+        except Exception as e:
+            logger.error(f"Error handling media replacement: {e}", exc_info=True)
+            await update.message.reply_text(f"Error replacing media: {e}")
+        return
+    
+    # Handle Mode 3 uploading phase
+    if mode == BotStates.MODE3_UPLOADING:
+        logger.info(f"Handling Mode 3 media upload for user {user.id}")
+        try:
+            file_path = await extract_and_save_media(update, user.id, media_type)
+            if file_path:
+                await handle_mode3_media_upload(update, user, file_path, media_type, session_data)
+                return
+        except Exception as e:
+            logger.error(f"Error handling Mode 3 media upload: {e}", exc_info=True)
+            await update.message.reply_text(f"Error uploading media: {e}")
+        return
+    
     if mode not in [BotStates.MODE1_PHOTOS, BotStates.MODE2_PHOTOS, BotStates.RECURRING_MODE]:
         logger.warning(f"Invalid mode for media upload: {mode} for user {user.id}")
         if update.message:
             await update.message.reply_text(
-                "Please start with /mode1, /mode2, recurring posts, or /multibatch first to upload media."
+                "Please start with /mode1, /mode2, /mode3, recurring posts, or /multibatch first to upload media."
             )
         return
     
@@ -407,6 +491,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
                 for i, post in enumerate(current_uploads[-3:], 1):  # Show last 3
                     icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(post['media_type'], '📁')
                     desc_preview = post['description'][:30] + "..." if post['description'] and len(post['description']) > 30 else post['description'] or "No description"
+                    desc_preview = escape_markdown(desc_preview)
                     error_message += f"\n• {icon} {desc_preview}"
             
             error_message += "\n\n📤 Continue uploading more files or use /schedule when ready."
@@ -486,12 +571,24 @@ async def handle_mode1_photo(update: Update, user, file_path: str, session_data:
 
 async def handle_mode2_media(update: Update, user, file_path: str, media_type: str, session_data: dict):
     """Handle media upload in Mode 2 (individual) - instant save with caption"""
+    import json
     
     # Get caption from the message (if any)
     caption = update.message.caption if update.message.caption else None
     
+    # Get caption entities (formatting like bold, italic, etc.) from Telegram's native formatting
+    caption_entities = update.message.caption_entities
+    caption_entities_json = None
+    if caption_entities:
+        # Serialize entities to JSON for storage
+        caption_entities_json = json.dumps([
+            {'type': e.type, 'offset': e.offset, 'length': e.length, 
+             'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+            for e in caption_entities
+        ])
+    
     # Debug logging for caption handling
-    logger.info(f"Mode 2 media upload: User {user.id}, caption='{caption}' (type: {type(caption).__name__})")
+    logger.info(f"Mode 2 media upload: User {user.id}, caption='{caption}', entities={len(caption_entities) if caption_entities else 0}")
     
     # Get the selected channel from session data
     selected_channel_id = session_data.get('selected_channel_id')
@@ -506,8 +603,9 @@ async def handle_mode2_media(update: Update, user, file_path: str, media_type: s
         await update.message.reply_text("❌ Security Error: Invalid channel in session. Please restart with /mode2.")
         return
     
-    # Save media instantly to database
-    post_id = Database.add_post(user.id, file_path, media_type=media_type, description=caption, mode=2, channel_id=selected_channel_id)
+    # Save media instantly to database with caption entities for native formatting support
+    post_id = Database.add_post(user.id, file_path, media_type=media_type, description=caption, mode=2, 
+                                 channel_id=selected_channel_id, caption_entities=caption_entities_json)
     
     # Update session data with saved media
     media_items = session_data.get('media_items', [])
@@ -525,7 +623,9 @@ async def handle_mode2_media(update: Update, user, file_path: str, media_type: s
     
     # Format media type for display
     media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
-    desc_text = f'"{caption}"' if caption else "no caption"
+    # Escape markdown in user-provided caption to prevent parsing errors
+    escaped_caption = escape_markdown(caption) if caption else None
+    desc_text = f'"{escaped_caption}"' if escaped_caption else "no caption"
     
     # Show comprehensive progress for Mode 2
     media_summary = {}
@@ -804,10 +904,11 @@ async def handle_album_caption_input(update: Update, user, text: str, session_da
     
     logger.info(f"Updated album post {pending_album_post_id} with caption for user {user.id}")
     
-    # Send confirmation
+    # Send confirmation - escape user-provided caption to prevent Markdown parsing errors
+    escaped_text = escape_markdown(text)
     await update.message.reply_text(
         f"✅ *Album caption saved!*\n\n"
-        f'📝 Caption: "{text}"\n'
+        f'📝 Caption: "{escaped_text}"\n'
         f"📱 Album size: {album_items_count} items\n\n"
         f"📤 Send more media or use /schedule when ready.",
         parse_mode='Markdown'
@@ -1394,16 +1495,38 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_recurring_count_input(update, user, text, session_data)
     elif mode == "waiting_recurring_date":
         await handle_recurring_date_input(update, user, text, session_data)
+    elif mode == "waiting_recurring_start_time":
+        handled = await handle_recurring_start_time_input(update, user, text, session_data)
+        if handled:
+            return
+    elif mode == 'RECURRING_EDIT_CAPTION':
+        handled = await handle_recurring_caption_input(update, user, text, session_data)
+        if handled:
+            return
+    elif mode == 'RECURRING_EDIT_END_DATE':
+        handled = await handle_recurring_end_date_input(update, user, text, session_data)
+        if handled:
+            return
     elif mode == BotStates.WAITING_BULK_EDIT_INPUT:
         await handle_bulk_edit_input(update, user, text, session_data)
     elif mode == "waiting_backup_name":
         await handle_backup_name_input(update, user, text)
     elif mode == "awaiting_reschedule_settings":
-        await handle_reschedule_settings_input(update, user, text)
+        await handle_reschedule_settings_input(update, user, text, context)
     elif mode == BotStates.WAITING_CAPTION_EDIT:
         await handle_caption_edit_input(update, user, text, session_data)
     elif mode == "awaiting_caption_input":
         await handle_new_caption_input(update, user, text, session_data)
+    elif mode in [BotStates.EDIT_POST_CAPTION, BotStates.EDIT_POST_SCHEDULE]:
+        # Handle comprehensive post editing inputs
+        handled = await handle_editposts_input(update, user, session_data, context)
+        if not handled:
+            await update.message.reply_text(
+                "I'm not sure what to do with this message. Use /help for available commands."
+            )
+    elif mode == BotStates.MODE3_CAPTIONING:
+        # Handle Mode 3 caption input
+        await handle_mode3_caption_input(update, user, session_data, context)
     else:
         await update.message.reply_text(
             "I'm not sure what to do with this message. Use /help for available commands."
@@ -1587,7 +1710,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         channel_id = data.replace("recurring_channel_", "")
         await handle_recurring_channel_selection(query, user, channel_id)
     elif data.startswith("recurring_"):
-        await handle_recurring_callback(query, user, data)
+        await handle_recurring_callback(query, user, data, context)
     elif data.startswith("clearqueue_"):
         await handle_clearqueue_callback(query, user, data)
     elif data.startswith("clearscheduled_"):
@@ -1599,8 +1722,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("retry_"):
         await handle_retry_callback(query, user, data)
     elif data.startswith("reschedule_"):
-        await handle_reschedule_action_callback(query, user, data)
-    elif data.startswith("mode1_channel_") or data.startswith("mode2_channel_"):
+        await handle_reschedule_action_callback(query, user, data, context)
+    elif data.startswith("mode1_channel_") or data.startswith("mode2_channel_") or data.startswith("mode3_channel_"):
         # Parse the mode and channel from the callback data
         parts = data.split("_", 2)  # Split into max 3 parts: mode, "channel", channel_id
         if len(parts) >= 3:
@@ -1609,6 +1732,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             await handle_mode_channel_selection(query, user, mode, channel_id)
         else:
             await query.edit_message_text("❌ Invalid selection.")
+    elif data == "mode3_done_uploading":
+        await handle_mode3_done_uploading(query, user)
+    elif data == "mode3_skip_caption":
+        await handle_mode3_skip_caption(query, user)
+    elif data == "mode3_schedule":
+        await handle_mode3_schedule(query, user)
+    elif data == "mode3_cancel":
+        await handle_mode3_cancel(query, user)
     elif data == "stats_channels":
         await stats_channels_handler(query, user)
     elif data.startswith("stats_channel_"):
@@ -1679,6 +1810,86 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await handle_delete_captions_callback(query, user, data)
     elif data.startswith("edit_captions_"):
         await handle_edit_captions_callback(query, user, data)
+    # Comprehensive edit posts menu callbacks
+    elif data == "editposts_menu":
+        await show_editposts_menu(query, user)
+    elif data.startswith("editposts_channel_"):
+        channel_id = data.replace("editposts_channel_", "")
+        await handle_editposts_channel_selection(query, user, channel_id)
+    elif data.startswith("editposts_nav_"):
+        new_index = int(data.replace("editposts_nav_", ""))
+        await handle_editposts_navigation(query, user, new_index)
+    elif data == "editposts_info":
+        await query.answer("Navigate using Prev/Next buttons")
+    elif data.startswith("editposts_preview_"):
+        post_id = int(data.replace("editposts_preview_", ""))
+        await handle_editposts_preview(query, user, post_id)
+    elif data.startswith("editposts_caption_"):
+        post_id = int(data.replace("editposts_caption_", ""))
+        await handle_editposts_caption(query, user, post_id)
+    elif data.startswith("editposts_media_"):
+        post_id = int(data.replace("editposts_media_", ""))
+        await handle_editposts_media(query, user, post_id)
+    elif data.startswith("editposts_schedule_"):
+        post_id = int(data.replace("editposts_schedule_", ""))
+        await handle_editposts_schedule(query, user, post_id)
+    elif data.startswith("editposts_schedquick_"):
+        parts = data.replace("editposts_schedquick_", "").split("_")
+        post_id = int(parts[0])
+        hours = int(parts[1])
+        await handle_editposts_schedule_quick(query, user, post_id, hours, context)
+    elif data.startswith("editposts_schedcustom_"):
+        post_id = int(data.replace("editposts_schedcustom_", ""))
+        await handle_editposts_schedule_custom(query, user, post_id)
+    elif data.startswith("editposts_delete_"):
+        post_id = int(data.replace("editposts_delete_", ""))
+        await handle_editposts_delete(query, user, post_id)
+    elif data.startswith("editposts_confirmdelete_"):
+        post_id = int(data.replace("editposts_confirmdelete_", ""))
+        await handle_editposts_confirm_delete(query, user, post_id, context)
+    elif data.startswith("editposts_cancel_"):
+        post_id = int(data.replace("editposts_cancel_", ""))
+        await handle_editposts_cancel(query, user, post_id)
+    # Recurring posts management callbacks
+    elif data == "recurring_manage_menu":
+        await show_recurring_posts_menu(query, user)
+    elif data.startswith("recur_manage_ch_"):
+        channel_id = data.replace("recur_manage_ch_", "")
+        await handle_recurring_channel_posts(query, user, channel_id)
+    elif data.startswith("recur_nav_"):
+        new_index = int(data.replace("recur_nav_", ""))
+        await handle_recurring_navigation(query, user, new_index)
+    elif data.startswith("recur_preview_"):
+        post_id = int(data.replace("recur_preview_", ""))
+        await handle_recurring_preview(query, user, post_id)
+    elif data.startswith("recur_editcap_"):
+        post_id = int(data.replace("recur_editcap_", ""))
+        await handle_recurring_edit_caption(query, user, post_id)
+    elif data.startswith("recur_editint_"):
+        post_id = int(data.replace("recur_editint_", ""))
+        await handle_recurring_edit_interval(query, user, post_id)
+    elif data.startswith("recur_setint_"):
+        parts = data.replace("recur_setint_", "").split("_")
+        post_id = int(parts[0])
+        interval = int(parts[1])
+        await handle_recurring_set_interval(query, user, post_id, interval)
+    elif data.startswith("recur_editend_"):
+        post_id = int(data.replace("recur_editend_", ""))
+        await handle_recurring_edit_end(query, user, post_id)
+    elif data.startswith("recur_setend_"):
+        parts = data.replace("recur_setend_", "").split("_", 1)
+        post_id = int(parts[0])
+        end_type = parts[1] if len(parts) > 1 else "never"
+        await handle_recurring_set_end(query, user, post_id, end_type, context)
+    elif data.startswith("recur_delete_"):
+        post_id = int(data.replace("recur_delete_", ""))
+        await handle_recurring_delete(query, user, post_id)
+    elif data.startswith("recur_confirmdel_"):
+        post_id = int(data.replace("recur_confirmdel_", ""))
+        await handle_recurring_confirm_delete(query, user, post_id, context)
+    elif data.startswith("recur_back_"):
+        post_id = int(data.replace("recur_back_", ""))
+        await handle_recurring_back_to_post(query, user, post_id)
     else:
         logger.warning(f"Unhandled callback data: {data} from user {user.id}")
 
@@ -1716,36 +1927,37 @@ async def execute_scheduling(query, user, context=None, selected_channel_id=None
     
     # Schedule all posts
     post_ids = [post['id'] for post in pending_posts]
-    scheduler_available = False
+    total_posts = len(post_ids)
+    
+    # For large batches, show progress message first
+    if total_posts > 20:
+        await query.edit_message_text(
+            f"⏳ *Scheduling {total_posts} posts...*\n\n"
+            f"This may take a moment. Please wait.",
+            parse_mode='Markdown'
+        )
+    
+    # First, save all scheduled times to database (fast, reliable)
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    for post_id, scheduled_time in zip(post_ids, schedule_times):
+        cursor.execute(
+            'UPDATE posts SET scheduled_time = ? WHERE id = ?',
+            (scheduled_time.isoformat(), post_id)
+        )
+    conn.commit()
+    conn.close()
+    logger.info(f"Saved {total_posts} post schedule times to database")
+    
+    # Then try to register with APScheduler (monitoring will catch any missed ones)
     if context and context.application and context.application.bot_data:
         scheduler = context.application.bot_data.get('scheduler')
         if scheduler:
             try:
                 await scheduler.schedule_posts(post_ids, schedule_times)
-                scheduler_available = True
-                logger.info(f"Successfully scheduled {len(post_ids)} posts with scheduler")
+                logger.info(f"Successfully registered {total_posts} posts with scheduler")
             except Exception as e:
-                logger.error(f"Failed to schedule posts: {e}")
-        else:
-            logger.warning("Scheduler not found in bot_data")
-    else:
-        logger.warning("Context, application, or bot_data not available for scheduler")
-    
-    if not scheduler_available:
-        logger.warning("Scheduler not available from context - using database-only fallback")
-        # Fallback: Update database with scheduled times and let the monitoring function handle it
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        for post_id, scheduled_time in zip(post_ids, schedule_times):
-            cursor.execute(
-                'UPDATE posts SET scheduled_time = ? WHERE id = ?',
-                (scheduled_time.isoformat(), post_id)
-            )
-        conn.commit()
-        conn.close()
-        logger.info(f"Fallback: Updated {len(post_ids)} posts with scheduled times in database")
-        
-        # The monitoring function will detect these posts and schedule them properly
+                logger.warning(f"Scheduler registration partial/failed: {e} - monitor will handle remaining")
     
     # Build summary message showing channels
     channel_summary = ""
@@ -1754,13 +1966,29 @@ async def execute_scheduling(query, user, context=None, selected_channel_id=None
         channel_name = channel['channel_name'] if channel else f"Unknown ({channel_id})"
         channel_summary += f"• *{channel_name}*: {len(posts)} posts\n"
     
-    await query.edit_message_text(
-        f"✅ *Successfully scheduled {len(pending_posts)} posts!*\n\n"
+    summary_text = format_schedule_summary(schedule_times)
+    
+    # Ensure message doesn't exceed Telegram's limit
+    msg = (
+        f"✅ *Successfully scheduled {total_posts} posts!*\n\n"
         f"*Channels:*\n{channel_summary}\n"
-        f"*Schedule:*\n{format_schedule_summary(schedule_times)}\n"
-        f"You'll receive notifications when each post is published.",
-        parse_mode='Markdown'
+        f"*Schedule:*\n{summary_text}\n"
+        f"You'll receive notifications when each post is published."
     )
+    
+    if len(msg) > 4000:
+        msg = (
+            f"✅ *Successfully scheduled {total_posts} posts!*\n\n"
+            f"*Channels:*\n{channel_summary}\n"
+            f"*First post:* {schedule_times[0].strftime('%Y-%m-%d %I:%M %p')}\n"
+            f"*Last post:* {schedule_times[-1].strftime('%Y-%m-%d %I:%M %p')}\n\n"
+            f"You'll receive notifications when each post is published."
+        )
+    
+    try:
+        await query.edit_message_text(msg, parse_mode='Markdown')
+    except Exception:
+        await query.message.reply_text(msg, parse_mode='Markdown')
     
     # Clear only the posts that were just scheduled (channel-specific clearing)
     # Get the unique channels that were scheduled
@@ -1838,7 +2066,13 @@ async def execute_next_slot_scheduling(query, user, context=None):
                 start_date = start_date.replace(hour=start_hour, minute=0, second=0, microsecond=0) + timedelta(days=1)
             else:
                 start_date = start_date.replace(hour=aligned_hour, minute=0, second=0, microsecond=0)
-    else:
+        
+        # CRITICAL: If start_date is still in the past, fall through to current time logic
+        if start_date <= now:
+            logger.info(f"Calculated start_date {start_date} is in the past, using current time logic")
+            latest_scheduled_time = None  # Force fallback to current time logic
+    
+    if not latest_scheduled_time:
         # No scheduled posts yet, use current time logic
         current_hour = now.hour
         current_minute = now.minute
@@ -1870,36 +2104,39 @@ async def execute_next_slot_scheduling(query, user, context=None):
     
     # Schedule all posts
     post_ids = [post['id'] for post in pending_posts]
-    scheduler_available = False
+    total_posts = len(post_ids)
+    
+    logger.info(f"execute_next_slot_scheduling: Attempting to schedule {total_posts} posts")
+    
+    # For large batches, show progress message first
+    if total_posts > 20:
+        await query.edit_message_text(
+            f"⏳ *Scheduling {total_posts} posts...*\n\n"
+            f"This may take a moment. Please wait.",
+            parse_mode='Markdown'
+        )
+    
+    # First, save all scheduled times to database (fast, reliable)
+    conn = Database.get_connection()
+    cursor = conn.cursor()
+    for post_id, scheduled_time in zip(post_ids, schedule_times):
+        cursor.execute(
+            'UPDATE posts SET scheduled_time = ? WHERE id = ?',
+            (scheduled_time.isoformat(), post_id)
+        )
+    conn.commit()
+    conn.close()
+    logger.info(f"Saved {total_posts} post schedule times to database (next slot)")
+    
+    # Then try to register with APScheduler (monitoring will catch any missed ones)
     if context and context.application and context.application.bot_data:
         scheduler = context.application.bot_data.get('scheduler')
         if scheduler:
             try:
                 await scheduler.schedule_posts(post_ids, schedule_times)
-                scheduler_available = True
-                logger.info(f"Successfully scheduled {len(post_ids)} posts with scheduler (next slot)")
+                logger.info(f"Successfully registered {total_posts} posts with scheduler (next slot)")
             except Exception as e:
-                logger.error(f"Failed to schedule posts: {e}")
-        else:
-            logger.warning("Scheduler not found in bot_data")
-    else:
-        logger.warning("Context, application, or bot_data not available for scheduler")
-    
-    if not scheduler_available:
-        logger.warning("Scheduler not available from context - using database-only fallback")
-        # Fallback: Update database with scheduled times and let the monitoring function handle it
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        for post_id, scheduled_time in zip(post_ids, schedule_times):
-            cursor.execute(
-                'UPDATE posts SET scheduled_time = ? WHERE id = ?',
-                (scheduled_time.isoformat(), post_id)
-            )
-        conn.commit()
-        conn.close()
-        logger.info(f"Fallback: Updated {len(post_ids)} posts with scheduled times in database (next slot)")
-        
-        # The monitoring function will detect these posts and schedule them properly
+                logger.warning(f"Scheduler registration partial/failed: {e} - monitor will handle remaining")
     
     # Build summary message showing channels
     channel_summary = ""
@@ -1921,14 +2158,30 @@ async def execute_next_slot_scheduling(query, user, context=None):
         strategy_msg = f"⏭️ *Starting from next available slot:*\n" \
                       f"First post: {first_time_str} (Kyiv time)\n\n"
     
-    await query.edit_message_text(
-        f"✅ *Successfully scheduled {len(pending_posts)} posts!*\n\n"
+    summary_text = format_schedule_summary(schedule_times)
+    
+    msg = (
+        f"✅ *Successfully scheduled {total_posts} posts!*\n\n"
         f"{strategy_msg}"
         f"*Channels:*\n{channel_summary}\n"
-        f"*Schedule:*\n{format_schedule_summary(schedule_times)}\n"
-        f"You'll receive notifications when each post is published.",
-        parse_mode='Markdown'
+        f"*Schedule:*\n{summary_text}\n"
+        f"You'll receive notifications when each post is published."
     )
+    
+    if len(msg) > 4000:
+        msg = (
+            f"✅ *Successfully scheduled {total_posts} posts!*\n\n"
+            f"{strategy_msg}"
+            f"*Channels:*\n{channel_summary}\n"
+            f"*First post:* {schedule_times[0].strftime('%Y-%m-%d %I:%M %p')}\n"
+            f"*Last post:* {schedule_times[-1].strftime('%Y-%m-%d %I:%M %p')}\n\n"
+            f"You'll receive notifications when each post is published."
+        )
+    
+    try:
+        await query.edit_message_text(msg, parse_mode='Markdown')
+    except Exception:
+        await query.message.reply_text(msg, parse_mode='Markdown')
     
     # Clear only the posts that were just scheduled (channel-specific clearing)
     # Get the unique channels that were scheduled
@@ -2880,6 +3133,21 @@ async def handle_main_menu_callback(query, user, data):
         
         # Always ask user to select a channel
         await prompt_channel_selection_for_mode_inline(query, user.id, channels, mode=2)
+    
+    elif action == "mode3":
+        # Check if user has channels configured
+        channels = Database.get_user_channels(user.id)
+        
+        if not channels:
+            await query.edit_message_text(
+                "❌ *No channels configured!*\n\n"
+                "Please add a channel first using /channels command before using Mode 3.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Always ask user to select a channel
+        await prompt_channel_selection_for_mode_inline(query, user.id, channels, mode=3)
         
     elif action == "channels":
         # Show channels management
@@ -2912,6 +3180,10 @@ async def handle_main_menu_callback(query, user, data):
     elif action == "preview":
         # Show post previews
         await main_preview_handler(query, user)
+    
+    elif action == "editposts":
+        # Show edit posts menu
+        await show_editposts_menu(query, user)
 
 async def channels_handler_inline(query, user):
     """Handle inline channels management"""
@@ -3124,8 +3396,8 @@ async def stats_channel_details_handler(query, user, channel_id):
                 time_str = scheduled_dt.strftime("%m/%d %H:%M")
                 media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(post['media_type'], '📁')
                 
-                # Show full description without truncation
-                desc = post['description'] or "No description"
+                # Show full description without truncation, escaped for Markdown
+                desc = escape_markdown(post['description'] or "No description")
                 
                 message += f"{i+1}. {time_str} {media_icon} - {desc}\n"
             except (ValueError, TypeError, AttributeError) as e:
@@ -3208,8 +3480,9 @@ async def edit_mode2_posts_handler(query, user, channel_id):
                 # Add status indicator for failed posts
                 status_icon = "⚠️" if post['status'] == 'failed' else ""
                 
-                # Truncate description if too long
-                desc = post['description'][:25] + "..." if post['description'] and len(post['description']) > 25 else post['description'] or "No description"
+                # Truncate description if too long, escaped for Markdown
+                raw_desc = post['description'][:25] + "..." if post['description'] and len(post['description']) > 25 else post['description'] or "No description"
+                desc = escape_markdown(raw_desc)
                 
                 message += f"{i+1}. {status_icon}*{time_str}* - {desc}\n"
                 
@@ -3564,10 +3837,13 @@ async def show_main_menu(query, user):
     keyboard = [
         [InlineKeyboardButton("📸 Mode 1: Bulk Upload", callback_data="main_mode1")],
         [InlineKeyboardButton("📝 Mode 2: Individual Upload", callback_data="main_mode2")],
+        [InlineKeyboardButton("🎯 Mode 3: Guided Captioning", callback_data="main_mode3")],
         [InlineKeyboardButton("🔄 Recurring Posts", callback_data="main_recurring")],
         [InlineKeyboardButton("👁️ Preview Posts", callback_data="main_preview")],
         [InlineKeyboardButton("📅 Calendar View", callback_data="main_calendar")],
         [InlineKeyboardButton("⏰ Manage Overdue", callback_data="main_overdue")],
+        [InlineKeyboardButton("✏️ Edit Posts", callback_data="main_editposts")],
+        [InlineKeyboardButton("🔄 Manage Recurring", callback_data="recurring_manage_menu")],
         [InlineKeyboardButton("🔁 Reschedule All", callback_data="main_reschedule")],
         [InlineKeyboardButton("📺 Manage Channels", callback_data="main_channels")],
         [InlineKeyboardButton("📊 View Statistics", callback_data="main_stats")],
@@ -4161,9 +4437,17 @@ Select posting frequency:
     
     await query.edit_message_text(message, reply_markup=reply_markup)
 
-async def handle_recurring_callback(query, user, data):
+async def handle_recurring_callback(query, user, data, context=None):
     """Handle recurring schedule callbacks"""
     action = data.replace("recurring_", "")
+    
+    # Handle start time selection for recurring posts
+    if action == "start_now":
+        await handle_recurring_start_choice(query, user, "now", context)
+        return
+    elif action == "start_custom":
+        await handle_recurring_start_choice(query, user, "custom", context)
+        return
     
     # Handle recurring post schedule options (new format with post_id)
     if action.startswith("schedule_"):
@@ -4316,114 +4600,122 @@ Choose end condition:
     
     # Handle new format end conditions with post_id
     elif action.startswith("count_"):
-        # Parse "count_{interval_hours}_{post_id}"
+        # Parse "count_{interval_hours}" or "count_{interval_hours}_{post_id}"
         parts = action.split("_")
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             interval_hours = int(parts[1])
-            post_id = int(parts[2])
-            Database.update_user_session(user.id, "waiting_recurring_count", {
-                "interval_hours": interval_hours, 
-                "post_id": post_id,
-                "mode": "individual_with_id"
-            })
-            await query.edit_message_text(
-                f"🔢 *Set Post Count Limit*\n\n"
-                f"*Interval:* Every {interval_hours} hours\n"
-                f"*Post ID:* {post_id}\n\n"
-                f"How many times should this post be repeated?\n\n"
-                f"*Examples:*\n"
-                f"• `5` - Post will be shared 5 times\n"
-                f"• `10` - Post will be shared 10 times\n"
-                f"• `30` - Post will be shared 30 times\n\n"
-                f"*Send the number of repetitions:*",
-                parse_mode='Markdown'
-            )
+            
+            if len(parts) >= 3:
+                # Has post_id
+                post_id = int(parts[2])
+                Database.update_user_session(user.id, "waiting_recurring_count", {
+                    "interval_hours": interval_hours, 
+                    "post_id": post_id,
+                    "mode": "individual_with_id"
+                })
+                await query.edit_message_text(
+                    f"🔢 *Set Post Count Limit*\n\n"
+                    f"*Interval:* Every {interval_hours} hours\n"
+                    f"*Post ID:* {post_id}\n\n"
+                    f"How many times should this post be repeated?\n\n"
+                    f"*Examples:*\n"
+                    f"• `5` - Post will be shared 5 times\n"
+                    f"• `10` - Post will be shared 10 times\n"
+                    f"• `30` - Post will be shared 30 times\n\n"
+                    f"*Send the number of repetitions:*",
+                    parse_mode='Markdown'
+                )
+            else:
+                # No post_id - individual mode
+                Database.update_user_session(user.id, "waiting_recurring_count", {
+                    "interval_hours": interval_hours, 
+                    "mode": "individual"
+                })
+                await query.edit_message_text(
+                    f"🔢 *Set Post Count Limit*\n\n"
+                    f"*Interval:* Every {interval_hours} hours\n\n"
+                    f"How many times should this post be repeated?\n\n"
+                    f"*Examples:*\n"
+                    f"• `5` - Post will be shared 5 times\n"
+                    f"• `10` - Post will be shared 10 times\n"
+                    f"• `30` - Post will be shared 30 times\n\n"
+                    f"*Send the number of repetitions:*",
+                    parse_mode='Markdown'
+                )
             return
     
     elif action.startswith("date_"):
-        # Parse "date_{interval_hours}_{post_id}"
+        # Parse "date_{interval_hours}" or "date_{interval_hours}_{post_id}"
         parts = action.split("_")
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             interval_hours = int(parts[1])
-            post_id = int(parts[2])
-            Database.update_user_session(user.id, "waiting_recurring_date", {
-                "interval_hours": interval_hours, 
-                "post_id": post_id,
-                "mode": "individual_with_id"
-            })
-            await query.edit_message_text(
-                f"📅 *Set End Date*\n\n"
-                f"*Interval:* Every {interval_hours} hours\n"
-                f"*Post ID:* {post_id}\n\n"
-                f"When should the recurring posts stop?\n\n"
-                f"*Format:* YYYY-MM-DD HH:MM\n"
-                f"*Examples:*\n"
-                f"• `2025-08-01 12:00` - Stop on August 1st at noon\n"
-                f"• `2025-12-31 23:59` - Stop on New Year's Eve\n\n"
-                f"*Send the end date and time (Kyiv timezone):*",
-                parse_mode='Markdown'
-            )
+            
+            if len(parts) >= 3:
+                # Has post_id
+                post_id = int(parts[2])
+                Database.update_user_session(user.id, "waiting_recurring_date", {
+                    "interval_hours": interval_hours, 
+                    "post_id": post_id,
+                    "mode": "individual_with_id"
+                })
+                await query.edit_message_text(
+                    f"📅 *Set End Date*\n\n"
+                    f"*Interval:* Every {interval_hours} hours\n"
+                    f"*Post ID:* {post_id}\n\n"
+                    f"When should the recurring posts stop?\n\n"
+                    f"*Format:* YYYY-MM-DD HH:MM\n"
+                    f"*Examples:*\n"
+                    f"• `2025-08-01 12:00` - Stop on August 1st at noon\n"
+                    f"• `2025-12-31 23:59` - Stop on New Year's Eve\n\n"
+                    f"*Send the end date and time (Kyiv timezone):*",
+                    parse_mode='Markdown'
+                )
+            else:
+                # No post_id - individual mode
+                Database.update_user_session(user.id, "waiting_recurring_date", {
+                    "interval_hours": interval_hours, 
+                    "mode": "individual"
+                })
+                await query.edit_message_text(
+                    f"📅 *Set End Date*\n\n"
+                    f"*Interval:* Every {interval_hours} hours\n\n"
+                    f"When should the recurring posts stop?\n\n"
+                    f"*Format:* YYYY-MM-DD HH:MM\n"
+                    f"*Examples:*\n"
+                    f"• `2025-08-01 12:00` - Stop on August 1st at noon\n"
+                    f"• `2025-12-31 23:59` - Stop on New Year's Eve\n\n"
+                    f"*Send the end date and time (Kyiv timezone):*",
+                    parse_mode='Markdown'
+                )
             return
     
     elif action.startswith("never_"):
-        # Parse "never_{interval_hours}_{post_id}"
+        # Parse "never_{interval_hours}" or "never_{interval_hours}_{post_id}"
         parts = action.split("_")
-        if len(parts) >= 3:
+        if len(parts) >= 2:
             interval_hours = int(parts[1])
-            post_id = int(parts[2])
             
-            # Set up recurring post with no end condition
-            try:
-                from bot.utils import get_current_kyiv_time
-                from datetime import timedelta
-                
-                # Set up the recurring post in the database using update
-                conn = Database.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    UPDATE posts SET 
-                        is_recurring = TRUE,
-                        recurring_interval_hours = ?,
-                        recurring_count = ?,
-                        recurring_end_date = ?
-                    WHERE id = ?
-                ''', (interval_hours, None, None, post_id))
-                conn.commit()
-                conn.close()
-                
-                # Schedule the first occurrence immediately or at next interval
-                next_time = get_current_kyiv_time() + timedelta(minutes=1)  # Start in 1 minute
-                Database.update_post_schedule(post_id, next_time)
-                
-                # Use scheduler to schedule the first post
-                # Note: This callback needs access to context to get shared scheduler
-                from .scheduler import PostScheduler
-                scheduler = PostScheduler()
-                logger.warning("Using fallback scheduler instance for recurring post setup")
-                await scheduler.schedule_single_post(post_id, next_time)
-                
-                await query.edit_message_text(
-                    f"✅ *Recurring Post Scheduled!*\n\n"
-                    f"*Post ID:* {post_id}\n"
-                    f"*Interval:* Every {interval_hours} hours\n"
-                    f"*End Condition:* Never (runs until manually stopped)\n"
-                    f"*First Post:* {next_time.strftime('%Y-%m-%d %H:%M')} (Kyiv time)\n\n"
-                    f"Your recurring post will start shortly and repeat automatically!",
-                    parse_mode='Markdown'
-                )
-                
-                # Reset user session
-                Database.update_user_session(user.id, BotStates.IDLE)
-                return
-                
-            except Exception as e:
-                logger.error(f"Failed to set up recurring post {post_id}: {e}")
-                await query.edit_message_text(
-                    f"❌ *Error Setting Up Recurring Post*\n\n"
-                    f"Failed to configure the recurring schedule. Please try again.",
-                    parse_mode='Markdown'
-                )
-                return
+            if len(parts) >= 3:
+                # Has post_id
+                post_id = int(parts[2])
+                await show_recurring_start_time_options(query, user, {
+                    'interval_hours': interval_hours,
+                    'post_id': post_id,
+                    'end_type': 'never',
+                    'recurring_count': None,
+                    'recurring_end_date': None,
+                    'mode': 'individual_with_id'
+                })
+            else:
+                # No post_id - individual mode
+                await show_recurring_start_time_options(query, user, {
+                    'interval_hours': interval_hours,
+                    'end_type': 'never',
+                    'recurring_count': None,
+                    'recurring_end_date': None,
+                    'mode': 'individual'
+                })
+            return
         
     elif action.startswith("recur_date_"):
         interval = int(action.split("_")[2])
@@ -4443,7 +4735,14 @@ Choose end condition:
         
     elif action.startswith("recur_never_"):
         interval = int(action.split("_")[2])
-        await setup_individual_recurring_post(query, user, interval, None, None)
+        # Store config in session and show start time options
+        await show_recurring_start_time_options(query, user, {
+            'interval_hours': interval,
+            'end_type': 'never',
+            'recurring_count': None,
+            'recurring_end_date': None,
+            'mode': 'individual'
+        })
         return
     
     # Handle channel selection for individual recurring posts (new format)
@@ -4835,17 +5134,17 @@ async def setup_recurring_posts(query, user, interval_hours, recurring_count=Non
     
     Database.update_user_session(user.id, BotStates.IDLE)
 
-async def setup_individual_recurring_post(query, user, interval_hours, recurring_count=None, recurring_end_date=None):
+async def setup_individual_recurring_post(query, user, interval_hours, recurring_count=None, recurring_end_date=None, first_post_time=None):
     """Set up recurring posts for individual mode"""
     # Get the post data from the current recurring mode session
-    session = Database.get_user_session(user.id)
-    if not session or session.get('mode') != 'RECURRING_MODE':
+    mode, session_data = Database.get_user_session(user.id)
+    if mode != 'RECURRING_MODE':
         await query.edit_message_text("❌ No post to schedule for recurring.")
         return
     
-    session_data = session.get('data', {})
-    file_path = session_data.get('file_path')
-    media_type = session_data.get('media_type', 'photo')
+    # Check both key names - 'file_path' and 'current_media_path' for compatibility
+    file_path = session_data.get('file_path') or session_data.get('current_media_path')
+    media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
     description = session_data.get('description', '')
     
     if not file_path:
@@ -4892,8 +5191,9 @@ async def setup_individual_recurring_post(query, user, interval_hours, recurring
     from bot.utils import get_current_kyiv_time
     from datetime import timedelta
     
-    # Create the recurring post starting from now
-    first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
+    # Use provided first_post_time or default to 1 minute from now
+    if first_post_time is None:
+        first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
     
     Database.add_post(
         user_id=user.id,
@@ -4944,17 +5244,17 @@ async def setup_individual_recurring_post(query, user, interval_hours, recurring
     # Clear the session since we've scheduled the post
     Database.update_user_session(user.id, BotStates.IDLE)
 
-async def setup_individual_recurring_post_with_channel(query, user, interval_hours, channel_id, recurring_count=None, recurring_end_date=None):
+async def setup_individual_recurring_post_with_channel(query, user, interval_hours, channel_id, recurring_count=None, recurring_end_date=None, first_post_time=None):
     """Set up individual recurring post with specific channel"""
     # Get the post data from the current recurring mode session
-    session = Database.get_user_session(user.id)
-    if not session or session.get('mode') != 'RECURRING_MODE':
+    mode, session_data = Database.get_user_session(user.id)
+    if mode != 'RECURRING_MODE':
         await query.edit_message_text("❌ No post to schedule for recurring.")
         return
     
-    session_data = session.get('data', {})
-    file_path = session_data.get('file_path')
-    media_type = session_data.get('media_type', 'photo')
+    # Check both key names - 'file_path' and 'current_media_path' for compatibility
+    file_path = session_data.get('file_path') or session_data.get('current_media_path')
+    media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
     description = session_data.get('description', '')
     
     if not file_path:
@@ -4969,8 +5269,9 @@ async def setup_individual_recurring_post_with_channel(query, user, interval_hou
     selected_channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
     channel_name = selected_channel['channel_name'] if selected_channel else channel_id
     
-    # Create the recurring post starting from now
-    first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
+    # Use provided first_post_time or default to 1 minute from now
+    if first_post_time is None:
+        first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
     
     Database.add_post(
         user_id=user.id,
@@ -5021,6 +5322,522 @@ async def setup_individual_recurring_post_with_channel(query, user, interval_hou
     # Clear the session since we've scheduled the post
     Database.update_user_session(user.id, BotStates.IDLE)
 
+
+async def show_recurring_start_time_options(query, user, config: dict):
+    """Show start time options for recurring posts"""
+    from bot.utils import get_current_kyiv_time
+    
+    # Get current session data to preserve media info
+    current_mode, current_session = Database.get_user_session(user.id)
+    
+    # Merge the recurring config with existing session data (preserve media info)
+    merged_session = {**current_session, 'recurring_config': config}
+    
+    # Store the merged session
+    Database.update_user_session(user.id, "RECURRING_START_TIME", merged_session)
+    
+    current_time = get_current_kyiv_time()
+    interval_hours = config.get('interval_hours', 24)
+    
+    interval_text = f"{interval_hours} hours"
+    if interval_hours == 24:
+        interval_text = "daily"
+    elif interval_hours == 48:
+        interval_text = "every 2 days"
+    elif interval_hours == 168:
+        interval_text = "weekly"
+    
+    end_type = config.get('end_type', 'never')
+    if end_type == 'never':
+        end_text = "Never (manual stop)"
+    elif config.get('recurring_count'):
+        end_text = f"After {config['recurring_count']} posts"
+    elif config.get('recurring_end_date'):
+        # Handle both string and datetime objects
+        end_date = config['recurring_end_date']
+        if isinstance(end_date, str):
+            from datetime import datetime
+            end_date = datetime.fromisoformat(end_date)
+        end_text = f"On {end_date.strftime('%Y-%m-%d %H:%M')}"
+    else:
+        end_text = "Never"
+    
+    keyboard = [
+        [InlineKeyboardButton("🚀 Start Now (in 1 minute)", callback_data="recurring_start_now")],
+        [InlineKeyboardButton("📅 Custom Date & Time", callback_data="recurring_start_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"⏰ *When should the first post be sent?*\n\n"
+        f"*Interval:* Every {interval_text}\n"
+        f"*End condition:* {end_text}\n"
+        f"*Current time:* {current_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n\n"
+        f"Choose when to start:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def show_recurring_start_time_options_from_message(update: Update, user, config: dict):
+    """Show start time options for recurring posts (from text message input)"""
+    from bot.utils import get_current_kyiv_time
+    
+    # Get current session data to preserve media info
+    current_mode, current_session = Database.get_user_session(user.id)
+    
+    # Merge the recurring config with existing session data (preserve media info)
+    merged_session = {**current_session, 'recurring_config': config}
+    
+    # Store the merged session
+    Database.update_user_session(user.id, "RECURRING_START_TIME", merged_session)
+    
+    current_time = get_current_kyiv_time()
+    interval_hours = config.get('interval_hours', 24)
+    
+    interval_text = f"{interval_hours} hours"
+    if interval_hours == 24:
+        interval_text = "daily"
+    elif interval_hours == 48:
+        interval_text = "every 2 days"
+    elif interval_hours == 168:
+        interval_text = "weekly"
+    
+    end_type = config.get('end_type', 'never')
+    if end_type == 'never':
+        end_text = "Never (manual stop)"
+    elif config.get('recurring_count'):
+        end_text = f"After {config['recurring_count']} posts"
+    elif config.get('recurring_end_date'):
+        # Handle both string and datetime objects
+        end_date = config['recurring_end_date']
+        if isinstance(end_date, str):
+            from datetime import datetime
+            end_date = datetime.fromisoformat(end_date)
+        end_text = f"On {end_date.strftime('%Y-%m-%d %H:%M')}"
+    else:
+        end_text = "Never"
+    
+    keyboard = [
+        [InlineKeyboardButton("🚀 Start Now (in 1 minute)", callback_data="recurring_start_now")],
+        [InlineKeyboardButton("📅 Custom Date & Time", callback_data="recurring_start_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"⏰ *When should the first post be sent?*\n\n"
+        f"*Interval:* Every {interval_text}\n"
+        f"*End condition:* {end_text}\n"
+        f"*Current time:* {current_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n\n"
+        f"Choose when to start:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_recurring_start_choice(query, user, start_type: str, context=None):
+    """Handle when user selects start time option"""
+    from bot.utils import get_current_kyiv_time
+    from datetime import timedelta
+    
+    mode, session_data = Database.get_user_session(user.id)
+    if mode != 'RECURRING_START_TIME':
+        await query.answer("Session expired. Please start again.")
+        return
+    
+    # Extract recurring config from merged session
+    recurring_config = session_data.get('recurring_config', {})
+    
+    if start_type == "now":
+        # Start in 1 minute
+        first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
+        await finalize_recurring_post(query, user, session_data, recurring_config, first_post_time, context)
+    
+    elif start_type == "custom":
+        # Ask for custom datetime input
+        current_time = get_current_kyiv_time()
+        Database.update_user_session(user.id, "waiting_recurring_start_time", session_data)
+        
+        await query.edit_message_text(
+            f"📅 *Set Start Date & Time*\n\n"
+            f"*Current time:* {current_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n\n"
+            f"Enter when the first post should be sent:\n\n"
+            f"*Format:* `YYYY-MM-DD HH:MM`\n\n"
+            f"*Examples:*\n"
+            f"• `{(current_time + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M')}` - In 2 hours\n"
+            f"• `{(current_time + timedelta(days=1)).strftime('%Y-%m-%d')} 10:00` - Tomorrow at 10 AM\n"
+            f"• `{(current_time + timedelta(days=7)).strftime('%Y-%m-%d')} 14:00` - Next week at 2 PM\n\n"
+            f"*Send the date and time (Kyiv timezone):*",
+            parse_mode='Markdown'
+        )
+
+
+async def handle_recurring_start_time_input(update: Update, user, text: str, session_data: dict):
+    """Handle custom start time input for recurring posts"""
+    from bot.utils import get_current_kyiv_time, get_kyiv_timezone
+    from datetime import datetime
+    
+    text = text.strip()
+    current_time = get_current_kyiv_time()
+    kyiv_tz = get_kyiv_timezone()
+    
+    try:
+        # Parse the datetime input
+        if ' ' in text:
+            start_time = datetime.strptime(text, '%Y-%m-%d %H:%M')
+        else:
+            # If only date provided, default to current hour
+            start_time = datetime.strptime(text, '%Y-%m-%d')
+            start_time = start_time.replace(hour=current_time.hour, minute=0)
+        
+        # Make it timezone-aware
+        start_time = kyiv_tz.localize(start_time)
+        
+        # Validate it's in the future
+        if start_time <= current_time:
+            await update.message.reply_text(
+                f"❌ Start time must be in the future.\n\n"
+                f"*Current time:* {current_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n\n"
+                f"Please enter a future date and time:",
+                parse_mode='Markdown'
+            )
+            return True
+        
+        # Finalize the recurring post
+        await finalize_recurring_post_from_message(update, user, session_data, start_time)
+        return True
+        
+    except ValueError as e:
+        await update.message.reply_text(
+            f"❌ Invalid date format.\n\n"
+            f"Please use: `YYYY-MM-DD HH:MM`\n"
+            f"Example: `{current_time.strftime('%Y-%m-%d %H:%M')}`\n\n"
+            f"Try again:",
+            parse_mode='Markdown'
+        )
+        return True
+
+
+async def finalize_recurring_post(query, user, session_data: dict, recurring_config: dict, first_post_time, context=None):
+    """Finalize and create the recurring post"""
+    from datetime import datetime
+    
+    post_id = recurring_config.get('post_id')
+    interval_hours = recurring_config.get('interval_hours')
+    recurring_count = recurring_config.get('recurring_count')
+    recurring_end_date = recurring_config.get('recurring_end_date')
+    mode = recurring_config.get('mode', 'individual')
+    
+    # Handle existing post (from individual mode with post_id)
+    if post_id and mode == 'individual_with_id':
+        try:
+            # Update the existing post to be recurring
+            conn = Database.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE posts SET 
+                    is_recurring = TRUE,
+                    recurring_interval_hours = ?,
+                    recurring_count = ?,
+                    recurring_end_date = ?,
+                    scheduled_time = ?
+                WHERE id = ? AND user_id = ?
+            ''', (interval_hours, recurring_count, 
+                  recurring_end_date.isoformat() if recurring_end_date else None,
+                  first_post_time.isoformat(), post_id, user.id))
+            conn.commit()
+            conn.close()
+            
+            # Schedule via shared scheduler
+            if context and 'scheduler' in context.application.bot_data:
+                scheduler = context.application.bot_data['scheduler']
+                scheduler._schedule_single_post(post_id, first_post_time)
+                logger.info(f"Scheduled recurring post {post_id} via shared scheduler")
+            
+            interval_text = f"{interval_hours} hours"
+            if interval_hours == 24:
+                interval_text = "24 hours (daily)"
+            elif interval_hours == 48:
+                interval_text = "48 hours (every 2 days)"
+            elif interval_hours == 168:
+                interval_text = "168 hours (weekly)"
+            
+            end_info = ""
+            if recurring_count:
+                end_info = f"*End Condition:* After {recurring_count} posts\n"
+            elif recurring_end_date:
+                end_info = f"*End Condition:* On {recurring_end_date.strftime('%Y-%m-%d %H:%M')}\n"
+            else:
+                end_info = "*End Condition:* Never (runs until manually stopped)\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"✅ *Recurring Post Scheduled!*\n\n"
+                f"*Post ID:* {post_id}\n"
+                f"*Interval:* Every {interval_text}\n"
+                f"{end_info}"
+                f"*First Post:* {first_post_time.strftime('%Y-%m-%d %H:%M')} (Kyiv time)\n\n"
+                f"Your recurring post will start at the scheduled time!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+            
+        except Exception as e:
+            logger.error(f"Failed to set up recurring post {post_id}: {e}")
+            await query.edit_message_text(
+                f"❌ *Error Setting Up Recurring Post*\n\n"
+                f"Failed to configure the recurring schedule. Please try again.",
+                parse_mode='Markdown'
+            )
+            return
+    
+    # Handle individual mode (new post creation)
+    elif mode == 'individual':
+        # Parse end date if it's a string
+        if recurring_end_date and isinstance(recurring_end_date, str):
+            recurring_end_date = datetime.fromisoformat(recurring_end_date)
+        
+        # Get media info from session_data
+        file_path = session_data.get('file_path') or session_data.get('current_media_path')
+        media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
+        description = session_data.get('description', '')
+        
+        if not file_path:
+            await query.edit_message_text("❌ No media file found. Please start again.")
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+        
+        # Get channel from session (user selected it earlier) or fall back to first channel
+        target_channel_id = session_data.get('channel_id')
+        channels = Database.get_user_channels(user.id)
+        
+        if not channels:
+            await query.edit_message_text("❌ No channels configured!")
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+        
+        # Find the selected channel or use the first one
+        if target_channel_id:
+            target_channel = next((ch for ch in channels if ch['channel_id'] == target_channel_id), channels[0])
+        else:
+            target_channel = channels[0]
+        
+        Database.add_post(
+            user_id=user.id,
+            file_path=file_path,
+            media_type=media_type,
+            description=description,
+            scheduled_time=first_post_time,
+            mode=3,
+            channel_id=target_channel['channel_id'],
+            is_recurring=True,
+            recurring_interval_hours=interval_hours,
+            recurring_end_date=recurring_end_date,
+            recurring_count=recurring_count
+        )
+        
+        interval_text = f"{interval_hours} hours"
+        if interval_hours == 24:
+            interval_text = "24 hours (daily)"
+        elif interval_hours == 48:
+            interval_text = "48 hours (every 2 days)"
+        elif interval_hours == 168:
+            interval_text = "168 hours (weekly)"
+        
+        end_info = ""
+        if recurring_count:
+            end_info = f"• *Repetitions:* {recurring_count} times\n"
+        elif recurring_end_date:
+            end_info = f"• *End Date:* {recurring_end_date.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
+        else:
+            end_info = f"• *Duration:* Infinite (manual stop required)\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✅ *Individual Recurring Post Activated!*\n\n"
+            f"*📺 Channel:* {target_channel['channel_name']}\n"
+            f"*⏰ Interval:* Every {interval_text}\n"
+            f"*🚀 First post:* {first_post_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
+            f"{end_info}\n"
+            f"Use /stats to monitor your recurring posts.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+        Database.update_user_session(user.id, BotStates.IDLE)
+        return
+    
+    # Default: show error
+    await query.edit_message_text("❌ Error: Unknown recurring mode. Please try again.")
+    Database.update_user_session(user.id, BotStates.IDLE)
+
+
+async def finalize_recurring_post_from_message(update: Update, user, session_data: dict, first_post_time):
+    """Finalize recurring post creation from text message (custom start time)"""
+    from datetime import datetime
+    
+    # Extract recurring config from session_data
+    recurring_config = session_data.get('recurring_config', {})
+    
+    post_id = recurring_config.get('post_id')
+    interval_hours = recurring_config.get('interval_hours')
+    recurring_count = recurring_config.get('recurring_count')
+    recurring_end_date = recurring_config.get('recurring_end_date')
+    mode = recurring_config.get('mode', 'individual')
+    
+    # Handle existing post (from individual mode with post_id)
+    if post_id and mode == 'individual_with_id':
+        try:
+            # Update the existing post to be recurring
+            conn = Database.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE posts SET 
+                    is_recurring = TRUE,
+                    recurring_interval_hours = ?,
+                    recurring_count = ?,
+                    recurring_end_date = ?,
+                    scheduled_time = ?
+                WHERE id = ? AND user_id = ?
+            ''', (interval_hours, recurring_count, 
+                  recurring_end_date.isoformat() if recurring_end_date else None,
+                  first_post_time.isoformat(), post_id, user.id))
+            conn.commit()
+            conn.close()
+            
+            interval_text = f"{interval_hours} hours"
+            if interval_hours == 24:
+                interval_text = "24 hours (daily)"
+            elif interval_hours == 48:
+                interval_text = "48 hours (every 2 days)"
+            elif interval_hours == 168:
+                interval_text = "168 hours (weekly)"
+            
+            end_info = ""
+            if recurring_count:
+                end_info = f"*End Condition:* After {recurring_count} posts\n"
+            elif recurring_end_date:
+                end_info = f"*End Condition:* On {recurring_end_date.strftime('%Y-%m-%d %H:%M')}\n"
+            else:
+                end_info = "*End Condition:* Never (runs until manually stopped)\n"
+            
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ *Recurring Post Scheduled!*\n\n"
+                f"*Post ID:* {post_id}\n"
+                f"*Interval:* Every {interval_text}\n"
+                f"{end_info}"
+                f"*First Post:* {first_post_time.strftime('%Y-%m-%d %H:%M')} (Kyiv time)\n\n"
+                f"Your recurring post will start at the scheduled time!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+            
+        except Exception as e:
+            logger.error(f"Failed to set up recurring post {post_id}: {e}")
+            await update.message.reply_text(
+                f"❌ *Error Setting Up Recurring Post*\n\n"
+                f"Failed to configure the recurring schedule. Please try again.",
+                parse_mode='Markdown'
+            )
+            return
+    
+    # Handle individual mode - need to create new post via message
+    elif mode == 'individual':
+        # Parse end date if it's a string
+        if recurring_end_date and isinstance(recurring_end_date, str):
+            recurring_end_date = datetime.fromisoformat(recurring_end_date)
+        
+        # Get media info from session_data (it was preserved when we merged sessions)
+        file_path = session_data.get('file_path') or session_data.get('current_media_path')
+        media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
+        description = session_data.get('description', '')
+        
+        if not file_path:
+            await update.message.reply_text("❌ No media file found. Please start again.")
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+        
+        # Get channel from session (user selected it earlier) or fall back to first channel
+        target_channel_id = session_data.get('channel_id')
+        channels = Database.get_user_channels(user.id)
+        
+        if not channels:
+            await update.message.reply_text("❌ No channels configured!")
+            Database.update_user_session(user.id, BotStates.IDLE)
+            return
+        
+        # Find the selected channel or use the first one
+        if target_channel_id:
+            target_channel = next((ch for ch in channels if ch['channel_id'] == target_channel_id), channels[0])
+        else:
+            target_channel = channels[0]
+        
+        Database.add_post(
+            user_id=user.id,
+            file_path=file_path,
+            media_type=media_type,
+            description=description,
+            scheduled_time=first_post_time,
+            mode=3,
+            channel_id=target_channel['channel_id'],
+            is_recurring=True,
+            recurring_interval_hours=interval_hours,
+            recurring_end_date=recurring_end_date,
+            recurring_count=recurring_count
+        )
+        
+        interval_text = f"{interval_hours} hours"
+        if interval_hours == 24:
+            interval_text = "24 hours (daily)"
+        elif interval_hours == 48:
+            interval_text = "48 hours (every 2 days)"
+        elif interval_hours == 168:
+            interval_text = "168 hours (weekly)"
+        
+        end_info = ""
+        if recurring_count:
+            end_info = f"• *Repetitions:* {recurring_count} times\n"
+        elif recurring_end_date:
+            end_info = f"• *End Date:* {recurring_end_date.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
+        else:
+            end_info = f"• *Duration:* Infinite (manual stop required)\n"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ *Individual Recurring Post Activated!*\n\n"
+            f"*📺 Channel:* {target_channel['channel_name']}\n"
+            f"*⏰ Interval:* Every {interval_text}\n"
+            f"*🚀 First post:* {first_post_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
+            f"{end_info}\n"
+            f"Use /stats to monitor your recurring posts.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+        Database.update_user_session(user.id, BotStates.IDLE)
+        return
+    
+    await update.message.reply_text("❌ Error: Unknown recurring mode. Please try again.")
+    Database.update_user_session(user.id, BotStates.IDLE)
+
+
 async def handle_recurring_hours_input(update: Update, user, text: str, session_data: dict):
     """Handle custom recurring hours input"""
     try:
@@ -5036,9 +5853,47 @@ async def handle_recurring_hours_input(update: Update, user, text: str, session_
             )
             return
         
-        # Check if this is for individual recurring post (recur_custom mode)
-        if session_data.get('action') == 'recur_custom':
-            # Show end condition options for individual post
+        # Get post_id if present (from schedule_custom flow)
+        post_id = session_data.get('post_id')
+        
+        # Check if this is for a specific post (has post_id from schedule_custom)
+        if session_data.get('action') == 'schedule_custom' and post_id:
+            # Show end condition options with post_id preserved
+            keyboard = [
+                [
+                    InlineKeyboardButton("🔢 End after X posts", callback_data=f"recurring_count_{hours}_{post_id}"),
+                    InlineKeyboardButton("📅 End on date", callback_data=f"recurring_date_{hours}_{post_id}")
+                ],
+                [
+                    InlineKeyboardButton("∞ Never end", callback_data=f"recurring_never_{hours}_{post_id}")
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"""
+🔄 *Recurring Schedule Setup*
+
+*Post ID:* {post_id}
+*Interval:* Every {hours} hours
+
+*How should it end?*
+
+• *Count:* Stop after a specific number of posts
+• *Date:* Stop on a specific date  
+• *Never:* Continue until manually stopped
+
+Choose end condition:
+"""
+            
+            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+            # Keep session with post_id for the flow
+            Database.update_user_session(user.id, "RECURRING_END_CONDITION", {
+                "post_id": post_id,
+                "interval_hours": hours
+            })
+        elif session_data.get('action') == 'recur_custom':
+            # Show end condition options for individual post (no post_id yet)
             keyboard = [
                 [
                     InlineKeyboardButton("🔢 End after X posts", callback_data=f"recur_count_{hours}"),
@@ -5067,6 +5922,7 @@ Choose end condition:
 """
             
             await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+            Database.update_user_session(user.id, BotStates.IDLE)
         else:
             # Show end condition options for bulk posts
             keyboard = [
@@ -5097,8 +5953,7 @@ Choose end condition:
 """
             
             await update.message.reply_text(message, reply_markup=reply_markup)
-        
-        Database.update_user_session(user.id, BotStates.IDLE)
+            Database.update_user_session(user.id, BotStates.IDLE)
         
     except ValueError:
         await update.message.reply_text(
@@ -5126,8 +5981,15 @@ async def handle_recurring_count_input(update: Update, user, text: str, session_
         
         # Check if this is for individual recurring post
         if session_data.get('mode') == 'individual':
-            # Set up individual recurring post with count
-            await setup_individual_recurring_post(None, user, interval_hours, count, None)
+            # Show start time options instead of directly setting up
+            await show_recurring_start_time_options_from_message(update, user, {
+                'interval_hours': interval_hours,
+                'end_type': 'count',
+                'recurring_count': count,
+                'recurring_end_date': None,
+                'mode': 'individual'
+            })
+            return
         elif session_data.get('mode') == 'individual_with_id':
             # Set up specific recurring post with count
             post_id = session_data.get('post_id')
@@ -5154,11 +6016,8 @@ async def handle_recurring_count_input(update: Update, user, text: str, session_
                     next_time = get_current_kyiv_time() + timedelta(minutes=1)
                     Database.update_post_schedule(post_id, next_time)
                     
-                    # Use scheduler to schedule the first post
-                    from .scheduler import PostScheduler
-                    scheduler = PostScheduler()
-                    logger.warning("Using fallback scheduler instance for recurring post setup")
-                    await scheduler.schedule_single_post(post_id, next_time)
+                    # Post will be picked up by the monitoring system within 5 minutes
+                    logger.info(f"Recurring post {post_id} saved to database with count={count}, will be picked up by monitor")
                     
                     await update.message.reply_text(
                         f"✅ *Recurring Post Scheduled!*\n\n"
@@ -5267,13 +6126,15 @@ async def handle_recurring_date_input(update: Update, user, text: str, session_d
         
         # Check if this is for individual recurring post
         if session_data.get('mode') == 'individual':
-            # Set up individual recurring post with end date
-            await setup_individual_recurring_post(None, user, interval_hours, None, end_date)
-            await update.message.reply_text(
-                f"✅ *Individual recurring post setup complete!*\n\n"
-                f"Post will repeat every {interval_hours} hours until {end_date.strftime('%Y-%m-%d %H:%M')} (Kyiv time).",
-                parse_mode='Markdown'
-            )
+            # Show start time options instead of directly setting up
+            await show_recurring_start_time_options_from_message(update, user, {
+                'interval_hours': interval_hours,
+                'end_type': 'date',
+                'recurring_count': None,
+                'recurring_end_date': end_date.isoformat(),
+                'mode': 'individual'
+            })
+            return
         else:
             # Set up bulk recurring posts
             success = await setup_recurring_posts_direct(user, interval_hours, None, end_date)
@@ -6041,8 +6902,8 @@ async def show_post_for_caption_editing(query, user, channel_id, post_index, pos
     # Get media type icon
     media_icon = get_media_icon(post['media_type'])
     
-    # Current caption
-    current_caption = post['description'] or "No caption"
+    # Current caption - escaped for Markdown display
+    current_caption = escape_markdown(post['description'] or "No caption")
     
     # Create navigation buttons
     keyboard = []
@@ -6125,8 +6986,8 @@ async def prompt_caption_input(query, user, channel_id, post_index):
     # Get media type icon
     media_icon = get_media_icon(post['media_type'])
     
-    # Current caption
-    current_caption = post['description'] or "No caption"
+    # Current caption - escaped for Markdown display
+    current_caption = escape_markdown(post['description'] or "No caption")
     
     keyboard = [[
         InlineKeyboardButton("🚫 Cancel", callback_data=f"edit_captions_nav_{channel_id}_{post_index}_cancel")
@@ -6247,8 +7108,8 @@ async def show_post_for_caption_editing_via_message(update, user, channel_id, po
     # Get media type icon
     media_icon = get_media_icon(post['media_type'])
     
-    # Current caption
-    current_caption = post['description'] or "No caption"
+    # Current caption - escaped for Markdown display
+    current_caption = escape_markdown(post['description'] or "No caption")
     
     # Create navigation buttons
     keyboard = []
@@ -6495,7 +7356,8 @@ async def prompt_channel_selection_for_mode(update, user_id: int, channels: list
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    mode_name = "Bulk Upload" if mode == 1 else "Individual Upload"
+    mode_names = {1: "Bulk Upload", 2: "Individual Upload", 3: "Guided Captioning"}
+    mode_name = mode_names.get(mode, "Upload")
     message = f"📺 *Select Channel for Mode {mode} ({mode_name}):*\n\n"
     for i, channel in enumerate(channels, 1):
         message += f"{i}. {channel['channel_name']}\n   ID: `{channel['channel_id']}`\n\n"
@@ -6514,7 +7376,8 @@ async def prompt_channel_selection_for_mode_inline(query, user_id: int, channels
     keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    mode_name = "Bulk Upload" if mode == 1 else "Individual Upload"
+    mode_names = {1: "Bulk Upload", 2: "Individual Upload", 3: "Guided Captioning"}
+    mode_name = mode_names.get(mode, "Upload")
     message = f"📺 *Select Channel for Mode {mode} ({mode_name}):*\n\n"
     for i, channel in enumerate(channels, 1):
         message += f"{i}. {channel['channel_name']}\n   ID: `{channel['channel_id']}`\n\n"
@@ -6569,7 +7432,7 @@ Use /cancel to abort this mode.
 
 🔄 Ready to receive photos..."""
             
-        else:  # mode == 2
+        elif mode == 2:
             Database.update_user_session(user.id, BotStates.MODE2_PHOTOS, {
                 'media_items': [],
                 'current_media_path': None,
@@ -6592,6 +7455,32 @@ Upload photos one by one with custom descriptions:
 Use /cancel to abort this mode.
 
 📸 Send your first photo..."""
+        
+        else:  # mode == 3
+            Database.update_user_session(user.id, BotStates.MODE3_UPLOADING, {
+                'media_items': [],
+                'start_time': datetime.now().isoformat(),
+                'selected_channel_id': selected_channel['channel_id']
+            })
+            
+            keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="mode3_done_uploading")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message = f"""🎯 *Mode 3: Guided Captioning*
+
+*Target Channel:* {selected_channel['channel_name']} ({selected_channel['channel_id']})
+
+*Step 1: Upload all your media*
+
+Send me all the photos/videos you want to schedule. When you're done, tap "Done Uploading" and I'll guide you through adding captions one by one with previews.
+
+Use /cancel to abort this mode.
+
+📸 Start uploading your media..."""
+            
+            await query.answer()
+            await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+            return
         
         logger.info(f"About to edit message for user {user.id}, mode {mode}, channel {channel_id}")
         
@@ -7717,25 +8606,11 @@ async def handle_bulk_edit_input(update: Update, user, text: str, session_data: 
     updated_count = Database.bulk_update_post_schedules(post_schedule_updates)
     
     if updated_count > 0:
-        # Update scheduler jobs
-        try:
-            # Use scheduler instance for bulk edit operations
-            # Note: Database is already updated, scheduler jobs will be recreated on restart
-            from .scheduler import PostScheduler
-            scheduler = PostScheduler()
-            
-            # Cancel existing jobs for these posts
-            for post in posts_to_update:
-                await scheduler.cancel_post_job(post['id'])
-            
-            # Create new scheduled jobs
-            for post_id, new_time in post_schedule_updates:
-                await scheduler.schedule_single_post(post_id, new_time)
-            
-            logger.info(f"Updated scheduler jobs for {len(post_schedule_updates)} posts in bulk edit")
-                
-        except Exception as e:
-            logger.error(f"Error updating scheduler jobs: {e}")
+        # Note: Database is already updated with new scheduled times.
+        # The post monitoring system (runs every 5 minutes) will automatically detect 
+        # posts that have scheduled_time but no active APScheduler job, and reschedule them.
+        # This is more reliable than trying to access the scheduler from a message handler.
+        logger.info(f"Bulk edit: Updated {len(post_schedule_updates)} posts in database. Monitor will reschedule them.")
     
     # Generate preview of new schedule
     preview_text = "\n*📅 New Schedule Preview:*\n"
@@ -8605,7 +9480,7 @@ async def handle_reschedule_callback(query, user):
 
 
 
-async def handle_reschedule_action_callback(query, user, data):
+async def handle_reschedule_action_callback(query, user, data, context):
     """Handle reschedule action callbacks"""
     from bot.database import Database
     
@@ -8614,7 +9489,7 @@ async def handle_reschedule_action_callback(query, user, data):
     if action == "all":
         # Reschedule all posts with default settings
         try:
-            scheduler = query.get_bot().application.bot_data.get('scheduler')
+            scheduler = context.bot_data.get('scheduler')
 
             if scheduler:
                 rescheduled_count = await scheduler.reschedule_all_posts_from_today(
@@ -8707,7 +9582,7 @@ Please enter your custom schedule settings in this format:
 
 
 
-async def handle_reschedule_settings_input(update, user, text):
+async def handle_reschedule_settings_input(update, user, text, context):
     """Handle custom reschedule settings input"""
     from bot.database import Database
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -8741,15 +9616,20 @@ async def handle_reschedule_settings_input(update, user, text):
         if start_hour >= end_hour:
             await update.message.reply_text("❌ Start hour must be less than end hour")
             return
-            
-        if not (1 <= interval_hours <= 24):
-            await update.message.reply_text("❌ Interval must be between 1-24 hours")
+        
+        # Calculate the time window
+        time_window = end_hour - start_hour
+        
+        if not (1 <= interval_hours <= time_window):
+            await update.message.reply_text(
+                f"❌ Interval must be between 1-{time_window} hours for your time window ({start_hour}:00-{end_hour}:00)"
+            )
             return
         
         # Clear user session
         Database.update_user_session(user.id, "idle", {})
         
-        scheduler = update.get_bot().application.bot_data.get('scheduler')
+        scheduler = context.bot_data.get('scheduler')
 
         if scheduler:
             rescheduled_count = await scheduler.reschedule_all_posts_from_today(
@@ -9052,4 +9932,1747 @@ Use the buttons below to adjust your settings:
     elif action == "threshold_info":
         # Just show info, no change
         await query.answer("Threshold determines when you receive low post alerts", show_alert=True)
+
+
+# ============== COMPREHENSIVE POST EDITING MENU ==============
+
+async def editposts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /editposts command - show comprehensive edit menu for Mode 2 posts"""
+    if not update or not update.effective_user or not update.message:
+        logger.error("Invalid update in editposts_handler")
+        return
+    
+    user = update.effective_user
+    logger.info(f"editposts_handler called for user {user.id}")
+    
+    # Get user's channels
+    channels = Database.get_user_channels(user.id)
+    
+    if not channels:
+        await update.message.reply_text(
+            "❌ *No channels configured!*\n\n"
+            "Please add a channel first using /channels command.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Show channel selection for editing
+    keyboard = []
+    for channel in channels:
+        # Count Mode 2 scheduled posts for this channel
+        posts = Database.get_user_mode2_scheduled_posts(user.id, channel['channel_id'])
+        post_count = len(posts)
+        
+        keyboard.append([InlineKeyboardButton(
+            f"📺 {channel['channel_name']} ({post_count} posts)",
+            callback_data=f"editposts_channel_{channel['channel_id']}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "✏️ *Edit Scheduled Posts*\n\n"
+        "Select a channel to edit its scheduled Mode 2 posts:\n\n"
+        "*Features:*\n"
+        "• Edit captions (with formatting preserved)\n"
+        "• Replace media files\n"
+        "• Reschedule posts\n"
+        "• Delete posts\n"
+        "• Preview media before changes",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_editposts_channel_selection(query, user, channel_id):
+    """Handle channel selection in edit posts menu"""
+    try:
+        logger.info(f"handle_editposts_channel_selection for user {user.id}, channel {channel_id}")
+        
+        # Verify user owns the channel
+        if not Database.user_has_channel(user.id, channel_id):
+            await query.edit_message_text("❌ You don't have access to this channel.")
+            return
+        
+        # Get channel info
+        channels = Database.get_user_channels(user.id)
+        channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+        channel_name = channel['channel_name'] if channel else channel_id
+        
+        # Get Mode 2 posts for this channel
+        posts = Database.get_user_mode2_scheduled_posts(user.id, channel_id)
+        
+        if not posts:
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="editposts_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"✏️ *Edit Posts - {channel_name}*\n\n"
+                "No scheduled Mode 2 posts found for editing.",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        # Store the posts in session for navigation
+        post_ids = [p['id'] for p in posts]
+        session_data = {
+            'edit_channel_id': channel_id,
+            'edit_post_ids': post_ids,
+            'edit_current_index': 0
+        }
+        Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, session_data)
+        
+        # Show first post
+        await show_edit_post_details(query, user, posts[0], 0, len(posts), channel_name)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_channel_selection: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error loading posts: {e}")
+
+
+async def show_edit_post_details(query, user, post, current_index, total_posts, channel_name):
+    """Show detailed edit interface for a single post with navigation"""
+    try:
+        post_id = post['id']
+        media_type = post.get('media_type', 'photo')
+        description = post.get('description') or 'No caption'
+        scheduled_time = post.get('scheduled_time')
+        
+        # Format scheduled time
+        if scheduled_time:
+            if isinstance(scheduled_time, str):
+                scheduled_dt = datetime.fromisoformat(scheduled_time)
+            else:
+                scheduled_dt = scheduled_time
+            time_str = scheduled_dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = "Not scheduled"
+        
+        media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄', 
+                      'document_image': '📸', 'document_video': '🎥'}.get(media_type, '📁')
+        
+        # Truncate long descriptions for display
+        display_desc = description[:100] + "..." if len(description) > 100 else description
+        
+        message = f"✏️ *Edit Post {current_index + 1}/{total_posts}*\n\n"
+        message += f"*📺 Channel:* {channel_name}\n"
+        message += f"*📁 Type:* {media_icon} {media_type.replace('document_', '').title()}\n"
+        message += f"*📝 Caption:* {escape_markdown(display_desc)}\n"
+        message += f"*⏰ Scheduled:* {time_str}\n\n"
+        message += "*Select an action:*"
+        
+        # Build keyboard with all editing options
+        keyboard = []
+        
+        # Navigation row (only if multiple posts)
+        if total_posts > 1:
+            nav_row = []
+            if current_index > 0:
+                nav_row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"editposts_nav_{current_index - 1}"))
+            nav_row.append(InlineKeyboardButton(f"{current_index + 1}/{total_posts}", callback_data="editposts_info"))
+            if current_index < total_posts - 1:
+                nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"editposts_nav_{current_index + 1}"))
+            keyboard.append(nav_row)
+        
+        # Edit options
+        keyboard.append([InlineKeyboardButton("👁️ Preview Media", callback_data=f"editposts_preview_{post_id}")])
+        keyboard.append([InlineKeyboardButton("📝 Edit Caption", callback_data=f"editposts_caption_{post_id}")])
+        keyboard.append([InlineKeyboardButton("🖼️ Replace Media", callback_data=f"editposts_media_{post_id}")])
+        keyboard.append([InlineKeyboardButton("⏰ Reschedule", callback_data=f"editposts_schedule_{post_id}")])
+        keyboard.append([InlineKeyboardButton("🗑️ Delete Post", callback_data=f"editposts_delete_{post_id}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back to Channels", callback_data="editposts_menu")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in show_edit_post_details: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error displaying post: {e}")
+
+
+async def handle_editposts_navigation(query, user, new_index):
+    """Handle navigation between posts in edit menu"""
+    try:
+        # Get session data
+        mode, session_data = Database.get_user_session(user.id)
+        
+        if not session_data or 'edit_post_ids' not in session_data:
+            await query.edit_message_text("❌ Session expired. Please use /editposts again.")
+            return
+        
+        post_ids = session_data['edit_post_ids']
+        channel_id = session_data['edit_channel_id']
+        
+        if new_index < 0 or new_index >= len(post_ids):
+            await query.answer("No more posts in this direction")
+            return
+        
+        # Update session with new index
+        session_data['edit_current_index'] = new_index
+        Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, session_data)
+        
+        # Get post data
+        post = Database.get_post_by_id(post_ids[new_index])
+        if not post:
+            await query.edit_message_text("❌ Post not found. It may have been deleted.")
+            return
+        
+        # Get channel name
+        channels = Database.get_user_channels(user.id)
+        channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+        channel_name = channel['channel_name'] if channel else channel_id
+        
+        await show_edit_post_details(query, user, post, new_index, len(post_ids), channel_name)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_navigation: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error navigating: {e}")
+
+
+async def handle_editposts_preview(query, user, post_id):
+    """Send media preview to user"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.answer("Post not found or access denied", show_alert=True)
+            return
+        
+        file_path = post['file_path']
+        media_type = post['media_type'] or 'photo'
+        description = post['description'] or 'No caption'
+        
+        if not os.path.exists(file_path):
+            await query.answer("Media file not found on server", show_alert=True)
+            return
+        
+        # Send the media as a preview - escape user description to avoid Markdown parsing errors
+        escaped_description = escape_markdown(description)
+        preview_caption = f"*Preview Post #{post_id}*\n{escaped_description}"
+        
+        with open(file_path, 'rb') as media_file:
+            if media_type == 'photo':
+                await query.message.reply_photo(photo=media_file, caption=preview_caption, parse_mode='Markdown')
+            elif media_type == 'video':
+                await query.message.reply_video(video=media_file, caption=preview_caption, parse_mode='Markdown')
+            elif media_type == 'audio':
+                await query.message.reply_audio(audio=media_file, caption=preview_caption, parse_mode='Markdown')
+            elif media_type == 'animation':
+                await query.message.reply_animation(animation=media_file, caption=preview_caption, parse_mode='Markdown')
+            else:
+                await query.message.reply_document(document=media_file, caption=preview_caption, parse_mode='Markdown')
+        
+        await query.answer("Preview sent!")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_preview: {e}", exc_info=True)
+        await query.answer(f"Error sending preview: {e}", show_alert=True)
+
+
+async def handle_editposts_caption(query, user, post_id):
+    """Start caption editing for a post"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.edit_message_text("❌ Post not found or access denied")
+            return
+        
+        # Store editing context in session
+        session_data = {
+            'editing_post_id': post_id,
+            'editing_type': 'caption'
+        }
+        Database.update_user_session(user.id, BotStates.EDIT_POST_CAPTION, session_data)
+        
+        current_caption = post['description'] or 'No caption'
+        
+        message = f"📝 *Edit Caption - Post #{post_id}*\n\n"
+        message += f"*Current Caption:*\n{escape_markdown(current_caption)}\n\n"
+        message += "*Send your new caption:*\n"
+        message += "• Use Telegram's formatting menu to format text\n"
+        message += "• Bold, italic, and other formatting will be preserved\n"
+        message += "• Send 'skip' to remove the caption"
+        
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"editposts_cancel_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_caption: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_media(query, user, post_id):
+    """Start media replacement for a post"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.edit_message_text("❌ Post not found or access denied")
+            return
+        
+        # Store editing context in session
+        session_data = {
+            'editing_post_id': post_id,
+            'editing_type': 'media'
+        }
+        Database.update_user_session(user.id, BotStates.EDIT_POST_MEDIA, session_data)
+        
+        media_type = post['media_type'] or 'photo'
+        media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
+        
+        message = f"🖼️ *Replace Media - Post #{post_id}*\n\n"
+        message += f"*Current Media:* {media_icon} {media_type.title()}\n\n"
+        message += "*Send new media file:*\n"
+        message += "• Send a photo, video, audio, animation, or document\n"
+        message += "• For best quality, send as document (uncompressed)\n"
+        message += "• The new file will replace the current one"
+        
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"editposts_cancel_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_media: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_schedule(query, user, post_id):
+    """Start schedule editing for a post"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.edit_message_text("❌ Post not found or access denied")
+            return
+        
+        scheduled_time = post.get('scheduled_time')
+        if scheduled_time:
+            if isinstance(scheduled_time, str):
+                scheduled_dt = datetime.fromisoformat(scheduled_time)
+            else:
+                scheduled_dt = scheduled_time
+            time_str = scheduled_dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = "Not scheduled"
+        
+        # Quick time options
+        current_time = get_current_kyiv_time()
+        
+        keyboard = [
+            [InlineKeyboardButton("+1 Hour", callback_data=f"editposts_schedquick_{post_id}_1"),
+             InlineKeyboardButton("+2 Hours", callback_data=f"editposts_schedquick_{post_id}_2")],
+            [InlineKeyboardButton("+4 Hours", callback_data=f"editposts_schedquick_{post_id}_4"),
+             InlineKeyboardButton("+8 Hours", callback_data=f"editposts_schedquick_{post_id}_8")],
+            [InlineKeyboardButton("+1 Day", callback_data=f"editposts_schedquick_{post_id}_24"),
+             InlineKeyboardButton("+2 Days", callback_data=f"editposts_schedquick_{post_id}_48")],
+            [InlineKeyboardButton("📅 Custom Time", callback_data=f"editposts_schedcustom_{post_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"editposts_cancel_{post_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message = f"⏰ *Reschedule Post #{post_id}*\n\n"
+        message += f"*Current Schedule:* {time_str}\n"
+        message += f"*Current Time (Kyiv):* {current_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+        message += "*Choose new time:*"
+        
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_schedule: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_schedule_quick(query, user, post_id, hours, context):
+    """Handle quick schedule adjustment"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.answer("Post not found or access denied", show_alert=True)
+            return
+        
+        # Calculate new time from now
+        current_time = get_current_kyiv_time()
+        new_time = current_time + timedelta(hours=hours)
+        
+        # Update database
+        success = Database.update_post_schedule(post_id, new_time)
+        
+        if success:
+            # Update scheduler if available
+            if context and context.application and context.application.bot_data:
+                scheduler = context.application.bot_data.get('scheduler')
+                if scheduler:
+                    scheduler.schedule_post(post_id, new_time)
+            
+            await query.answer(f"Rescheduled to {new_time.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
+            
+            # Refresh the post display
+            mode, session_data = Database.get_user_session(user.id)
+            if session_data and 'edit_post_ids' in session_data:
+                current_index = session_data.get('edit_current_index', 0)
+                channel_id = session_data.get('edit_channel_id')
+                channels = Database.get_user_channels(user.id)
+                channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+                channel_name = channel['channel_name'] if channel else channel_id
+                
+                # Get updated post
+                updated_post = Database.get_post_by_id(post_id)
+                await show_edit_post_details(query, user, updated_post, current_index, len(session_data['edit_post_ids']), channel_name)
+        else:
+            await query.answer("Failed to update schedule", show_alert=True)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_schedule_quick: {e}", exc_info=True)
+        await query.answer(f"Error: {e}", show_alert=True)
+
+
+async def handle_editposts_schedule_custom(query, user, post_id):
+    """Start custom schedule input for a post"""
+    try:
+        # Store editing context
+        session_data = {
+            'editing_post_id': post_id,
+            'editing_type': 'schedule'
+        }
+        Database.update_user_session(user.id, BotStates.EDIT_POST_SCHEDULE, session_data)
+        
+        message = f"📅 *Custom Schedule - Post #{post_id}*\n\n"
+        message += "*Enter new date and time:*\n"
+        message += "`YYYY-MM-DD HH:MM`\n\n"
+        message += "*Example:* `2025-12-30 14:30`\n"
+        message += "*(Time in Kyiv timezone)*"
+        
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"editposts_cancel_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_schedule_custom: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_delete(query, user, post_id):
+    """Show delete confirmation for a post"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.edit_message_text("❌ Post not found or access denied")
+            return
+        
+        description = post['description'] or 'No caption'
+        display_desc = description[:50] + "..." if len(description) > 50 else description
+        
+        message = f"🗑️ *Delete Post #{post_id}?*\n\n"
+        message += f"*Caption:* {escape_markdown(display_desc)}\n\n"
+        message += "⚠️ *This action cannot be undone!*\n"
+        message += "The post will be removed from the schedule."
+        
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"editposts_confirmdelete_{post_id}"),
+             InlineKeyboardButton("❌ No, Keep", callback_data=f"editposts_cancel_{post_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_delete: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_confirm_delete(query, user, post_id, context):
+    """Execute post deletion"""
+    try:
+        post = Database.get_post_by_id(post_id)
+        
+        if not post or post['user_id'] != user.id:
+            await query.answer("Post not found or access denied", show_alert=True)
+            return
+        
+        # Delete the post
+        success = Database.delete_post(post_id, user.id)
+        
+        if success:
+            # Remove from scheduler if available
+            if context and context.application and context.application.bot_data:
+                scheduler = context.application.bot_data.get('scheduler')
+                if scheduler:
+                    try:
+                        scheduler.scheduler.remove_job(f"post_{post_id}")
+                    except:
+                        pass  # Job might not exist
+            
+            # Delete media file
+            file_path = post.get('file_path')
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            
+            await query.answer("Post deleted successfully!", show_alert=True)
+            
+            # Update session and navigate
+            mode, session_data = Database.get_user_session(user.id)
+            if session_data and 'edit_post_ids' in session_data:
+                post_ids = session_data['edit_post_ids']
+                
+                # Remove deleted post from list
+                if post_id in post_ids:
+                    post_ids.remove(post_id)
+                
+                if not post_ids:
+                    # No more posts, go back to channel selection
+                    await query.edit_message_text(
+                        "✅ Post deleted! No more posts to edit.",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="editposts_menu")]])
+                    )
+                else:
+                    # Navigate to next post or previous
+                    current_index = session_data.get('edit_current_index', 0)
+                    if current_index >= len(post_ids):
+                        current_index = len(post_ids) - 1
+                    
+                    session_data['edit_post_ids'] = post_ids
+                    session_data['edit_current_index'] = current_index
+                    Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, session_data)
+                    
+                    # Show next post
+                    next_post = Database.get_post_by_id(post_ids[current_index])
+                    channel_id = session_data.get('edit_channel_id')
+                    channels = Database.get_user_channels(user.id)
+                    channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+                    channel_name = channel['channel_name'] if channel else channel_id
+                    
+                    await show_edit_post_details(query, user, next_post, current_index, len(post_ids), channel_name)
+        else:
+            await query.answer("Failed to delete post", show_alert=True)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_confirm_delete: {e}", exc_info=True)
+        await query.answer(f"Error: {e}", show_alert=True)
+
+
+async def handle_editposts_cancel(query, user, post_id):
+    """Cancel editing and return to post details"""
+    try:
+        # Reset state to menu
+        mode, session_data = Database.get_user_session(user.id)
+        
+        if session_data and 'edit_post_ids' in session_data:
+            Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, session_data)
+            
+            current_index = session_data.get('edit_current_index', 0)
+            channel_id = session_data.get('edit_channel_id')
+            
+            post = Database.get_post_by_id(post_id)
+            if post:
+                channels = Database.get_user_channels(user.id)
+                channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+                channel_name = channel['channel_name'] if channel else channel_id
+                
+                await show_edit_post_details(query, user, post, current_index, len(session_data['edit_post_ids']), channel_name)
+                return
+        
+        # Fallback to menu
+        await show_editposts_menu(query, user)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_cancel: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def show_editposts_menu(query, user):
+    """Show the main edit posts menu with channel selection"""
+    try:
+        channels = Database.get_user_channels(user.id)
+        
+        if not channels:
+            await query.edit_message_text(
+                "❌ *No channels configured!*\n\n"
+                "Please add a channel first using /channels command.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        keyboard = []
+        for channel in channels:
+            posts = Database.get_user_mode2_scheduled_posts(user.id, channel['channel_id'])
+            post_count = len(posts)
+            
+            keyboard.append([InlineKeyboardButton(
+                f"📺 {channel['channel_name']} ({post_count} posts)",
+                callback_data=f"editposts_channel_{channel['channel_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "✏️ *Edit Scheduled Posts*\n\n"
+            "Select a channel to edit its scheduled Mode 2 posts:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in show_editposts_menu: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {e}")
+
+
+async def handle_editposts_input(update: Update, user, session_data: dict, context=None):
+    """Handle text/media input during post editing"""
+    import json
+    
+    editing_post_id = session_data.get('editing_post_id')
+    editing_type = session_data.get('editing_type')
+    
+    if not editing_post_id:
+        return False
+    
+    if editing_type == 'caption':
+        # Handle caption editing
+        new_caption = update.message.text.strip() if update.message.text else None
+        
+        # Skip means remove caption
+        if new_caption and new_caption.lower() == 'skip':
+            new_caption = None
+            caption_entities_json = None
+        else:
+            # Get caption entities for formatting
+            caption_entities = update.message.entities
+            caption_entities_json = None
+            if caption_entities:
+                caption_entities_json = json.dumps([
+                    {'type': e.type, 'offset': e.offset, 'length': e.length, 
+                     'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+                    for e in caption_entities
+                ])
+        
+        # Update the post
+        success = Database.update_post_description(editing_post_id, new_caption, caption_entities_json)
+        
+        if success:
+            # Reset session and confirm
+            mode, old_session = Database.get_user_session(user.id)
+            if 'edit_post_ids' in old_session:
+                Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, old_session)
+            
+            await update.message.reply_text(
+                f"✅ *Caption Updated Successfully!*\n\n"
+                f"*Post #{editing_post_id}* has been updated.\n"
+                f"Use /editposts to continue editing.",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text("❌ Failed to update caption. Please try again.")
+        
+        return True
+    
+    elif editing_type == 'schedule':
+        # Handle custom schedule input
+        text = update.message.text.strip() if update.message.text else ""
+        
+        try:
+            # Parse the datetime
+            tz = get_kyiv_timezone()
+            new_time = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            new_time = tz.localize(new_time)
+            
+            # Update the post
+            success = Database.update_post_schedule(editing_post_id, new_time)
+            
+            if success:
+                # Update scheduler
+                if context and context.application and context.application.bot_data:
+                    scheduler = context.application.bot_data.get('scheduler')
+                    if scheduler:
+                        scheduler.schedule_post(editing_post_id, new_time)
+                
+                # Reset session
+                mode, old_session = Database.get_user_session(user.id)
+                if 'edit_post_ids' in old_session:
+                    Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, old_session)
+                
+                await update.message.reply_text(
+                    f"✅ *Schedule Updated!*\n\n"
+                    f"*Post #{editing_post_id}* rescheduled to:\n"
+                    f"`{new_time.strftime('%Y-%m-%d %H:%M')}` (Kyiv time)\n\n"
+                    f"Use /editposts to continue editing.",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text("❌ Failed to update schedule. Please try again.")
+            
+        except ValueError:
+            await update.message.reply_text(
+                "❌ *Invalid date format!*\n\n"
+                "Please use: `YYYY-MM-DD HH:MM`\n"
+                "Example: `2025-12-30 14:30`",
+                parse_mode='Markdown'
+            )
+        
+        return True
+    
+    return False
+
+
+# ============= MODE 3: GUIDED CAPTIONING HANDLERS =============
+
+async def handle_mode3_media_upload(update: Update, user, file_path: str, media_type: str, session_data: dict):
+    """Handle media upload during Mode 3 uploading phase"""
+    media_items = session_data.get('media_items', [])
+    
+    media_items.append({
+        'file_path': file_path,
+        'media_type': media_type
+    })
+    
+    session_data['media_items'] = media_items
+    Database.update_user_session(user.id, BotStates.MODE3_UPLOADING, session_data)
+    
+    media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
+    
+    keyboard = [[InlineKeyboardButton("✅ Done Uploading", callback_data="mode3_done_uploading")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"{media_icon} Media {len(media_items)} uploaded!\n\n"
+        f"Continue uploading or tap *Done Uploading* when ready to add captions.",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_mode3_done_uploading(query, user):
+    """Handle completion of Mode 3 uploading phase, start captioning"""
+    mode, session_data = Database.get_user_session(user.id)
+    
+    if mode != BotStates.MODE3_UPLOADING:
+        await query.answer("Not in Mode 3 uploading state.")
+        return
+    
+    media_items = session_data.get('media_items', [])
+    
+    if not media_items:
+        await query.answer("No media uploaded yet!")
+        await query.edit_message_text(
+            "❌ *No Media Uploaded*\n\n"
+            "Please upload at least one photo or video first.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Switch to captioning phase
+    session_data['current_caption_index'] = 0
+    Database.update_user_session(user.id, BotStates.MODE3_CAPTIONING, session_data)
+    
+    await query.answer()
+    
+    # Show first media for captioning
+    await show_mode3_caption_prompt(query, user, session_data, 0)
+
+
+async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, index: int):
+    """Show media preview and ask for caption"""
+    media_items = session_data.get('media_items', [])
+    total = len(media_items)
+    
+    if index >= total:
+        # All done - proceed to scheduling
+        await finish_mode3_captioning(query_or_message, user, session_data)
+        return
+    
+    item = media_items[index]
+    file_path = item['file_path']
+    media_type = item['media_type']
+    
+    media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
+    
+    keyboard = [
+        [InlineKeyboardButton("⏭️ Skip (No Caption)", callback_data="mode3_skip_caption")],
+        [InlineKeyboardButton("❌ Cancel Mode 3", callback_data="mode3_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    caption_text = (
+        f"🎯 *Guided Captioning* - Media {index + 1}/{total}\n\n"
+        f"Type your caption for this {media_type}, or tap *Skip* to post without caption.\n\n"
+        f"💡 Tip: Use Telegram's formatting menu for bold, italic, etc."
+    )
+    
+    # Send the media preview with caption prompt
+    chat_id = user.id
+    
+    # Determine if we're working with a query or message
+    if hasattr(query_or_message, 'message'):
+        # It's a callback query
+        bot = query_or_message.message.get_bot()
+        # Delete the old message first
+        try:
+            await query_or_message.message.delete()
+        except:
+            pass
+    else:
+        # It's a message
+        bot = query_or_message.get_bot()
+    
+    try:
+        if media_type == 'photo':
+            with open(file_path, 'rb') as f:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=f,
+                    caption=caption_text,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+        elif media_type == 'video':
+            with open(file_path, 'rb') as f:
+                await bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    caption=caption_text,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+        elif media_type == 'animation':
+            with open(file_path, 'rb') as f:
+                await bot.send_animation(
+                    chat_id=chat_id,
+                    animation=f,
+                    caption=caption_text,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+        elif media_type == 'document':
+            with open(file_path, 'rb') as f:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    caption=caption_text,
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
+        else:
+            # Fallback to text message with reference
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"{media_icon} {caption_text}\n\n(Preview not available for this media type)",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        logger.error(f"Error sending Mode 3 preview: {e}", exc_info=True)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{media_icon} {caption_text}\n\n(Error loading preview: {e})",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+
+async def handle_mode3_caption_input(update: Update, user, session_data: dict, context):
+    """Handle caption text input for Mode 3"""
+    text = update.message.text.strip() if update.message.text else ""
+    caption_entities = update.message.entities if update.message.entities else None
+    
+    index = session_data.get('current_caption_index', 0)
+    media_items = session_data.get('media_items', [])
+    selected_channel_id = session_data.get('selected_channel_id')
+    
+    if index >= len(media_items):
+        await update.message.reply_text("❌ Error: Invalid media index.")
+        return
+    
+    item = media_items[index]
+    file_path = item['file_path']
+    media_type = item['media_type']
+    
+    # Serialize caption entities if present
+    entities_json = None
+    if caption_entities:
+        entities_list = []
+        for entity in caption_entities:
+            user_data = None
+            if hasattr(entity, 'user') and entity.user:
+                user_data = entity.user.id
+            entities_list.append({
+                'type': entity.type,
+                'offset': entity.offset,
+                'length': entity.length,
+                'url': getattr(entity, 'url', None),
+                'user': user_data,
+                'language': getattr(entity, 'language', None),
+                'custom_emoji_id': getattr(entity, 'custom_emoji_id', None)
+            })
+        entities_json = json.dumps(entities_list)
+    
+    # Save post to database
+    post_id = Database.add_post(
+        user.id, 
+        file_path, 
+        media_type=media_type, 
+        description=text if text else None,
+        mode=3, 
+        channel_id=selected_channel_id,
+        caption_entities=entities_json
+    )
+    
+    # Mark this item as saved with its post_id
+    media_items[index]['post_id'] = post_id
+    media_items[index]['caption'] = text if text else None
+    
+    # Move to next item
+    session_data['current_caption_index'] = index + 1
+    session_data['media_items'] = media_items
+    Database.update_user_session(user.id, BotStates.MODE3_CAPTIONING, session_data)
+    
+    # Show next media or finish
+    await show_mode3_caption_prompt(update.message, user, session_data, index + 1)
+
+
+async def handle_mode3_skip_caption(query, user):
+    """Handle skip caption button in Mode 3"""
+    mode, session_data = Database.get_user_session(user.id)
+    
+    if mode != BotStates.MODE3_CAPTIONING:
+        await query.answer("Not in captioning mode.")
+        return
+    
+    index = session_data.get('current_caption_index', 0)
+    media_items = session_data.get('media_items', [])
+    selected_channel_id = session_data.get('selected_channel_id')
+    
+    if index >= len(media_items):
+        await query.answer("All media processed.")
+        return
+    
+    item = media_items[index]
+    file_path = item['file_path']
+    media_type = item['media_type']
+    
+    # Save post to database without caption
+    post_id = Database.add_post(
+        user.id, 
+        file_path, 
+        media_type=media_type, 
+        description=None,
+        mode=3, 
+        channel_id=selected_channel_id
+    )
+    
+    # Mark this item as saved
+    media_items[index]['post_id'] = post_id
+    media_items[index]['caption'] = None
+    
+    # Move to next item
+    session_data['current_caption_index'] = index + 1
+    session_data['media_items'] = media_items
+    Database.update_user_session(user.id, BotStates.MODE3_CAPTIONING, session_data)
+    
+    await query.answer(f"Skipped caption for media {index + 1}")
+    
+    # Show next media or finish
+    await show_mode3_caption_prompt(query, user, session_data, index + 1)
+
+
+async def finish_mode3_captioning(query_or_message, user, session_data: dict):
+    """Finish Mode 3 captioning and show scheduling options"""
+    media_items = session_data.get('media_items', [])
+    selected_channel_id = session_data.get('selected_channel_id')
+    
+    # Count posts saved
+    saved_posts = [item for item in media_items if 'post_id' in item]
+    
+    # Get channel name
+    channels = Database.get_user_channels(user.id)
+    channel = next((ch for ch in channels if ch['channel_id'] == selected_channel_id), None)
+    channel_name = channel['channel_name'] if channel else selected_channel_id
+    
+    keyboard = [
+        [InlineKeyboardButton("📅 Schedule Posts", callback_data="mode3_schedule")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_text = (
+        f"✅ *All Captions Added!*\n\n"
+        f"*Media:* {len(saved_posts)} items\n"
+        f"*Channel:* {channel_name}\n\n"
+        f"Tap *Schedule Posts* to set posting times."
+    )
+    
+    # Reset session state but keep media info for scheduling
+    session_data['mode3_ready_to_schedule'] = True
+    Database.update_user_session(user.id, BotStates.IDLE, session_data)
+    
+    # Determine if we're working with a query or message
+    if hasattr(query_or_message, 'message'):
+        bot = query_or_message.message.get_bot()
+        chat_id = query_or_message.message.chat_id
+    else:
+        bot = query_or_message.get_bot()
+        chat_id = query_or_message.chat_id
+    
+    await bot.send_message(
+        chat_id=chat_id,
+        text=message_text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_mode3_schedule(query, user):
+    """Handle Mode 3 scheduling - use same scheduling logic as Mode 2"""
+    mode, session_data = Database.get_user_session(user.id)
+    
+    media_items = session_data.get('media_items', [])
+    selected_channel_id = session_data.get('selected_channel_id')
+    
+    # Get pending posts for this channel (unscheduled only)
+    pending_posts = Database.get_pending_posts(user.id, channel_id=selected_channel_id, unscheduled_only=True)
+    
+    if not pending_posts:
+        await query.answer("No posts to schedule.")
+        await query.edit_message_text(
+            "❌ *No Posts to Schedule*\n\n"
+            "All posts may have already been scheduled.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Use same scheduling interface as other modes
+    keyboard = [
+        [InlineKeyboardButton("✅ Schedule All Posts", callback_data="schedule_current")],
+        [InlineKeyboardButton("⏭️ Next Available Slot", callback_data="schedule_next_slot")],
+        [InlineKeyboardButton("⚙️ Change Settings", callback_data="schedule_custom")],
+        [InlineKeyboardButton("📅 Custom Date", callback_data="schedule_custom_date")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="schedule_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.answer()
+    await query.edit_message_text(
+        f"📅 *Schedule {len(pending_posts)} Posts*\n\n"
+        f"Choose scheduling option:\n\n"
+        f"• *Schedule All:* Use default settings\n"
+        f"• *Next Available Slot:* Start from next time slot\n"
+        f"• *Change Settings:* Adjust interval and hours\n"
+        f"• *Custom Date:* Pick a specific start date",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_mode3_cancel(query, user):
+    """Cancel Mode 3 and clean up"""
+    mode, session_data = Database.get_user_session(user.id)
+    
+    media_items = session_data.get('media_items', [])
+    
+    # Clean up uploaded files that haven't been saved to database
+    for item in media_items:
+        if 'post_id' not in item:
+            file_path = item.get('file_path')
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+    
+    # Reset session
+    Database.update_user_session(user.id, BotStates.IDLE)
+    
+    await query.answer("Mode 3 cancelled")
+    try:
+        await query.message.delete()
+    except:
+        pass
+    
+    # Show main menu
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.chat.send_message(
+        "❌ *Mode 3 Cancelled*\n\nUploaded media has been removed.",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+
+async def handle_editposts_media_input(update: Update, user, file_path: str, media_type: str, session_data: dict):
+    """Handle media replacement input"""
+    editing_post_id = session_data.get('editing_post_id')
+    
+    if not editing_post_id or session_data.get('editing_type') != 'media':
+        return False
+    
+    # Get old file path for cleanup
+    post = Database.get_post_by_id(editing_post_id)
+    old_file_path = post.get('file_path') if post else None
+    
+    # Update the post with new media
+    success = Database.update_post_media(editing_post_id, file_path, media_type)
+    
+    if success:
+        # Delete old file
+        if old_file_path and os.path.exists(old_file_path) and old_file_path != file_path:
+            try:
+                os.remove(old_file_path)
+            except:
+                pass
+        
+        # Reset session
+        mode, old_session = Database.get_user_session(user.id)
+        if 'edit_post_ids' in old_session:
+            Database.update_user_session(user.id, BotStates.EDIT_POSTS_MENU, old_session)
+        
+        media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
+        
+        await update.message.reply_text(
+            f"✅ *Media Replaced Successfully!*\n\n"
+            f"*Post #{editing_post_id}* now has new {media_icon} {media_type}.\n\n"
+            f"Use /editposts to continue editing.",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("❌ Failed to replace media. Please try again.")
+    
+    return True
+
+
+# ==================== RECURRING POSTS MANAGEMENT ====================
+
+async def show_recurring_posts_menu(query, user):
+    """Show the main recurring posts management menu"""
+    try:
+        recurring_posts = Database.get_user_recurring_posts(user.id)
+        
+        if not recurring_posts:
+            keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "🔄 *No Recurring Posts*\n\n"
+                "You don't have any active recurring posts.\n\n"
+                "Use *Recurring Mode* from the main menu to create one!",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+        
+        channels = {}
+        for post in recurring_posts:
+            channel_id = post['channel_id']
+            channel_name = post.get('channel_name', channel_id)
+            if channel_id not in channels:
+                channels[channel_id] = {'name': channel_name, 'count': 0}
+            channels[channel_id]['count'] += 1
+        
+        keyboard = []
+        for channel_id, info in channels.items():
+            keyboard.append([InlineKeyboardButton(
+                f"📺 {info['name']} ({info['count']} recurring)",
+                callback_data=f"recur_manage_ch_{channel_id}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🔄 *Manage Recurring Posts*\n\n"
+            f"You have *{len(recurring_posts)}* active recurring post(s).\n\n"
+            f"Select a channel to view and manage recurring posts:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in show_recurring_posts_menu: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {escape_markdown(str(e))}", parse_mode='Markdown')
+
+
+async def handle_recurring_channel_posts(query, user, channel_id: str):
+    """Show recurring posts for a specific channel with navigation"""
+    try:
+        posts = Database.get_user_recurring_posts(user.id, channel_id)
+        
+        if not posts:
+            keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="recurring_manage_menu")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                "❌ No recurring posts found for this channel.",
+                reply_markup=reply_markup
+            )
+            return
+        
+        session_data = {
+            'recurring_posts': [p['id'] for p in posts],
+            'current_index': 0,
+            'channel_id': channel_id
+        }
+        Database.update_user_session(user.id, 'RECURRING_MANAGE', session_data)
+        
+        await show_recurring_post_detail(query, user, posts[0], 0, len(posts))
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_channel_posts: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {escape_markdown(str(e))}", parse_mode='Markdown')
+
+
+async def show_recurring_post_detail(query, user, post: dict, index: int, total: int):
+    """Show details of a recurring post with edit/delete options"""
+    try:
+        post_id = post['id']
+        interval = post.get('recurring_interval_hours', 24)
+        end_date = post.get('recurring_end_date')
+        count_limit = post.get('recurring_count')
+        posted_count = post.get('recurring_posted_count', 0)
+        description = post.get('description', '')
+        media_type = post.get('media_type', 'photo')
+        next_post = post.get('scheduled_time')
+        channel_name = post.get('channel_name', post.get('channel_id', 'Unknown'))
+        
+        interval_text = f"{interval} hours"
+        if interval == 24:
+            interval_text = "Daily (24h)"
+        elif interval == 48:
+            interval_text = "Every 2 days"
+        elif interval == 168:
+            interval_text = "Weekly"
+        
+        if count_limit:
+            remaining = count_limit - posted_count
+            end_text = f"{remaining} posts remaining (of {count_limit})"
+        elif end_date:
+            end_text = f"Until {end_date.strftime('%Y-%m-%d %H:%M')}"
+        else:
+            end_text = "Never (infinite)"
+        
+        caption_text = escape_markdown(description[:100] + "..." if len(description) > 100 else description) if description else "_No caption_"
+        next_text = next_post.strftime('%Y-%m-%d %H:%M') if next_post else "Not scheduled"
+        
+        media_icons = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}
+        media_icon = media_icons.get(media_type, '📁')
+        
+        nav_buttons = []
+        if index > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"recur_nav_{index-1}"))
+        if index < total - 1:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"recur_nav_{index+1}"))
+        
+        keyboard = []
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+        
+        keyboard.extend([
+            [
+                InlineKeyboardButton("👁️ Preview", callback_data=f"recur_preview_{post_id}"),
+                InlineKeyboardButton("✏️ Caption", callback_data=f"recur_editcap_{post_id}")
+            ],
+            [
+                InlineKeyboardButton("⏱️ Interval", callback_data=f"recur_editint_{post_id}"),
+                InlineKeyboardButton("🔚 End Condition", callback_data=f"recur_editend_{post_id}")
+            ],
+            [InlineKeyboardButton("🗑️ Delete", callback_data=f"recur_delete_{post_id}")],
+            [InlineKeyboardButton("🔙 Back to Channels", callback_data="recurring_manage_menu")]
+        ])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🔄 *Recurring Post \\#{post_id}* ({index+1}/{total})\n\n"
+            f"*📺 Channel:* {escape_markdown(channel_name)}\n"
+            f"*{media_icon} Type:* {media_type.capitalize()}\n"
+            f"*⏱️ Interval:* {interval_text}\n"
+            f"*📊 Posted:* {posted_count} times\n"
+            f"*🔚 Ends:* {end_text}\n"
+            f"*📅 Next Post:* {next_text}\n\n"
+            f"*📝 Caption:*\n{caption_text}",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in show_recurring_post_detail: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Error: {escape_markdown(str(e))}", parse_mode='Markdown')
+
+
+async def handle_recurring_navigation(query, user, new_index: int):
+    """Handle navigation between recurring posts"""
+    try:
+        mode, session_data = Database.get_user_session(user.id)
+        if mode != 'RECURRING_MANAGE':
+            await query.answer("Session expired. Please start again.")
+            return
+        
+        post_ids = session_data.get('recurring_posts', [])
+        
+        if not post_ids or new_index < 0 or new_index >= len(post_ids):
+            await query.answer("Invalid navigation")
+            return
+        
+        session_data['current_index'] = new_index
+        Database.update_user_session(user.id, 'RECURRING_MANAGE', session_data)
+        
+        post_id = post_ids[new_index]
+        posts = Database.get_user_recurring_posts(user.id, session_data.get('channel_id'))
+        post = next((p for p in posts if p['id'] == post_id), None)
+        
+        if not post:
+            await query.answer("Post not found")
+            return
+        
+        await show_recurring_post_detail(query, user, post, new_index, len(post_ids))
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_navigation: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_preview(query, user, post_id: int):
+    """Preview the media of a recurring post"""
+    try:
+        posts = Database.get_user_recurring_posts(user.id)
+        post = next((p for p in posts if p['id'] == post_id), None)
+        
+        if not post:
+            await query.answer("Post not found")
+            return
+        
+        file_path = post.get('file_path')
+        media_type = post.get('media_type', 'photo')
+        description = post.get('description', '')
+        caption_entities_json = post.get('caption_entities')
+        
+        if not file_path or not os.path.exists(file_path):
+            await query.answer("Media file not found")
+            return
+        
+        caption_entities = None
+        if caption_entities_json:
+            import json
+            try:
+                entities_data = json.loads(caption_entities_json)
+                caption_entities = [
+                    MessageEntity(
+                        type=e['type'],
+                        offset=e['offset'],
+                        length=e['length'],
+                        url=e.get('url'),
+                        language=e.get('language')
+                    ) for e in entities_data
+                ]
+            except:
+                pass
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=f"recur_back_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        with open(file_path, 'rb') as f:
+            if media_type == 'photo':
+                await query.message.chat.send_photo(
+                    photo=f,
+                    caption=description if description else None,
+                    caption_entities=caption_entities,
+                    reply_markup=reply_markup
+                )
+            elif media_type == 'video':
+                await query.message.chat.send_video(
+                    video=f,
+                    caption=description if description else None,
+                    caption_entities=caption_entities,
+                    reply_markup=reply_markup
+                )
+            elif media_type == 'audio':
+                await query.message.chat.send_audio(
+                    audio=f,
+                    caption=description if description else None,
+                    caption_entities=caption_entities,
+                    reply_markup=reply_markup
+                )
+            elif media_type == 'animation':
+                await query.message.chat.send_animation(
+                    animation=f,
+                    caption=description if description else None,
+                    caption_entities=caption_entities,
+                    reply_markup=reply_markup
+                )
+            else:
+                await query.message.chat.send_document(
+                    document=f,
+                    caption=description if description else None,
+                    caption_entities=caption_entities,
+                    reply_markup=reply_markup
+                )
+        
+        await query.answer("Preview sent!")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_preview: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_edit_caption(query, user, post_id: int):
+    """Start editing the caption of a recurring post"""
+    try:
+        session_data = {
+            'editing_recurring_id': post_id,
+            'editing_type': 'caption'
+        }
+        Database.update_user_session(user.id, 'RECURRING_EDIT_CAPTION', session_data)
+        
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"recur_back_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✏️ *Edit Caption for Recurring Post \\#{post_id}*\n\n"
+            f"Send the new caption with formatting \\(bold, italic, etc\\.\\)\\.\n\n"
+            f"Send `skip` to remove the caption\\.\n\n"
+            f"*Formatting Tips:*\n"
+            f"• Use Telegram's built\\-in formatting\n"
+            f"• Bold, italic, underline, strikethrough all work\n"
+            f"• Links and code blocks are preserved",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_edit_caption: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_edit_interval(query, user, post_id: int):
+    """Show interval editing options"""
+    try:
+        keyboard = [
+            [
+                InlineKeyboardButton("6h", callback_data=f"recur_setint_{post_id}_6"),
+                InlineKeyboardButton("12h", callback_data=f"recur_setint_{post_id}_12"),
+                InlineKeyboardButton("24h", callback_data=f"recur_setint_{post_id}_24")
+            ],
+            [
+                InlineKeyboardButton("48h", callback_data=f"recur_setint_{post_id}_48"),
+                InlineKeyboardButton("72h", callback_data=f"recur_setint_{post_id}_72"),
+                InlineKeyboardButton("168h (weekly)", callback_data=f"recur_setint_{post_id}_168")
+            ],
+            [InlineKeyboardButton("🔙 Cancel", callback_data=f"recur_back_{post_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⏱️ *Change Interval for Post \\#{post_id}*\n\n"
+            f"Select new posting interval:",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_edit_interval: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_set_interval(query, user, post_id: int, interval_hours: int):
+    """Apply new interval to recurring post"""
+    try:
+        success = Database.update_recurring_post_interval(post_id, interval_hours, user_id=user.id)
+        
+        if success:
+            await query.answer(f"Interval updated to {interval_hours}h!")
+            
+            posts = Database.get_user_recurring_posts(user.id)
+            post = next((p for p in posts if p['id'] == post_id), None)
+            if post:
+                await show_recurring_post_detail(query, user, post, 0, 1)
+        else:
+            await query.answer("Failed to update interval")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_set_interval: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_edit_end(query, user, post_id: int):
+    """Show end condition editing options"""
+    try:
+        keyboard = [
+            [InlineKeyboardButton("🔄 Never (Infinite)", callback_data=f"recur_setend_{post_id}_never")],
+            [
+                InlineKeyboardButton("5 times", callback_data=f"recur_setend_{post_id}_count_5"),
+                InlineKeyboardButton("10 times", callback_data=f"recur_setend_{post_id}_count_10")
+            ],
+            [
+                InlineKeyboardButton("20 times", callback_data=f"recur_setend_{post_id}_count_20"),
+                InlineKeyboardButton("50 times", callback_data=f"recur_setend_{post_id}_count_50")
+            ],
+            [InlineKeyboardButton("📅 Custom Date", callback_data=f"recur_setend_{post_id}_date")],
+            [InlineKeyboardButton("🔙 Cancel", callback_data=f"recur_back_{post_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🔚 *Change End Condition for Post \\#{post_id}*\n\n"
+            f"Select when this recurring post should stop:",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_edit_end: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_set_end(query, user, post_id: int, end_type: str, context=None):
+    """Apply new end condition to recurring post"""
+    try:
+        if end_type == "never":
+            success = Database.update_recurring_post_end_condition(post_id, None, None, user_id=user.id)
+            msg = "End condition set to: Never"
+        elif end_type.startswith("count_"):
+            count = int(end_type.replace("count_", ""))
+            success = Database.update_recurring_post_end_condition(post_id, count, None, user_id=user.id)
+            msg = f"End condition set to: {count} times"
+        elif end_type == "date":
+            session_data = {
+                'editing_recurring_id': post_id,
+                'editing_type': 'end_date'
+            }
+            Database.update_user_session(user.id, 'RECURRING_EDIT_END_DATE', session_data)
+            
+            keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data=f"recur_back_{post_id}")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"📅 *Set End Date for Post \\#{post_id}*\n\n"
+                f"Enter the end date in format:\n"
+                f"`YYYY\\-MM\\-DD HH:MM`\n\n"
+                f"Example: `2026\\-02\\-15 18:00`",
+                reply_markup=reply_markup,
+                parse_mode='MarkdownV2'
+            )
+            return
+        else:
+            await query.answer("Invalid end type")
+            return
+        
+        if success:
+            await query.answer(msg)
+            
+            posts = Database.get_user_recurring_posts(user.id)
+            post = next((p for p in posts if p['id'] == post_id), None)
+            if post:
+                await show_recurring_post_detail(query, user, post, 0, 1)
+        else:
+            await query.answer("Failed to update end condition")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_set_end: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_delete(query, user, post_id: int):
+    """Confirm deletion of recurring post"""
+    try:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Yes, Delete", callback_data=f"recur_confirmdel_{post_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"recur_back_{post_id}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"🗑️ *Delete Recurring Post \\#{post_id}?*\n\n"
+            f"This will stop all future posts and remove the media file\\.\n\n"
+            f"*This action cannot be undone\\!*",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_delete: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_confirm_delete(query, user, post_id: int, context=None):
+    """Actually delete the recurring post"""
+    try:
+        posts = Database.get_user_recurring_posts(user.id)
+        post = next((p for p in posts if p['id'] == post_id), None)
+        
+        if not post:
+            await query.answer("Post not found")
+            return
+        
+        file_path = post.get('file_path')
+        
+        if context and context.application.bot_data.get('scheduler'):
+            try:
+                scheduler = context.application.bot_data['scheduler']
+                scheduler.cancel_post(post_id)
+            except:
+                pass
+        
+        success = Database.delete_post(post_id)
+        
+        if success:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except:
+                    pass
+            
+            await query.answer("Recurring post deleted!")
+            await show_recurring_posts_menu(query, user)
+        else:
+            await query.answer("Failed to delete post")
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_confirm_delete: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_back_to_post(query, user, post_id: int):
+    """Go back to viewing a specific recurring post"""
+    try:
+        posts = Database.get_user_recurring_posts(user.id)
+        post = next((p for p in posts if p['id'] == post_id), None)
+        
+        if not post:
+            await query.answer("Post not found")
+            await show_recurring_posts_menu(query, user)
+            return
+        
+        Database.update_user_session(user.id, BotStates.IDLE)
+        await show_recurring_post_detail(query, user, post, 0, 1)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_recurring_back_to_post: {e}", exc_info=True)
+        await query.answer(f"Error: {str(e)[:50]}")
+
+
+async def handle_recurring_caption_input(update: Update, user, text: str, session_data: dict):
+    """Handle caption input for recurring post editing"""
+    import json
+    
+    post_id = session_data.get('editing_recurring_id')
+    
+    if not post_id:
+        return False
+    
+    if text.lower() == 'skip':
+        new_caption = None
+        caption_entities_json = None
+    else:
+        new_caption = text
+        caption_entities = update.message.entities
+        caption_entities_json = None
+        if caption_entities:
+            caption_entities_json = json.dumps([
+                {'type': e.type, 'offset': e.offset, 'length': e.length, 
+                 'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+                for e in caption_entities
+            ])
+    
+    success = Database.update_post_description(post_id, new_caption, caption_entities_json)
+    
+    if success:
+        Database.update_user_session(user.id, BotStates.IDLE)
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Post", callback_data=f"recur_back_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ *Caption Updated\\!*\n\n"
+            f"Recurring post \\#{post_id} caption has been changed\\.",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+    else:
+        await update.message.reply_text("❌ Failed to update caption. Please try again.")
+    
+    return True
+
+
+async def handle_recurring_end_date_input(update: Update, user, text: str, session_data: dict):
+    """Handle end date input for recurring post editing"""
+    from datetime import datetime
+    from bot.utils import get_kyiv_timezone
+    
+    post_id = session_data.get('editing_recurring_id')
+    
+    if not post_id:
+        return False
+    
+    date_str = text.strip()
+    
+    date_formats = [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%m/%d/%Y %H:%M",
+        "%d.%m.%Y %H:%M"
+    ]
+    
+    end_date = None
+    for fmt in date_formats:
+        try:
+            end_date = datetime.strptime(date_str, fmt)
+            break
+        except ValueError:
+            continue
+    
+    if not end_date:
+        await update.message.reply_text(
+            "❌ Invalid date format\\. Please use:\n\n"
+            "`YYYY\\-MM\\-DD HH:MM`\n\n"
+            "Example: `2026\\-02\\-15 18:00`",
+            parse_mode='MarkdownV2'
+        )
+        return True
+    
+    kyiv_tz = get_kyiv_timezone()
+    end_date = kyiv_tz.localize(end_date)
+    
+    current_time = get_current_kyiv_time()
+    if end_date <= current_time:
+        await update.message.reply_text(
+            f"❌ End date must be in the future\\.\n\n"
+            f"Current time: {escape_markdown(current_time.strftime('%Y-%m-%d %H:%M'))} \\(Kyiv\\)",
+            parse_mode='MarkdownV2'
+        )
+        return True
+    
+    success = Database.update_recurring_post_end_condition(post_id, None, end_date, user_id=user.id)
+    
+    if success:
+        Database.update_user_session(user.id, BotStates.IDLE)
+        
+        keyboard = [[InlineKeyboardButton("🔙 Back to Post", callback_data=f"recur_back_{post_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"✅ *End Date Updated\\!*\n\n"
+            f"Recurring post \\#{post_id} will now end on:\n"
+            f"*{escape_markdown(end_date.strftime('%Y-%m-%d %H:%M'))}* \\(Kyiv time\\)",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+    else:
+        await update.message.reply_text("❌ Failed to update end date. Please try again.")
+    
+    return True
 

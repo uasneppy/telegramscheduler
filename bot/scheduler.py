@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta
+from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import pytz
@@ -96,14 +97,26 @@ class PostScheduler:
     
     async def schedule_posts(self, post_ids: list, scheduled_times: list):
         """Schedule multiple posts with delays to prevent connection pool exhaustion"""
+        logger.info(f"schedule_posts called with {len(post_ids)} posts")
+        
         if len(post_ids) != len(scheduled_times):
             raise ValueError("Number of posts and scheduled times must match")
         
         conn = Database.get_connection()
         cursor = conn.cursor()
         
+        scheduled_count = 0
         for i, (post_id, scheduled_time) in enumerate(zip(post_ids, scheduled_times)):
+            logger.info(f"Scheduling post {post_id} for {scheduled_time}")
             self._schedule_single_post(post_id, scheduled_time)
+            
+            # Verify job was created
+            job_id = f"post_{post_id}"
+            if self.scheduler.get_job(job_id):
+                scheduled_count += 1
+                logger.info(f"Job {job_id} confirmed in scheduler")
+            else:
+                logger.warning(f"Job {job_id} NOT found in scheduler after scheduling")
             
             # Update the database with the scheduled time
             cursor.execute(
@@ -176,9 +189,32 @@ class PostScheduler:
                 user_id = post_data['user_id']
                 channel_id = post_data['channel_id']
                 media_bundle_json = post_data['media_bundle_json']
+                caption_entities_json = post_data.get('caption_entities')
+                
+                # Convert stored caption entities JSON back to MessageEntity objects
+                caption_entities = None
+                if caption_entities_json:
+                    try:
+                        import json
+                        from telegram import MessageEntity
+                        entities_data = json.loads(caption_entities_json)
+                        caption_entities = [
+                            MessageEntity(
+                                type=e['type'],
+                                offset=e['offset'],
+                                length=e['length'],
+                                url=e.get('url'),
+                                language=e.get('language')
+                            )
+                            for e in entities_data
+                        ]
+                        logger.info(f"Post {post_id}: Restored {len(caption_entities)} caption entities")
+                    except Exception as e:
+                        logger.warning(f"Post {post_id}: Failed to parse caption_entities: {e}")
+                        caption_entities = None
                 
                 # Debug logging for caption handling
-                logger.info(f"Post {post_id}: Retrieved description='{description}' (type: {type(description).__name__})")
+                logger.info(f"Post {post_id}: Retrieved description='{description}', entities={len(caption_entities) if caption_entities else 0}")
                 
                 # Check if channel_id is provided
                 if not channel_id:
@@ -219,32 +255,38 @@ class PostScheduler:
                     return
                 
                 # Send media to channel based on type
+                # Use caption_entities for native Telegram formatting (bold/italic from menu)
+                # No parse_mode when entities are absent to avoid HTML parsing issues with special chars like </3
                 with open(file_path, 'rb') as media_file:
                     if media_type == 'photo':
                         logger.info(f"Post {post_id}: Sending photo with caption='{description}' to {target_channel}")
                         await self.bot.send_photo(
                             chat_id=target_channel,
                             photo=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                     elif media_type == 'video':
                         logger.info(f"Post {post_id}: Sending video with caption='{description}' to {target_channel}")
                         await self.bot.send_video(
                             chat_id=target_channel,
                             video=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                     elif media_type == 'audio':
                         await self.bot.send_audio(
                             chat_id=target_channel,
                             audio=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                     elif media_type == 'animation':
                         await self.bot.send_animation(
                             chat_id=target_channel,
                             animation=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                     elif media_type in ['document', 'document_image', 'document_video']:
                         # Send as document to preserve original quality and file size
@@ -252,14 +294,16 @@ class PostScheduler:
                         await self.bot.send_document(
                             chat_id=target_channel,
                             document=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                     else:
                         # Default to document for unknown types (preserves quality)
                         await self.bot.send_document(
                             chat_id=target_channel,
                             document=media_file,
-                            caption=description
+                            caption=description,
+                            caption_entities=caption_entities
                         )
                 
                 # Check if this is a recurring post by querying the specific post
@@ -551,13 +595,28 @@ class PostScheduler:
         if post['recurring_count'] and post['recurring_posted_count'] + 1 >= post['recurring_count']:
             should_continue = False
         
-        # Check end date
-        if post['recurring_end_date'] and get_current_kyiv_time() >= post['recurring_end_date']:
-            should_continue = False
+        # Check end date - parse string dates properly
+        recurring_end_date = post['recurring_end_date']
+        if recurring_end_date:
+            # Handle string dates from database
+            if isinstance(recurring_end_date, str):
+                try:
+                    recurring_end_date = datetime.fromisoformat(recurring_end_date)
+                    if recurring_end_date.tzinfo is None:
+                        recurring_end_date = get_kyiv_timezone().localize(recurring_end_date)
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse recurring_end_date: {recurring_end_date}")
+                    recurring_end_date = None
+            
+            if recurring_end_date and get_current_kyiv_time() >= recurring_end_date:
+                should_continue = False
         
         if should_continue and post['recurring_interval_hours']:
             # Schedule next occurrence
             next_time = get_current_kyiv_time() + timedelta(hours=post['recurring_interval_hours'])
+            
+            # Update the scheduled_time in database for the next occurrence
+            Database.update_post_schedule(post_id, next_time)
             
             # Create new job for next occurrence
             job_id = f"post_{post_id}"
@@ -616,6 +675,7 @@ class PostScheduler:
                 open_files.append(f)
                 
                 # Determine InputMedia type for Telegram
+                # No parse_mode to avoid HTML parsing issues with special chars like </3
                 if media_type in ['photo', 'document_image']:
                     media_obj = InputMediaPhoto(
                         media=f,
@@ -971,7 +1031,7 @@ The post has been marked for manual review.
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about unexpected error: {e}")
     
-    async def reschedule_all_posts_from_today(self, user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: str = None) -> int:
+    async def reschedule_all_posts_from_today(self, user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: Optional[str] = None) -> int:
         """Reschedule all pending posts starting from today with custom hours"""
         try:
             # Cancel existing scheduled jobs first
