@@ -5,7 +5,7 @@ Configuration settings for the Telegram bot
 import os
 
 # Bot configuration
-BOT_TOKEN = ""
+BOT_TOKEN = os.getenv("BOT_TOKEN", None)
 
 # Channel configuration (optional - bot supports multi-channel)
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", None)
