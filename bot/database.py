@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, UPLOADS_DIR
 from .utils import get_kyiv_timezone
 
 logger = logging.getLogger(__name__)
@@ -2489,7 +2489,7 @@ class Database:
                     # Try to find file with just filename if full path doesn't exist
                     if not file_exists and '/' in file_path:
                         filename = os.path.basename(file_path)
-                        new_path = f"uploads/{filename}"
+                        new_path = os.path.join(UPLOADS_DIR, filename)
                         if os.path.exists(new_path):
                             file_path = new_path
                             file_exists = True
