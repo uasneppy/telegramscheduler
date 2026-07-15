@@ -258,8 +258,8 @@ class PostScheduler:
                     await self.bot.send_message(
                         chat_id=user_id,
                         text=f"❌ Post #{post_id} failed: Media file not found."
-                )
-                return
+                    )
+                    return
                 
                 # Send media to channel based on type
                 # Use caption_entities for native Telegram formatting (bold/italic from menu)
