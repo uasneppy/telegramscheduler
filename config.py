@@ -10,9 +10,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", None)
 # Channel configuration (optional - bot supports multi-channel)
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", None)
 
-# File paths
-DATABASE_PATH = "bot_data.db"
-UPLOADS_DIR = "uploads"
+# File paths — use DATA_DIR env var (default /data) so Docker volume mounts work
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATABASE_PATH = os.path.join(DATA_DIR, "bot_data.db")
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
 
 # Timezone settings
 TIMEZONE = "Europe/Kiev"  # Kyiv timezone

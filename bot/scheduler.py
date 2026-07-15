@@ -17,7 +17,7 @@ from telegram.request import HTTPXRequest
 
 from .database import Database
 from .utils import get_kyiv_timezone, get_current_kyiv_time, cleanup_old_media_files, cleanup_empty_directories
-from config import BOT_TOKEN, CHANNEL_ID
+from config import BOT_TOKEN, CHANNEL_ID, UPLOADS_DIR, DATA_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -244,9 +244,10 @@ class PostScheduler:
                     await self._post_album_to_channel(post_id, media_bundle_json, description, target_channel, user_id)
                     return
                 
-                # Convert stored relative paths to Docker data paths
-                if file_path.startswith("uploads/"):
-                    actual_file_path = os.path.join("/data", file_path)
+                # Convert stored relative paths to absolute data paths
+                # Legacy posts stored "uploads/..." relative paths; new posts store absolute paths
+                if not os.path.isabs(file_path):
+                    actual_file_path = os.path.join(DATA_DIR, file_path)
                 else:
                     actual_file_path = file_path
 
