@@ -244,20 +244,26 @@ class PostScheduler:
                     await self._post_album_to_channel(post_id, media_bundle_json, description, target_channel, user_id)
                     return
                 
+                # Convert stored relative paths to Docker data paths
+                if file_path.startswith("uploads/"):
+                    actual_file_path = os.path.join("/data", file_path)
+                else:
+                    actual_file_path = file_path
+
                 # Check if file exists before trying to open it
-                if not os.path.exists(file_path):
-                    logger.error(f"File not found for post {post_id}: {file_path}")
-                    Database.mark_post_as_failed(post_id, f"File not found: {file_path}")
+                if not os.path.exists(actual_file_path):
+                    logger.error(f"File not found for post {post_id}: {actual_file_path}")
+                    Database.mark_post_as_failed(post_id, f"File not found: {actual_file_path}")
                     await self.bot.send_message(
                         chat_id=user_id,
                         text=f"❌ Post #{post_id} failed: Media file not found."
-                    )
-                    return
+                )
+                return
                 
                 # Send media to channel based on type
                 # Use caption_entities for native Telegram formatting (bold/italic from menu)
                 # No parse_mode when entities are absent to avoid HTML parsing issues with special chars like </3
-                with open(file_path, 'rb') as media_file:
+                with open(actual_file_path, 'rb') as media_file:
                     if media_type == 'photo':
                         logger.info(f"Post {post_id}: Sending photo with caption='{description}' to {target_channel}")
                         await self.bot.send_photo(
@@ -671,7 +677,7 @@ class PostScheduler:
                     continue
                 
                 # Open file and keep it open until after send_media_group
-                f = open(file_path, 'rb')
+                f = open(actual_file_path, 'rb')
                 open_files.append(f)
                 
                 # Determine InputMedia type for Telegram
