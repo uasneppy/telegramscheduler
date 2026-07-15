@@ -343,7 +343,22 @@ class PostScheduler:
                     await self._handle_recurring_post(current_post)
                 else:
                     # Mark as posted for non-recurring posts
-                    Database.mark_post_as_posted(post_id)
+                    try:
+                        Database.mark_post_as_posted(post_id)
+                        logger.info(f"Post {post_id} marked as posted in DB")
+                    except Exception as db_err:
+                        logger.error(
+                            f"CRITICAL: Post {post_id} was sent to channel but could not be "
+                            f"marked as posted in DB: {db_err}. Retrying mark..."
+                        )
+                        try:
+                            Database.mark_post_as_posted(post_id)
+                            logger.info(f"Post {post_id} marked as posted on second attempt")
+                        except Exception as db_err2:
+                            logger.error(
+                                f"Post {post_id} mark_as_posted failed twice: {db_err2}. "
+                                f"Post was sent but will appear stuck as pending."
+                            )
                 
                 logger.info(f"Successfully posted {post_id} to channel")
                 
@@ -510,23 +525,55 @@ class PostScheduler:
                     job = self.scheduler.get_job(job_id)
                     
                     if not job:
-                        # Job is missing - reschedule it
-                        logger.error(f"Post {post_id} has no scheduled job - rescheduling")
-                        
-                        # Schedule immediately with a small delay
-                        new_time = get_current_kyiv_time() + timedelta(seconds=10)
-                        self._schedule_single_post(post_id, new_time)
-                        Database.update_post_schedule(post_id, new_time)
-                        
-                        # Notify user
-                        try:
-                            await self.bot.send_message(
-                                chat_id=user_id,
-                                text=f"⚠️ Post #{post_id} was delayed. Rescheduling for immediate posting.",
-                                parse_mode='Markdown'
+                        # Check how many times this post has already been rescheduled
+                        current_retry = Database.increment_retry_count(post_id)
+                        max_monitor_reschedules = 5
+
+                        if current_retry > max_monitor_reschedules:
+                            # Post is stuck in a loop - give up and mark as failed
+                            logger.error(
+                                f"Post {post_id} has been rescheduled {current_retry} times without posting. "
+                                f"Marking as failed to stop infinite loop."
                             )
-                        except Exception as e:
-                            logger.error(f"Could not notify user {user_id}: {e}")
+                            Database.mark_post_as_failed(
+                                post_id,
+                                f"Exceeded max reschedule attempts ({max_monitor_reschedules}). "
+                                f"Post fired but was never marked as sent — check file path and channel access."
+                            )
+                            try:
+                                await self.bot.send_message(
+                                    chat_id=user_id,
+                                    text=(
+                                        f"❌ Post #{post_id} failed after {current_retry} retry attempts.\n\n"
+                                        f"The post kept firing but was never confirmed as sent. "
+                                        f"Please check that the media file still exists and that the bot "
+                                        f"has permission to post to the channel."
+                                    )
+                                )
+                            except Exception as e:
+                                logger.error(f"Could not notify user {user_id} of post failure: {e}")
+                        else:
+                            # Job is missing - reschedule it
+                            logger.error(
+                                f"Post {post_id} has no scheduled job - rescheduling "
+                                f"(attempt {current_retry}/{max_monitor_reschedules})"
+                            )
+
+                            # Schedule immediately with a small delay
+                            new_time = get_current_kyiv_time() + timedelta(seconds=10)
+                            self._schedule_single_post(post_id, new_time)
+                            Database.update_post_schedule(post_id, new_time)
+
+                            # Only notify user on first reschedule to avoid spam
+                            if current_retry == 1:
+                                try:
+                                    await self.bot.send_message(
+                                        chat_id=user_id,
+                                        text=f"⚠️ Post #{post_id} was delayed. Rescheduling for immediate posting.",
+                                        parse_mode='Markdown'
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Could not notify user {user_id}: {e}")
                     else:
                         # Job exists but didn't execute - might be a scheduler issue
                         logger.warning(f"Post {post_id} has job but didn't execute")

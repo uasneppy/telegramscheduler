@@ -46,3 +46,4 @@ class BotStates:
     WAITING_BATCH_NAME = "waiting_batch_name"
     MULTI_BATCH_MENU = "multi_batch_menu"
     WAITING_BULK_EDIT_INPUT = "waiting_bulk_edit_input"
+    PREVIEW_MODE = "preview_mode"
