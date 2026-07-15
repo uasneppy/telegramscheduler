@@ -9170,9 +9170,47 @@ async def handle_overdue_callback(query, user, data):
             parse_mode='Markdown'
         )
     
-    elif action.startswith("post_"):
+    elif action.startswith("post_channel_"):
+        # Post all overdue posts for a specific channel immediately
+        channel_id = action.replace("post_channel_", "")
+        overdue_posts = Database.get_overdue_posts(user.id, channel_id)
+        if not overdue_posts:
+            await query.edit_message_text("✅ No overdue posts found for this channel.")
+            return
+
+        from .scheduler import PostScheduler
+        scheduler = PostScheduler()
+        logger.warning("Using fallback scheduler instance for channel overdue posting")
+        posted_count = 0
+        failed_count = 0
+        for post in overdue_posts:
+            try:
+                await scheduler._post_to_channel(post['id'])
+                posted_count += 1
+            except Exception as e:
+                logger.error(f"Failed to post overdue post {post['id']}: {e}")
+                failed_count += 1
+
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh Overdue", callback_data="overdue_refresh")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        status_message = f"✅ *Channel Posting Complete*\n\n"
+        if posted_count > 0:
+            status_message += f"*Successfully processed:* {posted_count} posts\n"
+        if failed_count > 0:
+            status_message += f"*Failed:* {failed_count} posts\n"
+        await query.edit_message_text(status_message, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif action.startswith("post_") and not action == "post_all":
         # Post a specific overdue post immediately
-        post_id = int(action.replace("post_", ""))
+        try:
+            post_id = int(action.replace("post_", ""))
+        except ValueError:
+            logger.error(f"Invalid overdue post action: {action}")
+            await query.edit_message_text("❌ Invalid action. Please try again.")
+            return
         
         try:
             # Actually post the content to Telegram instead of just marking as posted
@@ -9204,9 +9242,36 @@ async def handle_overdue_callback(query, user, data):
                 f"Please try again."
             )
     
+    elif action.startswith("reschedule_channel_"):
+        # Reschedule all overdue posts for a specific channel
+        channel_id = action.replace("reschedule_channel_", "")
+        overdue_posts = Database.get_overdue_posts(user.id, channel_id)
+        if not overdue_posts:
+            await query.edit_message_text("✅ No overdue posts found for this channel.")
+            return
+        post_ids = [post['id'] for post in overdue_posts]
+        updated_count = Database.reschedule_overdue_posts_to_next_slots(user.id, post_ids, channel_id)
+        keyboard = [
+            [InlineKeyboardButton("🔄 Refresh Overdue", callback_data="overdue_refresh")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if updated_count > 0:
+            await query.edit_message_text(
+                f"✅ *Rescheduling Complete*\n\n*Posts rescheduled:* {updated_count}",
+                reply_markup=reply_markup, parse_mode='Markdown'
+            )
+        else:
+            await query.edit_message_text("❌ Failed to reschedule posts. Please try again.")
+
     elif action.startswith("reschedule_"):
         # Reschedule a specific overdue post
-        post_id = int(action.replace("reschedule_", ""))
+        try:
+            post_id = int(action.replace("reschedule_", ""))
+        except ValueError:
+            logger.error(f"Invalid overdue reschedule action: {action}")
+            await query.edit_message_text("❌ Invalid action. Please try again.")
+            return
         
         updated_count = Database.reschedule_overdue_posts_to_next_slots(user.id, [post_id])
         

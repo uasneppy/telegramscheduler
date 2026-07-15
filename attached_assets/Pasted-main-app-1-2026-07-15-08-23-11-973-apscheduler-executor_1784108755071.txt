@@ -1,0 +1,198 @@
+main_app-1  | 2026-07-15 08:23:11,973 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:28:11 EEST)" (scheduled at 2026-07-15 11:23:11.963649+03:00)
+main_app-1  | 2026-07-15 08:23:11,974 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:23:11,980 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:23:11,980 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:28:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:28:11,973 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:33:11 EEST)" (scheduled at 2026-07-15 11:28:11.963649+03:00)
+main_app-1  | 2026-07-15 08:28:11,974 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:28:11,980 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:28:11,980 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:33:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:33:11,972 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:38:11 EEST)" (scheduled at 2026-07-15 11:33:11.963649+03:00)
+main_app-1  | 2026-07-15 08:33:11,972 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:33:11,977 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:33:11,977 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:38:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:38:11,971 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:43:11 EEST)" (scheduled at 2026-07-15 11:38:11.963649+03:00)
+main_app-1  | 2026-07-15 08:38:11,972 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:38:11,976 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:38:11,976 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:43:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:43:11,970 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:48:11 EEST)" (scheduled at 2026-07-15 11:43:11.963649+03:00)
+main_app-1  | 2026-07-15 08:43:11,970 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:43:11,975 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:43:11,975 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:48:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:48:11,970 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:53:11 EEST)" (scheduled at 2026-07-15 11:48:11.963649+03:00)
+main_app-1  | 2026-07-15 08:48:11,970 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:48:11,976 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:48:11,976 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:53:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:53:11,968 - apscheduler.executors.default - INFO - Running job "PostScheduler._check_and_send_reminders (trigger: interval[1:00:00], next run at: 2026-07-15 12:53:11 EEST)" (scheduled at 2026-07-15 11:53:11.962907+03:00)
+main_app-1  | 2026-07-15 08:53:11,969 - bot.scheduler - INFO - Checking for users who need post reminders...
+main_app-1  | 2026-07-15 08:53:11,970 - bot.scheduler - INFO - No users need reminders at this time
+main_app-1  | 2026-07-15 08:53:11,970 - apscheduler.executors.default - INFO - Job "PostScheduler._check_and_send_reminders (trigger: interval[1:00:00], next run at: 2026-07-15 12:53:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:53:11,970 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:58:11 EEST)" (scheduled at 2026-07-15 11:53:11.963649+03:00)
+main_app-1  | 2026-07-15 08:53:11,970 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:53:11,973 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:53:11,973 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 11:58:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 08:58:11,968 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:03:11 EEST)" (scheduled at 2026-07-15 11:58:11.963649+03:00)
+main_app-1  | 2026-07-15 08:58:11,969 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 08:58:11,973 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 0
+main_app-1  | 2026-07-15 08:58:11,973 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:03:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:00:00,003 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:00:00,004 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:00:00 UTC+03:00], next run at: 2026-07-15 12:00:00 UTC+03:00)" (scheduled at 2026-07-15 12:00:00+03:00)
+main_app-1  | 2026-07-15 09:00:01,009 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:00:01,010 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:00:00 UTC+03:00], next run at: 2026-07-15 12:00:00 UTC+03:00)" executed successfully
+main_app-1  | 2026-07-15 09:03:11,966 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:08:11 EEST)" (scheduled at 2026-07-15 12:03:11.963649+03:00)
+main_app-1  | 2026-07-15 09:03:11,967 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:03:11,970 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:03:11,971 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:03:11,971 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:03:11,971 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:03:21.971172+03:00
+main_app-1  | 2026-07-15 09:03:11,976 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:03:21.971172+03:00
+main_app-1  | 2026-07-15 09:03:12,097 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:03:12,097 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:08:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:03:21,973 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:03:21,973 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:03:21 EEST], next run at: 2026-07-15 12:03:21 EEST)" (scheduled at 2026-07-15 12:03:21.971172+03:00)
+main_app-1  | 2026-07-15 09:03:22,975 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:03:22,975 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:03:21 EEST], next run at: 2026-07-15 12:03:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:08:11,964 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:13:11 EEST)" (scheduled at 2026-07-15 12:08:11.963649+03:00)
+main_app-1  | 2026-07-15 09:08:11,964 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:08:11,967 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:08:11,967 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:08:11,967 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:08:11,967 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:08:21.967528+03:00
+main_app-1  | 2026-07-15 09:08:11,970 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:08:21.967528+03:00
+main_app-1  | 2026-07-15 09:08:12,120 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:08:12,121 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:13:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:08:21,968 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:08:21,968 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:08:21 EEST], next run at: 2026-07-15 12:08:21 EEST)" (scheduled at 2026-07-15 12:08:21.967528+03:00)
+main_app-1  | 2026-07-15 09:08:22,970 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:08:22,971 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:08:21 EEST], next run at: 2026-07-15 12:08:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:13:11,975 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:18:11 EEST)" (scheduled at 2026-07-15 12:13:11.963649+03:00)
+main_app-1  | 2026-07-15 09:13:11,975 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:13:11,981 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:13:11,981 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:13:11,982 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:13:11,982 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:13:21.981682+03:00
+main_app-1  | 2026-07-15 09:13:11,985 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:13:21.981682+03:00
+main_app-1  | 2026-07-15 09:13:12,168 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:13:12,169 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:18:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:13:21,988 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:13:21,988 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:13:21 EEST], next run at: 2026-07-15 12:13:21 EEST)" (scheduled at 2026-07-15 12:13:21.981682+03:00)
+main_app-1  | 2026-07-15 09:13:22,990 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:13:22,990 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:13:21 EEST], next run at: 2026-07-15 12:13:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:18:11,973 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:23:11 EEST)" (scheduled at 2026-07-15 12:18:11.963649+03:00)
+main_app-1  | 2026-07-15 09:18:11,973 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:18:11,976 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:18:11,976 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:18:11,977 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:18:11,977 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:18:21.977014+03:00
+main_app-1  | 2026-07-15 09:18:11,980 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:18:21.977014+03:00
+main_app-1  | 2026-07-15 09:18:12,126 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:18:12,127 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:23:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:18:21,987 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:18:21,987 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:18:21 EEST], next run at: 2026-07-15 12:18:21 EEST)" (scheduled at 2026-07-15 12:18:21.977014+03:00)
+main_app-1  | 2026-07-15 09:18:22,989 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:18:22,990 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:18:21 EEST], next run at: 2026-07-15 12:18:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:23:11,973 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:28:11 EEST)" (scheduled at 2026-07-15 12:23:11.963649+03:00)
+main_app-1  | 2026-07-15 09:23:11,973 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:23:11,978 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:23:11,978 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:23:11,978 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:23:11,979 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:23:21.978431+03:00
+main_app-1  | 2026-07-15 09:23:11,981 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:23:21.978431+03:00
+main_app-1  | 2026-07-15 09:23:12,129 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:23:12,130 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:28:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:23:21,986 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:23:21,987 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:23:21 EEST], next run at: 2026-07-15 12:23:21 EEST)" (scheduled at 2026-07-15 12:23:21.978431+03:00)
+main_app-1  | 2026-07-15 09:23:22,989 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:23:22,989 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:23:21 EEST], next run at: 2026-07-15 12:23:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:28:11,968 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:33:11 EEST)" (scheduled at 2026-07-15 12:28:11.963649+03:00)
+main_app-1  | 2026-07-15 09:28:11,968 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:28:11,973 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:28:11,973 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:28:11,973 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:28:11,973 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:28:21.973217+03:00
+main_app-1  | 2026-07-15 09:28:11,977 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:28:21.973217+03:00
+main_app-1  | 2026-07-15 09:28:12,119 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:28:12,119 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:33:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:28:21,981 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:28:21,981 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:28:21 EEST], next run at: 2026-07-15 12:28:21 EEST)" (scheduled at 2026-07-15 12:28:21.973217+03:00)
+main_app-1  | 2026-07-15 09:28:22,983 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:28:22,984 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:28:21 EEST], next run at: 2026-07-15 12:28:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:33:11,966 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:38:11 EEST)" (scheduled at 2026-07-15 12:33:11.963649+03:00)
+main_app-1  | 2026-07-15 09:33:11,966 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:33:11,972 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:33:11,972 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:33:11,973 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:33:11,973 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:33:21.972843+03:00
+main_app-1  | 2026-07-15 09:33:11,975 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:33:21.972843+03:00
+main_app-1  | 2026-07-15 09:33:12,217 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:33:12,217 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:38:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:33:21,978 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:33:21,979 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:33:21 EEST], next run at: 2026-07-15 12:33:21 EEST)" (scheduled at 2026-07-15 12:33:21.972843+03:00)
+main_app-1  | 2026-07-15 09:33:22,981 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:33:22,981 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:33:21 EEST], next run at: 2026-07-15 12:33:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:36:53,603 - bot.handlers - INFO - Callback received - User: 1336308262, Data: main_preview
+main_app-1  | 2026-07-15 09:36:55,427 - bot.handlers - INFO - Callback received - User: 1336308262, Data: preview_channel_@furryukrainecult
+main_app-1  | 2026-07-15 09:36:55,429 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+main_app-1  | Traceback (most recent call last):
+main_app-1  |   File "/usr/local/lib/python3.12/site-packages/telegram/ext/_application.py", line 1311, in process_update
+main_app-1  |     await coroutine
+main_app-1  |   File "/usr/local/lib/python3.12/site-packages/telegram/ext/_handlers/basehandler.py", line 158, in handle_update
+main_app-1  |     return await self.callback(update, context)
+main_app-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+main_app-1  |   File "/app/bot/handlers.py", line 1787, in callback_query_handler
+main_app-1  |     await handle_preview_channel_selection(query, user, channel_selection)
+main_app-1  |   File "/app/bot/handlers.py", line 1302, in handle_preview_channel_selection
+main_app-1  |     Database.update_user_session(user.id, BotStates.PREVIEW_MODE, {'selected_channel': channel_selection})
+main_app-1  |                                           ^^^^^^^^^^^^^^^^^^^^^^
+main_app-1  | AttributeError: type object 'BotStates' has no attribute 'PREVIEW_MODE'
+main_app-1  | 2026-07-15 09:36:56,605 - bot.handlers - INFO - Callback received - User: 1336308262, Data: back_to_main
+main_app-1  | 2026-07-15 09:36:56,656 - bot.handlers - INFO - Main menu successfully displayed for user 1336308262
+main_app-1  | 2026-07-15 09:38:07,284 - bot.handlers - INFO - Callback received - User: 1336308262, Data: main_calendar
+main_app-1  | 2026-07-15 09:38:08,565 - bot.handlers - INFO - Callback received - User: 1336308262, Data: cal_day_2026-07-15
+main_app-1  | 2026-07-15 09:38:11,968 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:43:11 EEST)" (scheduled at 2026-07-15 12:38:11.963649+03:00)
+main_app-1  | 2026-07-15 09:38:11,968 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:38:11,970 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:38:11,971 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:38:11,971 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:38:11,971 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:38:21.971109+03:00
+main_app-1  | 2026-07-15 09:38:11,973 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:38:21.971109+03:00
+main_app-1  | 2026-07-15 09:38:12,089 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:38:12,089 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:43:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:38:15,040 - bot.handlers - INFO - Callback received - User: 1336308262, Data: cal_nav_2026_7
+main_app-1  | 2026-07-15 09:38:21,978 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:38:21,978 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:38:21 EEST], next run at: 2026-07-15 12:38:21 EEST)" (scheduled at 2026-07-15 12:38:21.971109+03:00)
+main_app-1  | 2026-07-15 09:38:22,980 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:38:22,980 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:38:21 EEST], next run at: 2026-07-15 12:38:21 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:41:42,420 - bot.handlers - INFO - Callback received - User: 1336308262, Data: back_to_main
+main_app-1  | 2026-07-15 09:41:42,472 - bot.handlers - INFO - Main menu successfully displayed for user 1336308262
+main_app-1  | 2026-07-15 09:41:51,250 - bot.handlers - INFO - Callback received - User: 1336308262, Data: main_overdue
+main_app-1  | 2026-07-15 09:41:52,359 - bot.handlers - INFO - Callback received - User: 1336308262, Data: overdue_channel_@furryukrainecult
+main_app-1  | 2026-07-15 09:41:53,479 - bot.handlers - INFO - Callback received - User: 1336308262, Data: overdue_post_channel_@furryukrainecult
+main_app-1  | 2026-07-15 09:41:53,479 - telegram.ext.Application - ERROR - No error handlers are registered, logging exception.
+main_app-1  | Traceback (most recent call last):
+main_app-1  |   File "/usr/local/lib/python3.12/site-packages/telegram/ext/_application.py", line 1311, in process_update
+main_app-1  |     await coroutine
+main_app-1  |   File "/usr/local/lib/python3.12/site-packages/telegram/ext/_handlers/basehandler.py", line 158, in handle_update
+main_app-1  |     return await self.callback(update, context)
+main_app-1  |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+main_app-1  |   File "/app/bot/handlers.py", line 1774, in callback_query_handler
+main_app-1  |     await handle_overdue_callback(query, user, data)
+main_app-1  |   File "/app/bot/handlers.py", line 9175, in handle_overdue_callback
+main_app-1  |     post_id = int(action.replace("post_", ""))
+main_app-1  |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+main_app-1  | ValueError: invalid literal for int() with base 10: 'channel_@furryukrainecult'
+main_app-1  | 2026-07-15 09:42:00,864 - bot.handlers - INFO - Callback received - User: 1336308262, Data: overdue_post_5600
+main_app-1  | 2026-07-15 09:42:00,882 - bot.handlers - WARNING - Using fallback scheduler instance for individual overdue posting
+main_app-1  | 2026-07-15 09:42:01,884 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:43:11,967 - apscheduler.executors.default - INFO - Running job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:48:11 EEST)" (scheduled at 2026-07-15 12:43:11.963649+03:00)
+main_app-1  | 2026-07-15 09:43:11,968 - bot.scheduler - INFO - Running scheduled post monitoring...
+main_app-1  | 2026-07-15 09:43:11,974 - bot.scheduler - WARNING - Found 1 overdue posts
+main_app-1  | 2026-07-15 09:43:11,975 - bot.scheduler - ERROR - Post 5600 has no scheduled job - rescheduling
+main_app-1  | 2026-07-15 09:43:11,976 - apscheduler.scheduler - INFO - Added job "PostScheduler._post_to_channel" to job store "default"
+main_app-1  | 2026-07-15 09:43:11,976 - bot.scheduler - INFO - Scheduled post 5600 for 2026-07-15 12:43:21.976117+03:00
+main_app-1  | 2026-07-15 09:43:11,979 - bot.database - INFO - Updated scheduled time for post 5600 to 2026-07-15 12:43:21.976117+03:00
+main_app-1  | 2026-07-15 09:43:12,156 - bot.scheduler - INFO - Post monitor completed. Active jobs: 117, Overdue posts: 1
+main_app-1  | 2026-07-15 09:43:12,156 - apscheduler.executors.default - INFO - Job "PostScheduler._monitor_scheduled_posts (trigger: interval[0:05:00], next run at: 2026-07-15 12:48:11 EEST)" executed successfully
+main_app-1  | 2026-07-15 09:43:21,977 - apscheduler.scheduler - INFO - Removed job post_5600
+main_app-1  | 2026-07-15 09:43:21,978 - apscheduler.executors.default - INFO - Running job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:43:21 EEST], next run at: 2026-07-15 12:43:21 EEST)" (scheduled at 2026-07-15 12:43:21.976117+03:00)
+main_app-1  | 2026-07-15 09:43:22,979 - bot.scheduler - INFO - Post 5600: Retrieved description='Тепло і запах багаття 🥰', entities=0
+main_app-1  | 2026-07-15 09:43:22,980 - apscheduler.executors.default - INFO - Job "PostScheduler._post_to_channel (trigger: date[2026-07-15 12:43:21 EEST], next run at: 2026-07-15 12:43:21 EEST)" executed successfully
