@@ -7,7 +7,7 @@ Main entry point for the application
 import asyncio
 import logging
 import os
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop
@@ -63,6 +63,24 @@ async def post_init(application):
     scheduler.start()
     # Store scheduler in application context
     application.bot_data['scheduler'] = scheduler
+
+    # Register the command menu Telegram shows when the user types "/".
+    # Only the everyday commands are listed - everything else is reachable
+    # from the /start menu.
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Main menu & dashboard"),
+            BotCommand("mode1", "Bulk upload (auto-schedule)"),
+            BotCommand("mode2", "Upload with captions"),
+            BotCommand("schedule", "Schedule queued posts"),
+            BotCommand("stats", "Your posting statistics"),
+            BotCommand("settings", "Reminders & notifications"),
+            BotCommand("cancel", "Cancel current operation"),
+            BotCommand("help", "All commands & help"),
+        ])
+        logger.info("Registered bot command menu")
+    except Exception as e:
+        logger.warning(f"Could not register command menu: {e}")
 
 async def post_shutdown(application):
     """Shut the scheduler down cleanly when the application stops"""

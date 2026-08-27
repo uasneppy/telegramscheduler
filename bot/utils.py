@@ -256,50 +256,36 @@ def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int
     # Localize each wall-clock time with its correct DST offset
     return [kyiv_tz.localize(t) for t in schedule_times]
 
-def format_schedule_summary(schedule_times: List[datetime], max_display: int = 15) -> str:
-    """Format schedule times for display, truncating for large batches"""
+def format_schedule_summary(schedule_times: List[datetime], max_days: int = 7) -> str:
+    """Format schedule times as a compact per-day grid.
+
+    One line per day with the times inline, so the user sees the SHAPE of
+    the schedule at a glance instead of a long numbered list:
+        Mon 01.09: 10:00 · 12:00 · 14:00
+    """
     if not schedule_times:
         return "No posts scheduled."
-    
+
     total = len(schedule_times)
-    
-    if total <= max_display:
-        summary = f"📅 Schedule Summary ({total} posts):\n\n"
-        current_date = None
-        for i, time in enumerate(schedule_times):
-            if current_date != time.date():
-                current_date = time.date()
-                summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
-            summary += f"  {i+1}. {time.strftime('%I:%M %p')}\n"
-        return summary
-    
-    first_time = schedule_times[0]
-    last_time = schedule_times[-1]
-    
-    num_days = (last_time.date() - first_time.date()).days + 1
-    
-    summary = f"📅 Schedule Summary ({total} posts over {num_days} days):\n\n"
-    
-    show_first = 5
-    show_last = 3
-    
-    current_date = None
-    for i, time in enumerate(schedule_times[:show_first]):
-        if current_date != time.date():
-            current_date = time.date()
-            summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
-        summary += f"  {i+1}. {time.strftime('%I:%M %p')}\n"
-    
-    summary += f"\n  ... {total - show_first - show_last} more posts ...\n"
-    
-    current_date = None
-    for i, time in enumerate(schedule_times[-show_last:], total - show_last + 1):
-        if current_date != time.date():
-            current_date = time.date()
-            summary += f"\n📅 {time.strftime('%B %d, %Y')}:\n"
-        summary += f"  {i}. {time.strftime('%I:%M %p')}\n"
-    
-    return summary
+
+    # Group times by date, preserving order
+    by_day = {}
+    for t in schedule_times:
+        by_day.setdefault(t.date(), []).append(t)
+
+    days = list(by_day.keys())
+    num_days = (schedule_times[-1].date() - schedule_times[0].date()).days + 1
+
+    lines = [f"📅 {total} posts over {num_days} day{'s' if num_days > 1 else ''}:", ""]
+    for day in days[:max_days]:
+        times = " · ".join(t.strftime('%H:%M') for t in by_day[day])
+        lines.append(f"• {day.strftime('%a %d.%m')}:  {times}")
+
+    if len(days) > max_days:
+        remaining_posts = sum(len(by_day[d]) for d in days[max_days:])
+        lines.append(f"• ... {remaining_posts} more posts through {days[-1].strftime('%a %d.%m')}")
+
+    return "\n".join(lines)
 
 def parse_date_input(text: str) -> Tuple[bool, Optional[datetime], int, str]:
     """Parse custom date input string"""

@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import pytz
 
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.request import HTTPXRequest
 
@@ -24,6 +24,16 @@ logger = logging.getLogger(__name__)
 # Late jobs are executed rather than dropped (APScheduler's default grace is
 # 1 second, which silently discards any job that fires late)
 MISFIRE_GRACE_SECONDS = 3600
+
+
+def _failure_keyboard(post_id: int) -> InlineKeyboardMarkup:
+    """Action buttons attached to failure notifications - the message that
+    reports a problem should also carry the fix."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Retry now", callback_data=f"retry_post_{post_id}")],
+        [InlineKeyboardButton("✏️ Manage posts", callback_data="main_editposts"),
+         InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")],
+    ])
 
 class PostScheduler:
     def __init__(self, bot: Optional[Bot] = None):
@@ -81,6 +91,17 @@ class PostScheduler:
             id='post_monitor'
         )
         logger.info("Scheduled post monitoring every 5 minutes")
+
+        # Daily notification digest at 9 AM Kyiv for users on 'digest' mode
+        self.scheduler.add_job(
+            self._send_daily_digests,
+            'cron',
+            hour=9,
+            minute=0,
+            timezone=get_kyiv_timezone(),
+            id='daily_digest'
+        )
+        logger.info("Scheduled daily notification digest at 9:00 AM Kyiv time")
     
     def stop(self):
         """Stop the scheduler"""
@@ -392,13 +413,15 @@ class PostScheduler:
                 
                 logger.info(f"Successfully posted {post_id} to channel")
                 
-                # Notify user
+                # Notify user (only in 'all' mode - digest/errors-only users
+                # get their summary from the daily digest instead)
                 try:
-                    recurring_text = " (recurring)" if recurring_row and recurring_row[0] else ""
-                    await self.bot.send_message(
-                        chat_id=user_id,
-                        text=f"✅ Post #{post_id} has been successfully published to the channel!{recurring_text}"
-                    )
+                    if Database.get_notify_mode(user_id) == 'all':
+                        recurring_text = " (recurring)" if recurring_row and recurring_row[0] else ""
+                        await self.bot.send_message(
+                            chat_id=user_id,
+                            text=f"✅ Post #{post_id} has been successfully published to the channel!{recurring_text}"
+                        )
                 except Exception as e:
                     logger.warning(f"Could not notify user {user_id}: {e}")
                     
@@ -632,6 +655,35 @@ class PostScheduler:
         except Exception as e:
             logger.error(f"Error during post monitoring: {e}")
     
+    async def _send_daily_digests(self):
+        """Send the daily summary to users on 'digest' notification mode."""
+        try:
+            digests = Database.get_digest_data(hours=24)
+            for user_id, counts in digests.items():
+                try:
+                    lines = ["📮 *Daily posting digest*", ""]
+                    if counts['posted']:
+                        lines.append(f"✅ Published in the last 24h: *{counts['posted']}*")
+                    if counts['failed']:
+                        lines.append(f"⚠️ Currently failed: *{counts['failed']}*")
+                    keyboard = None
+                    if counts['failed']:
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Review failed posts", callback_data="main_retry")]
+                        ])
+                    await self.bot.send_message(
+                        chat_id=user_id,
+                        text="\n".join(lines),
+                        parse_mode='Markdown',
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not send digest to user {user_id}: {e}")
+            if digests:
+                logger.info(f"Sent daily digests to {len(digests)} users")
+        except Exception as e:
+            logger.error(f"Error sending daily digests: {e}")
+
     async def _check_and_send_reminders(self):
         """Check for users with low post counts and send reminders"""
         try:
@@ -838,12 +890,13 @@ class PostScheduler:
 
             logger.info(f"Album post {post_id} sent successfully with {len(media_group)} items")
 
-            # Notify user (same as the single-post path)
+            # Notify user (same as the single-post path; respects notify mode)
             try:
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text=f"✅ Album post #{post_id} ({len(media_group)} items) has been successfully published to the channel!"
-                )
+                if Database.get_notify_mode(user_id) == 'all':
+                    await self.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ Album post #{post_id} ({len(media_group)} items) has been successfully published to the channel!"
+                    )
             except Exception as e:
                 logger.warning(f"Could not notify user {user_id}: {e}")
             
@@ -1012,7 +1065,8 @@ Use /help for more assistance.
             await self.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=_failure_keyboard(post_id)
             )
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about post {post_id} failure: {e}")
@@ -1040,7 +1094,8 @@ Use /mode1 or /mode2 to upload new content.
             await self.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=_failure_keyboard(post_id)
             )
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about file error: {e}")
@@ -1072,7 +1127,8 @@ The post has been marked for manual review.
             await self.bot.send_message(
                 chat_id=user_id,
                 text=message,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                reply_markup=_failure_keyboard(post_id)
             )
         except Exception as e:
             logger.error(f"Failed to notify user {user_id} about unexpected error: {e}")

@@ -181,15 +181,17 @@ def init_database():
             reminder_enabled BOOLEAN DEFAULT TRUE,
             reminder_threshold INTEGER DEFAULT 5,
             last_reminder_sent TEXT DEFAULT NULL,
+            notify_mode TEXT DEFAULT 'all',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
 
-    # Add reminder columns if they don't exist (migration)
+    # Add reminder/notification columns if they don't exist (migration)
     reminder_columns = [
         ('reminder_enabled', 'BOOLEAN DEFAULT TRUE'),
         ('reminder_threshold', 'INTEGER DEFAULT 5'),
-        ('last_reminder_sent', 'TEXT DEFAULT NULL')
+        ('last_reminder_sent', 'TEXT DEFAULT NULL'),
+        ("notify_mode", "TEXT DEFAULT 'all'")
     ]
 
     for column_name, column_def in reminder_columns:
@@ -1306,6 +1308,98 @@ class Database:
         conn.commit()
         conn.close()
     
+    @staticmethod
+    def get_notify_mode(user_id: int) -> str:
+        """Get the user's notification mode: 'all', 'digest', or 'errors'."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT notify_mode FROM scheduling_config WHERE user_id = ?', (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        mode = row[0] if row and row[0] else 'all'
+        return mode if mode in ('all', 'digest', 'errors') else 'all'
+
+    @staticmethod
+    def set_notify_mode(user_id: int, mode: str):
+        """Set the user's notification mode ('all' | 'digest' | 'errors')."""
+        if mode not in ('all', 'digest', 'errors'):
+            raise ValueError(f"Invalid notify mode: {mode}")
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO scheduling_config (user_id, notify_mode) VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET notify_mode = excluded.notify_mode
+        ''', (user_id, mode))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def get_digest_data(hours: int = 24) -> Dict[int, Dict]:
+        """Per-user posted/failed counts for the daily digest.
+
+        Returns {user_id: {'posted': n, 'failed': n}} covering users on
+        'digest' notification mode with any activity in the window.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        since = (datetime.now(get_kyiv_timezone()) - timedelta(hours=hours)).isoformat()
+        cursor.execute('''
+            SELECT p.user_id,
+                   SUM(CASE WHEN p.status = 'posted' AND p.posted_at >= ? THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN p.status = 'failed' THEN 1 ELSE 0 END)
+            FROM posts p
+            JOIN scheduling_config sc ON sc.user_id = p.user_id
+            WHERE sc.notify_mode = 'digest'
+            GROUP BY p.user_id
+        ''', (since,))
+
+        result = {}
+        for user_id, posted, failed in cursor.fetchall():
+            if posted or failed:
+                result[user_id] = {'posted': posted or 0, 'failed': failed or 0}
+        conn.close()
+        return result
+
+    @staticmethod
+    def get_dashboard_stats(user_id: int) -> Dict:
+        """Compact stats for the main-menu dashboard, in one query pass."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        now_iso = datetime.now(get_kyiv_timezone()).isoformat()
+        cursor.execute('''
+            SELECT
+                (SELECT COUNT(*) FROM user_channels WHERE user_id = ? AND is_active = TRUE),
+                (SELECT COUNT(*) FROM posts WHERE user_id = ? AND status = 'pending' AND scheduled_time IS NULL),
+                (SELECT COUNT(*) FROM posts WHERE user_id = ? AND status IN ('pending','sending') AND scheduled_time IS NOT NULL),
+                (SELECT COUNT(*) FROM posts WHERE user_id = ? AND status = 'failed'),
+                (SELECT COUNT(*) FROM posts WHERE user_id = ? AND status = 'pending'
+                    AND scheduled_time IS NOT NULL AND scheduled_time < ?)
+        ''', (user_id, user_id, user_id, user_id, user_id, now_iso))
+        channels, queued, scheduled, failed, overdue = cursor.fetchone()
+
+        cursor.execute('''
+            SELECT p.scheduled_time, COALESCE(c.channel_name, p.channel_id)
+            FROM posts p
+            LEFT JOIN user_channels c ON c.channel_id = p.channel_id AND c.user_id = p.user_id
+            WHERE p.user_id = ? AND p.status = 'pending' AND p.scheduled_time >= ?
+            ORDER BY p.scheduled_time ASC LIMIT 1
+        ''', (user_id, now_iso))
+        row = cursor.fetchone()
+        conn.close()
+
+        next_post = None
+        if row:
+            next_time = parse_dt(row[0])
+            if next_time:
+                next_post = {'time': next_time, 'channel_name': row[1]}
+
+        return {
+            'channels': channels, 'queued': queued, 'scheduled': scheduled,
+            'failed': failed, 'overdue': overdue, 'next_post': next_post,
+        }
+
     @staticmethod
     def update_last_reminder_sent(user_id: int):
         """Update the timestamp of the last reminder sent"""

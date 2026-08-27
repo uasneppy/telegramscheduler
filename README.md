@@ -35,6 +35,10 @@ Find your own Telegram user ID by messaging [@userinfobot](https://t.me/userinfo
 - SQLite database at `$DATA_DIR/bot_data.db` (WAL mode). Timestamps are stored as Kyiv-timezone ISO strings; a one-time migration normalizes legacy rows.
 - Uploaded media under `$DATA_DIR/uploads/`, organized per date/user, cleaned up 7 days after a post is published.
 
-## Commands
+## Using the bot
 
-`/start` shows the main menu. Key commands: `/mode1` (bulk upload), `/mode2` (upload with captions), `/multibatch` (multi-channel batches), `/recurring`, `/schedule`, `/channels`, `/stats`, `/preview`, `/editposts`, `/backup`, `/restore`, `/retry`, `/overdue`, `/settings`, `/help`.
+`/start` opens the main menu, which doubles as a live dashboard (channels, queued/scheduled counts, next post, and alert buttons for failed/overdue posts). On first run it walks you through connecting a channel — the easiest way is to **forward any post from your channel**; the bot verifies your admin rights and sends a self-deleting test post to confirm it can publish.
+
+Most features are reachable from the menu; the everyday commands (`/mode1` bulk upload, `/mode2` upload with captions, `/schedule`, `/stats`, `/settings`, `/cancel`, `/help`) appear in Telegram's command menu. Schedule windows are configured with tap-based hour pickers (typed `10 20 2` input still works).
+
+**Notification modes** (in `/settings`): every post · daily digest (9:00 Kyiv summary) · errors only. Failure notifications always carry Retry/Manage buttons.
