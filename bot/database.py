@@ -236,6 +236,20 @@ def init_database():
     except sqlite3.OperationalError:
         # Column already exists, this is fine
         pass
+
+    # Add sort_key column for queue shuffling (migration)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN sort_key INTEGER')
+        logger.info("Added sort_key column to posts table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Add per-channel caption signature (migration)
+    try:
+        cursor.execute('ALTER TABLE user_channels ADD COLUMN signature TEXT')
+        logger.info("Added signature column to user_channels table")
+    except sqlite3.OperationalError:
+        pass
     
     # Create post_backups table for backup functionality
     cursor.execute('''
@@ -445,9 +459,9 @@ class Database:
         cursor.execute(f'''
             SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
                    is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, recurring_posted_count, media_bundle_json
-            FROM posts 
+            FROM posts
             WHERE {where_clause}
-            ORDER BY scheduled_time ASC
+            ORDER BY scheduled_time ASC, COALESCE(sort_key, id) ASC
         ''', params)
         
         posts = []
@@ -1518,12 +1532,12 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT id, channel_id, channel_name, is_default, is_active
+            SELECT id, channel_id, channel_name, is_default, is_active, signature
             FROM user_channels
             WHERE user_id = ? AND is_active = TRUE
             ORDER BY channel_name ASC
         ''', (user_id,))
-        
+
         channels = []
         for row in cursor.fetchall():
             channels.append({
@@ -1531,11 +1545,69 @@ class Database:
                 'channel_id': row[1],
                 'channel_name': row[2],
                 'is_default': bool(row[3]),
-                'is_active': bool(row[4])
+                'is_active': bool(row[4]),
+                'signature': row[5]
             })
-        
+
         conn.close()
         return channels
+
+    @staticmethod
+    def get_channel_signature(user_id: int, channel_id: str) -> Optional[str]:
+        """Get the caption signature configured for a channel, if any."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT signature FROM user_channels
+            WHERE user_id = ? AND channel_id = ? AND is_active = TRUE
+        ''', (user_id, channel_id))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row and row[0] else None
+
+    @staticmethod
+    def set_channel_signature(user_id: int, channel_id: str, signature: Optional[str]) -> bool:
+        """Set (or clear, with None) the caption signature for a channel."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE user_channels SET signature = ?
+            WHERE user_id = ? AND channel_id = ?
+        ''', (signature, user_id, channel_id))
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
+        return success
+
+    @staticmethod
+    def shuffle_queued_posts(user_id: int, channel_id: Optional[str] = None) -> int:
+        """Randomize the order of the unscheduled queue.
+
+        Scheduling assigns time slots in queue order, so shuffling the queue
+        shuffles which post lands in which slot.
+        """
+        import random
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        conditions = ["user_id = ?", "status = 'pending'", "scheduled_time IS NULL"]
+        params = [user_id]
+        if channel_id:
+            conditions.append("channel_id = ?")
+            params.append(channel_id)
+        where = " AND ".join(conditions)
+
+        cursor.execute(f'SELECT id FROM posts WHERE {where}', params)
+        ids = [row[0] for row in cursor.fetchall()]
+        keys = list(range(len(ids)))
+        random.shuffle(keys)
+        for post_id, key in zip(ids, keys):
+            cursor.execute('UPDATE posts SET sort_key = ? WHERE id = ?', (key, post_id))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Shuffled {len(ids)} queued posts for user {user_id}")
+        return len(ids)
     
 
     

@@ -1,0 +1,16 @@
+services:
+  bot:
+    build: .
+    container_name: telegram-scheduler
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in .env}
+      # Comma-separated Telegram user IDs allowed to use the bot.
+      # Leave unset only for testing - the bot is otherwise open to everyone.
+      ALLOWED_USER_IDS: ${ALLOWED_USER_IDS:-}
+      # Optional: chat that receives unexpected-error reports
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+      # Per-user media storage quota in MB (0 = unlimited)
+      MAX_USER_STORAGE_MB: ${MAX_USER_STORAGE_MB:-2048}
+    volumes:
+      - ./data:/data

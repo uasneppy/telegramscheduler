@@ -287,7 +287,20 @@ class PostScheduler:
                     return
                     
                 target_channel = channel_id
-                
+
+                # Append the channel's caption signature (if configured).
+                # Skipped when it would push the caption past Telegram's
+                # 1024-char limit; appending after the text keeps any
+                # formatting entity offsets valid.
+                signature = Database.get_channel_signature(user_id, channel_id)
+                if signature:
+                    base = description or ""
+                    combined = f"{base}\n\n{signature}" if base else signature
+                    if len(combined) <= 1024:
+                        description = combined
+                    else:
+                        logger.warning(f"Post {post_id}: signature skipped (caption would exceed 1024 chars)")
+
                 # Handle album posts separately
                 if media_type == 'album' and media_bundle_json:
                     await self._post_album_to_channel(post_id, media_bundle_json, description,

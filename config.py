@@ -24,6 +24,10 @@ def _parse_allowed_user_ids(raw):
 
 ALLOWED_USER_IDS = _parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS"))
 
+# Optional: chat ID that receives unexpected-error reports (e.g. your own
+# Telegram user ID). Unset = errors only go to the log.
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID") or None
+
 # Channel configuration (optional - bot supports multi-channel)
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", None)
 
@@ -43,6 +47,13 @@ DEFAULT_INTERVAL_HOURS = 2  # Every 2 hours
 # File size limits (in bytes) - REMOVED FOR UNLIMITED UPLOADS
 # MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB - DISABLED
 MAX_FILE_SIZE = None  # No file size limit
+
+# Per-user storage quota in MB for uploaded media (0 = unlimited).
+# Protects the server disk from one careless user filling it.
+try:
+    MAX_USER_STORAGE_MB = int(os.getenv("MAX_USER_STORAGE_MB", "2048"))
+except ValueError:
+    MAX_USER_STORAGE_MB = 2048
 
 # Bot states
 class BotStates:
