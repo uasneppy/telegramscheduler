@@ -8,5 +8,9 @@ dependencies = [
     "pillow>=11.3.0",
     "python-telegram-bot==20.8",
     "pytz>=2025.2",
+]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
 ]

@@ -22,11 +22,11 @@ from bot.handlers import (
     bulkedit_handler, recurring_mode_handler as recurring_handler,
     backup_handler, restore_handler, overdue_handler, preview_handler, settings_handler,
     recover_captions_handler, recover_captions_interactive_handler, delete_all_captions_handler,
-    edit_captions_handler, editposts_handler
+    edit_captions_handler, editposts_handler, status_handler
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
-from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR, ALLOWED_USER_IDS
+from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR, ALLOWED_USER_IDS, ADMIN_CHAT_ID
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +87,21 @@ async def post_shutdown(application):
     scheduler = application.bot_data.get('scheduler')
     if scheduler:
         scheduler.stop()
+
+async def error_handler(update, context):
+    """Log unexpected errors and optionally forward them to the admin chat."""
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    if ADMIN_CHAT_ID:
+        try:
+            import traceback
+            tb = ''.join(traceback.format_exception(None, context.error, context.error.__traceback__))
+            summary = tb[-1500:]  # last lines carry the actual error
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"🚨 Bot error:\n\n{summary}"
+            )
+        except Exception as e:
+            logger.error(f"Could not forward error to admin chat: {e}")
 
 def main():
     """Main function to run the bot"""
@@ -149,7 +164,11 @@ def main():
     application.add_handler(CommandHandler("edit_captions", edit_captions_handler))
     application.add_handler(CommandHandler("editposts", editposts_handler))
     application.add_handler(CommandHandler("cancel", cancel_handler))
+    application.add_handler(CommandHandler("status", status_handler))
     application.add_handler(CommandHandler("help", help_handler))
+
+    # Forward unexpected errors to the log (and admin chat if configured)
+    application.add_error_handler(error_handler)
     
     # Add callback query handler for inline keyboards
     application.add_handler(CallbackQueryHandler(callback_query_handler))

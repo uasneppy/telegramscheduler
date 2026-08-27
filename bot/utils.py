@@ -129,8 +129,41 @@ async def cleanup_empty_directories(base_path: str = None):
     logger.info(f"Directory cleanup completed: {cleaned_dirs} empty directories removed")
     return cleaned_dirs
 
+def get_user_disk_usage(user_id: int) -> int:
+    """Total bytes of stored media belonging to a user.
+
+    Media is stored under uploads/YYYY-MM/DD/<user_id>/<type>/, so we sum
+    every file inside directories named after the user id.
+    """
+    total = 0
+    user_dir = str(user_id)
+    for root, dirs, files in os.walk(UPLOADS_DIR):
+        if user_dir in root.split(os.sep):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    return total
+
+def check_storage_quota(user_id: int, incoming_bytes: int):
+    """Raise ValueError if storing incoming_bytes would exceed the user's quota."""
+    from config import MAX_USER_STORAGE_MB
+    if not MAX_USER_STORAGE_MB or not user_id:
+        return
+    quota = MAX_USER_STORAGE_MB * 1024 * 1024
+    used = get_user_disk_usage(user_id)
+    if used + (incoming_bytes or 0) > quota:
+        used_mb = used / (1024 * 1024)
+        raise ValueError(
+            f"Storage quota reached ({used_mb:.0f} of {MAX_USER_STORAGE_MB} MB used). "
+            f"Schedule or discard some queued posts to free space - published "
+            f"media is cleaned up automatically after 7 days."
+        )
+
 async def save_media_streaming(telegram_file, filename: str, media_type: str = 'photo', user_id: int = None) -> str:
     """Stream download and save media directly to disk for heavy files (memory optimized)"""
+    check_storage_quota(user_id, getattr(telegram_file, 'file_size', None) or 0)
     if user_id:
         # Use organized storage
         organized_folder, relative_path = get_organized_media_path(user_id, media_type)
@@ -161,7 +194,7 @@ async def save_media_streaming(telegram_file, filename: str, media_type: str = '
 
 def save_media(file_data: bytes, filename: str, media_type: str = 'photo', user_id: int = None) -> str:
     """Save media data to the uploads directory with optimized heavy file handling (fallback method)"""
-    # Log file size for monitoring (but don't restrict)
+    check_storage_quota(user_id, len(file_data))
     file_size_mb = len(file_data) / (1024 * 1024)
     logger.info(f"Processing {media_type} file: {file_size_mb:.2f} MB")
     
