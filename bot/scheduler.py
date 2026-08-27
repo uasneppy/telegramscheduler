@@ -718,12 +718,19 @@ class PostScheduler:
             for i, media_item in enumerate(media_bundle):
                 file_path = media_item['file_path']
                 media_type = media_item['media_type']
-                
+
+                # Convert stored relative paths to absolute data paths
+                # Legacy posts stored "uploads/..." relative paths; new posts store absolute paths
+                if not os.path.isabs(file_path):
+                    actual_file_path = os.path.join(DATA_DIR, file_path)
+                else:
+                    actual_file_path = file_path
+
                 # Check if file exists
-                if not os.path.exists(file_path):
-                    missing_files.append(file_path)
+                if not os.path.exists(actual_file_path):
+                    missing_files.append(actual_file_path)
                     continue
-                
+
                 # Open file and keep it open until after send_media_group
                 f = open(actual_file_path, 'rb')
                 open_files.append(f)

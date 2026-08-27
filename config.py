@@ -7,6 +7,23 @@ import os
 # Bot configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", None)
 
+# Access control: comma-separated list of Telegram user IDs allowed to use the bot,
+# e.g. ALLOWED_USER_IDS="123456789,987654321".
+# SECURITY: if unset or empty, the bot is open to EVERY Telegram user who finds it
+# (a warning is logged at startup). Set this in any real deployment.
+def _parse_allowed_user_ids(raw):
+    ids = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.add(int(part))
+            except ValueError:
+                raise ValueError(f"ALLOWED_USER_IDS contains a non-numeric entry: {part!r}")
+    return ids
+
+ALLOWED_USER_IDS = _parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS"))
+
 # Channel configuration (optional - bot supports multi-channel)
 CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", None)
 

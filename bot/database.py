@@ -129,9 +129,27 @@ def init_database():
             start_hour INTEGER DEFAULT 10,
             end_hour INTEGER DEFAULT 20,
             interval_hours INTEGER DEFAULT 2,
+            reminder_enabled BOOLEAN DEFAULT TRUE,
+            reminder_threshold INTEGER DEFAULT 5,
+            last_reminder_sent TEXT DEFAULT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    # Add reminder columns if they don't exist (migration)
+    reminder_columns = [
+        ('reminder_enabled', 'BOOLEAN DEFAULT TRUE'),
+        ('reminder_threshold', 'INTEGER DEFAULT 5'),
+        ('last_reminder_sent', 'TEXT DEFAULT NULL')
+    ]
+
+    for column_name, column_def in reminder_columns:
+        try:
+            cursor.execute(f'ALTER TABLE scheduling_config ADD COLUMN {column_name} {column_def}')
+            logger.info(f"Added {column_name} column to scheduling_config table")
+        except sqlite3.OperationalError:
+            # Column already exists, this is fine
+            pass
     
     # Create user_channels table
     cursor.execute('''
@@ -830,35 +848,28 @@ class Database:
     
     
     @staticmethod
-    def retry_failed_post(post_id: int) -> bool:
-        """Reset a failed post back to pending status for retry"""
+    def retry_failed_post(post_id: int, user_id: int) -> bool:
+        """Reset a failed post back to pending status for retry.
+
+        Requires user_id because post_id can come from forgeable callback data.
+        Single conditional UPDATE avoids the check-then-write race.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
-        # Check if the post exists and is actually failed
-        cursor.execute('SELECT status FROM posts WHERE id = ?', (post_id,))
-        result = cursor.fetchone()
-        
-        if not result:
-            conn.close()
-            return False
-            
-        if result[0] != 'failed':
-            conn.close()
-            return False
-            
-        # Reset the post to pending status
+
         cursor.execute('''
-            UPDATE posts 
+            UPDATE posts
             SET status = 'pending', posted_at = NULL
-            WHERE id = ?
-        ''', (post_id,))
-        
+            WHERE id = ? AND user_id = ? AND status = 'failed'
+        ''', (post_id, user_id))
+
         conn.commit()
+        success = cursor.rowcount > 0
         conn.close()
-        
-        logger.info(f"Reset failed post {post_id} back to pending for retry")
-        return True
+
+        if success:
+            logger.info(f"Reset failed post {post_id} back to pending for retry")
+        return success
     
     @staticmethod
     def update_user_session(user_id: int, mode: str, session_data: Optional[Dict] = None):
@@ -1810,18 +1821,26 @@ class Database:
         return batches
 
     @staticmethod
-    def get_batch_posts(batch_id: int) -> List[Dict]:
-        """Get all posts in a specific batch"""
+    def get_batch_posts(batch_id: int, user_id: Optional[int] = None) -> List[Dict]:
+        """Get all posts in a specific batch.
+
+        Pass user_id whenever batch_id originates from user input/callback data.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute('''
+
+        query = '''
             SELECT id, user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
                    is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, recurring_posted_count
-            FROM posts 
+            FROM posts
             WHERE batch_id = ? AND status = 'pending'
-            ORDER BY id ASC
-        ''', (batch_id,))
+        '''
+        params = [batch_id]
+        if user_id is not None:
+            query += ' AND user_id = ?'
+            params.append(user_id)
+        query += ' ORDER BY id ASC'
+        cursor.execute(query, params)
         
         posts = []
         for row in cursor.fetchall():
@@ -1887,54 +1906,71 @@ class Database:
         return post_id
 
     @staticmethod
-    def schedule_batch(batch_id: int, scheduled_times: List[datetime]):
-        """Schedule all posts in a batch"""
+    def schedule_batch(batch_id: int, scheduled_times: List[datetime], user_id: Optional[int] = None) -> bool:
+        """Schedule all posts in a batch.
+
+        Pass user_id whenever batch_id originates from user input/callback data;
+        the batch's ownership is then verified before any writes.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
+        if user_id is not None:
+            cursor.execute('SELECT 1 FROM post_batches WHERE id = ? AND user_id = ?', (batch_id, user_id))
+            if cursor.fetchone() is None:
+                conn.close()
+                logger.warning(f"User {user_id} attempted to schedule batch {batch_id} they don't own")
+                return False
+
         # Get all posts in the batch
         cursor.execute('''
-            SELECT id FROM posts 
+            SELECT id FROM posts
             WHERE batch_id = ? AND status = 'pending'
             ORDER BY id ASC
         ''', (batch_id,))
-        
+
         post_ids = [row[0] for row in cursor.fetchall()]
-        
+
         # Schedule each post
         for i, post_id in enumerate(post_ids):
             if i < len(scheduled_times):
                 cursor.execute('''
-                    UPDATE posts 
+                    UPDATE posts
                     SET scheduled_time = ?
                     WHERE id = ?
                 ''', (scheduled_times[i].isoformat(), post_id))
-        
+
         # Mark batch as scheduled
         cursor.execute('''
-            UPDATE post_batches 
+            UPDATE post_batches
             SET status = 'scheduled'
             WHERE id = ?
         ''', (batch_id,))
-        
+
         conn.commit()
         conn.close()
-        
+
         logger.info(f"Scheduled batch {batch_id} with {len(scheduled_times)} times")
+        return True
 
     @staticmethod
-    def update_post_schedule(post_id: int, scheduled_time: datetime):
-        """Update the scheduled time for a specific post"""
+    def update_post_schedule(post_id: int, scheduled_time: datetime, user_id: Optional[int] = None):
+        """Update the scheduled time for a specific post.
+
+        Pass user_id whenever post_id originates from user input/callback data;
+        omit it only for trusted internal calls (scheduler).
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
         try:
-            cursor.execute('''
-                UPDATE posts 
-                SET scheduled_time = ?
-                WHERE id = ?
-            ''', (scheduled_time.isoformat(), post_id))
-            
+            query = 'UPDATE posts SET scheduled_time = ? WHERE id = ?'
+            params = [scheduled_time.isoformat(), post_id]
+            if user_id is not None:
+                query += ' AND user_id = ?'
+                params.append(user_id)
+            cursor.execute(query, params)
+
             conn.commit()
             rows_affected = cursor.rowcount
             conn.close()
@@ -1952,18 +1988,23 @@ class Database:
             return False
 
     @staticmethod
-    def update_post_description(post_id: int, description: str, caption_entities: Optional[str] = None):
-        """Update the description and caption entities for a specific post"""
+    def update_post_description(post_id: int, description: str, caption_entities: Optional[str] = None,
+                                user_id: Optional[int] = None):
+        """Update the description and caption entities for a specific post.
+
+        Pass user_id whenever post_id originates from user input/callback data.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
         try:
-            cursor.execute('''
-                UPDATE posts 
-                SET description = ?, caption_entities = ?
-                WHERE id = ?
-            ''', (description, caption_entities, post_id))
-            
+            query = 'UPDATE posts SET description = ?, caption_entities = ? WHERE id = ?'
+            params = [description, caption_entities, post_id]
+            if user_id is not None:
+                query += ' AND user_id = ?'
+                params.append(user_id)
+            cursor.execute(query, params)
+
             conn.commit()
             rows_affected = cursor.rowcount
             conn.close()
@@ -1981,18 +2022,22 @@ class Database:
             return False
     
     @staticmethod
-    def update_post_media(post_id: int, file_path: str, media_type: str):
-        """Update the media file for a specific post"""
+    def update_post_media(post_id: int, file_path: str, media_type: str, user_id: Optional[int] = None):
+        """Update the media file for a specific post.
+
+        Pass user_id whenever post_id originates from user input/callback data.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
         try:
-            cursor.execute('''
-                UPDATE posts 
-                SET file_path = ?, media_type = ?
-                WHERE id = ?
-            ''', (file_path, media_type, post_id))
-            
+            query = 'UPDATE posts SET file_path = ?, media_type = ? WHERE id = ?'
+            params = [file_path, media_type, post_id]
+            if user_id is not None:
+                query += ' AND user_id = ?'
+                params.append(user_id)
+            cursor.execute(query, params)
+
             conn.commit()
             rows_affected = cursor.rowcount
             conn.close()
@@ -2161,29 +2206,36 @@ class Database:
         return posts
 
     @staticmethod
-    def delete_batch(batch_id: int) -> bool:
-        """Delete a batch and all its posts"""
+    def delete_batch(batch_id: int, user_id: int) -> bool:
+        """Delete a batch and all its posts (only if owned by user_id)"""
         from .utils import delete_media_file
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
+        # SECURITY: batch_id comes from forgeable callback data - verify ownership first
+        cursor.execute('SELECT 1 FROM post_batches WHERE id = ? AND user_id = ?', (batch_id, user_id))
+        if cursor.fetchone() is None:
+            conn.close()
+            logger.warning(f"User {user_id} attempted to delete batch {batch_id} they don't own")
+            return False
+
         # Get file paths of posts in the batch
         cursor.execute('''
-            SELECT file_path FROM posts 
-            WHERE batch_id = ? AND status = 'pending'
-        ''', (batch_id,))
-        
+            SELECT file_path FROM posts
+            WHERE batch_id = ? AND user_id = ? AND status = 'pending'
+        ''', (batch_id, user_id))
+
         file_paths = [row[0] for row in cursor.fetchall()]
-        
+
         # Delete the physical files
         for file_path in file_paths:
             delete_media_file(file_path)
-        
+
         # Delete posts in the batch
-        cursor.execute('DELETE FROM posts WHERE batch_id = ?', (batch_id,))
-        
+        cursor.execute('DELETE FROM posts WHERE batch_id = ? AND user_id = ?', (batch_id, user_id))
+
         # Delete the batch itself
-        cursor.execute('DELETE FROM post_batches WHERE id = ?', (batch_id,))
+        cursor.execute('DELETE FROM post_batches WHERE id = ? AND user_id = ?', (batch_id, user_id))
         
         success = cursor.rowcount > 0
         conn.commit()

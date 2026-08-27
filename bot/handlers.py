@@ -33,6 +33,16 @@ if not hasattr(BotStates, 'WAITING_BULK_EDIT_INPUT'):
 
 # Scheduler will be accessed from application context
 
+def get_shared_scheduler(context):
+    """Return the application's running PostScheduler, or None if unavailable.
+
+    Never construct a fallback PostScheduler() here: a fresh instance is
+    never started, so jobs added to it silently never fire.
+    """
+    if context and getattr(context, 'application', None) and context.application.bot_data:
+        return context.application.bot_data.get('scheduler')
+    return None
+
 async def extract_and_save_media(update: Update, user_id: int, media_type: str) -> str:
     """Extract media from update message and save to disk"""
     message = update.message
@@ -1714,11 +1724,11 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("clearqueue_"):
         await handle_clearqueue_callback(query, user, data)
     elif data.startswith("clearscheduled_"):
-        await handle_clearscheduled_callback(query, user, data)
+        await handle_clearscheduled_callback(query, user, data, context)
     elif data.startswith("batch_mode"):
         await handle_batch_mode_callback(query, user, data)
     elif data.startswith("batch_"):
-        await handle_batch_callback(query, user, data)
+        await handle_batch_callback(query, user, data, context)
     elif data.startswith("retry_"):
         await handle_retry_callback(query, user, data)
     elif data.startswith("reschedule_"):
@@ -1771,7 +1781,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("restore_"):
         await handle_restore_callback(query, user, data)
     elif data.startswith("overdue_"):
-        await handle_overdue_callback(query, user, data)
+        await handle_overdue_callback(query, user, data, context)
     elif data.startswith("preview_nav_channel_"):
         # Handle channel-specific navigation: preview_nav_channel_{channel_id}_{post_index}
         parts = data.replace("preview_nav_channel_", "").split("_")
@@ -1851,6 +1861,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         post_id = int(data.replace("editposts_cancel_", ""))
         await handle_editposts_cancel(query, user, post_id)
     # Recurring posts management callbacks
+    elif data.startswith("recur_count_") or data.startswith("recur_date_") or data.startswith("recur_never_") or data.startswith("recur_channel_"):
+        # End-condition / channel buttons emit bare "recur_*" data; handle_recurring_callback
+        # strips a "recurring_" prefix before matching, so re-add it here
+        await handle_recurring_callback(query, user, "recurring_" + data, context)
     elif data == "recurring_manage_menu":
         await show_recurring_posts_menu(query, user)
     elif data.startswith("recur_manage_ch_"):
@@ -1942,8 +1956,8 @@ async def execute_scheduling(query, user, context=None, selected_channel_id=None
     cursor = conn.cursor()
     for post_id, scheduled_time in zip(post_ids, schedule_times):
         cursor.execute(
-            'UPDATE posts SET scheduled_time = ? WHERE id = ?',
-            (scheduled_time.isoformat(), post_id)
+            'UPDATE posts SET scheduled_time = ? WHERE id = ? AND user_id = ?',
+            (scheduled_time.isoformat(), post_id, user.id)
         )
     conn.commit()
     conn.close()
@@ -2121,8 +2135,8 @@ async def execute_next_slot_scheduling(query, user, context=None):
     cursor = conn.cursor()
     for post_id, scheduled_time in zip(post_ids, schedule_times):
         cursor.execute(
-            'UPDATE posts SET scheduled_time = ? WHERE id = ?',
-            (scheduled_time.isoformat(), post_id)
+            'UPDATE posts SET scheduled_time = ? WHERE id = ? AND user_id = ?',
+            (scheduled_time.isoformat(), post_id, user.id)
         )
     conn.commit()
     conn.close()
@@ -2319,7 +2333,7 @@ async def handle_individual_post_edit(update: Update, user, text: str, post_id: 
             return
         
         # Update the post schedule in database
-        success = Database.update_post_schedule(post_id, scheduled_dt)
+        success = Database.update_post_schedule(post_id, scheduled_dt, user_id=user.id)
         
         if not success:
             await update.message.reply_text("❌ Failed to update post schedule. Please try again.")
@@ -2386,37 +2400,28 @@ async def handle_individual_post_edit(update: Update, user, text: str, post_id: 
 async def execute_custom_date_scheduling(update: Update, user, pending_posts: list, schedule_times: list, context=None):
     """Execute scheduling with custom dates"""
     try:
-        # Get the scheduler from context or create new one
-        scheduler = None
-        if context and context.application and context.application.bot_data:
-            scheduler = context.application.bot_data.get('scheduler')
-            
+        scheduler = get_shared_scheduler(context)
         if not scheduler:
-            # Try to get scheduler from context if available
-            if context and context.application and context.application.bot_data:
-                scheduler = context.application.bot_data.get('scheduler')
-            if not scheduler:
-                from .scheduler import PostScheduler
-                scheduler = PostScheduler()
-                logger.warning("Using fallback scheduler instance - jobs may not persist")
-        
+            # Scheduled times are stored in the DB; the monitor job will pick them up
+            logger.error("Shared scheduler unavailable in execute_custom_date_scheduling - relying on overdue monitor")
+
         # Prepare post IDs and schedule times for batch scheduling
         post_ids = []
         valid_schedule_times = []
-        
+
         for i, post in enumerate(pending_posts):
             if i < len(schedule_times):
                 scheduled_time = schedule_times[i]
-                
+
                 # Update the post with the scheduled time
-                Database.update_post_schedule(post['id'], scheduled_time)
-                
+                Database.update_post_schedule(post['id'], scheduled_time, user_id=user.id)
+
                 # Add to batch scheduling lists
                 post_ids.append(post['id'])
                 valid_schedule_times.append(scheduled_time)
-        
+
         # Schedule all posts at once using the scheduler
-        if post_ids and valid_schedule_times:
+        if scheduler and post_ids and valid_schedule_times:
             await scheduler.schedule_posts(post_ids, valid_schedule_times)
         
         # Get channels for summary
@@ -2721,6 +2726,38 @@ async def handle_channel_input(update: Update, user, text: str, session_data: di
 
         if not channel_name:
             await update.message.reply_text("Please enter a valid channel name:")
+            return
+
+        # SECURITY: verify the requesting user actually administers this channel
+        # before registering it - otherwise any user could post through the bot
+        # to any channel where the bot is admin.
+        try:
+            chat_ref = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
+            member = await update.get_bot().get_chat_member(chat_id=chat_ref, user_id=user.id)
+            if member.status not in ('administrator', 'creator'):
+                logger.warning(
+                    f"User {user.id} tried to register channel {channel_id} "
+                    f"where their status is '{member.status}'"
+                )
+                await update.message.reply_text(
+                    "❌ You must be an *administrator* of that channel to register it.\n\n"
+                    "Ask a channel admin to promote you, then try again.",
+                    parse_mode='Markdown'
+                )
+                Database.update_user_session(user.id, BotStates.IDLE)
+                return
+        except Exception as e:
+            logger.warning(f"Channel verification failed for user {user.id}, channel {channel_id}: {e}")
+            await update.message.reply_text(
+                "❌ *Could not verify the channel.*\n\n"
+                "Make sure:\n"
+                "1. The channel ID is correct\n"
+                "2. This bot is added to the channel as an *admin*\n"
+                "3. You are an *admin* of the channel\n\n"
+                "Then try again with /channels.",
+                parse_mode='Markdown'
+            )
+            Database.update_user_session(user.id, BotStates.IDLE)
             return
 
         # Add the channel
@@ -3748,7 +3785,7 @@ async def handle_individual_post_description_edit(update: Update, user, text: st
         new_description = text.strip() if text.strip().lower() != 'skip' else None
         
         # Update the post description in database
-        success = Database.update_post_description(post_id, new_description)
+        success = Database.update_post_description(post_id, new_description, user_id=user.id)
         
         if not success:
             await update.message.reply_text("❌ Failed to update post description. Please try again.")
@@ -4516,7 +4553,9 @@ async def handle_recurring_callback(query, user, data, context=None):
             return
     
     # Handle individual recurring post schedule options (old format)
-    elif action.startswith("recur_"):
+    # Exclude the specific recur_* prefixes handled by their own branches below,
+    # which this generic prefix match would otherwise shadow
+    elif action.startswith("recur_") and not action.startswith(("recur_count_", "recur_date_", "recur_never_", "recur_channel_")):
         recur_action = action.replace("recur_", "")
         
         if recur_action == "daily":
@@ -5136,21 +5175,21 @@ async def setup_recurring_posts(query, user, interval_hours, recurring_count=Non
 
 async def setup_individual_recurring_post(query, user, interval_hours, recurring_count=None, recurring_end_date=None, first_post_time=None):
     """Set up recurring posts for individual mode"""
-    # Get the post data from the current recurring mode session
+    # Get the post data from the current recurring mode session.
+    # Don't gate on session mode here: by this point the flow has moved through
+    # several states (waiting_recurring_count, RECURRING_START_TIME, ...) -
+    # the file_path check below is the real validation.
     mode, session_data = Database.get_user_session(user.id)
-    if mode != 'RECURRING_MODE':
-        await query.edit_message_text("❌ No post to schedule for recurring.")
-        return
-    
+
     # Check both key names - 'file_path' and 'current_media_path' for compatibility
     file_path = session_data.get('file_path') or session_data.get('current_media_path')
     media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
     description = session_data.get('description', '')
-    
+
     if not file_path:
         await query.edit_message_text("❌ No media file found for recurring schedule.")
         return
-    
+
     # Get target channel
     channels = Database.get_user_channels(user.id)
     
@@ -5246,12 +5285,12 @@ async def setup_individual_recurring_post(query, user, interval_hours, recurring
 
 async def setup_individual_recurring_post_with_channel(query, user, interval_hours, channel_id, recurring_count=None, recurring_end_date=None, first_post_time=None):
     """Set up individual recurring post with specific channel"""
-    # Get the post data from the current recurring mode session
+    # Get the post data from the current recurring mode session.
+    # Don't gate on session mode here: by this point the flow has moved through
+    # several states (waiting_recurring_count, RECURRING_START_TIME, ...) -
+    # the file_path check below is the real validation.
     mode, session_data = Database.get_user_session(user.id)
-    if mode != 'RECURRING_MODE':
-        await query.edit_message_text("❌ No post to schedule for recurring.")
-        return
-    
+
     # Check both key names - 'file_path' and 'current_media_path' for compatibility
     file_path = session_data.get('file_path') or session_data.get('current_media_path')
     media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
@@ -6002,19 +6041,19 @@ async def handle_recurring_count_input(update: Update, user, text: str, session_
                     conn = Database.get_connection()
                     cursor = conn.cursor()
                     cursor.execute('''
-                        UPDATE posts SET 
+                        UPDATE posts SET
                             is_recurring = TRUE,
                             recurring_interval_hours = ?,
                             recurring_count = ?,
                             recurring_end_date = NULL
-                        WHERE id = ?
-                    ''', (interval_hours, count, post_id))
+                        WHERE id = ? AND user_id = ?
+                    ''', (interval_hours, count, post_id, user.id))
                     conn.commit()
                     conn.close()
                     
                     # Schedule the first occurrence
                     next_time = get_current_kyiv_time() + timedelta(minutes=1)
-                    Database.update_post_schedule(post_id, next_time)
+                    Database.update_post_schedule(post_id, next_time, user_id=user.id)
                     
                     # Post will be picked up by the monitoring system within 5 minutes
                     logger.info(f"Recurring post {post_id} saved to database with count={count}, will be picked up by monitor")
@@ -6047,8 +6086,8 @@ async def handle_recurring_count_input(update: Update, user, text: str, session_
                 parse_mode='Markdown'
             )
         else:
-            # Set up bulk recurring posts
-            success = await setup_recurring_posts_direct(user, interval_hours, count, None)
+            # Set up bulk recurring posts (synchronous helper - do not await)
+            success = setup_recurring_posts_direct(user, interval_hours, count, None)
             
             if success:
                 # Send confirmation message
@@ -6136,8 +6175,8 @@ async def handle_recurring_date_input(update: Update, user, text: str, session_d
             })
             return
         else:
-            # Set up bulk recurring posts
-            success = await setup_recurring_posts_direct(user, interval_hours, None, end_date)
+            # Set up bulk recurring posts (synchronous helper - do not await)
+            success = setup_recurring_posts_direct(user, interval_hours, None, end_date)
             
             if success:
                 # Send confirmation message  
@@ -6218,25 +6257,32 @@ Choose an option:
     
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def handle_batch_callback(query, user, data):
+async def handle_batch_callback(query, user, data, context=None):
     """Handle batch management callbacks"""
     if data == "batch_create":
         await prompt_batch_creation(query, user)
     elif data == "batch_list":
         await show_batch_list(query, user)
     elif data == "batch_schedule_all":
-        await schedule_all_batches(query, user)
+        await schedule_all_batches(query, user, context)
     elif data == "batch_clear_all":
         await confirm_clear_all_batches(query, user)
     elif data.startswith("batch_select_"):
         batch_id = int(data.replace("batch_select_", ""))
         await show_batch_details(query, user, batch_id)
+    elif data.startswith("batch_delete_confirmed_"):
+        batch_id = int(data.replace("batch_delete_confirmed_", ""))
+        success = Database.delete_batch(batch_id, user.id)
+        if success:
+            await query.edit_message_text("✅ Batch deleted successfully!")
+        else:
+            await query.edit_message_text("❌ Failed to delete batch.")
     elif data.startswith("batch_delete_"):
         batch_id = int(data.replace("batch_delete_", ""))
         await delete_batch_confirm(query, user, batch_id)
     elif data.startswith("batch_schedule_"):
         batch_id = int(data.replace("batch_schedule_", ""))
-        await schedule_single_batch(query, user, batch_id)
+        await schedule_single_batch(query, user, batch_id, context)
     elif data.startswith("batch_channel_"):
         channel_id = data.replace("batch_channel_", "")
         await create_batch_for_channel(query, user, channel_id)
@@ -6280,15 +6326,8 @@ Choose an option:
         # Clear all batches
         batches = Database.get_user_batches(user.id)
         for batch in batches:
-            Database.delete_batch(batch['id'])
+            Database.delete_batch(batch['id'], user.id)
         await query.edit_message_text("✅ All batches cleared successfully!")
-    elif data.startswith("batch_delete_confirmed_"):
-        batch_id = int(data.replace("batch_delete_confirmed_", ""))
-        success = Database.delete_batch(batch_id)
-        if success:
-            await query.edit_message_text("✅ Batch deleted successfully!")
-        else:
-            await query.edit_message_text("❌ Failed to delete batch.")
 
 async def handle_batch_mode_callback(query, user, data):
     """Handle batch mode selection callbacks"""
@@ -6478,9 +6517,9 @@ async def show_batch_details(query, user, batch_id):
     if not batch:
         await query.edit_message_text("❌ Batch not found.")
         return
-    
-    posts = Database.get_batch_posts(batch_id)
-    
+
+    posts = Database.get_batch_posts(batch_id, user_id=user.id)
+
     keyboard = []
     if posts:
         keyboard.append([InlineKeyboardButton("📅 Schedule This Batch", callback_data=f"batch_schedule_{batch_id}")])
@@ -6513,34 +6552,38 @@ async def show_batch_details(query, user, batch_id):
         parse_mode='Markdown'
     )
 
-async def schedule_single_batch(query, user, batch_id):
+async def schedule_single_batch(query, user, batch_id, context=None):
     """Schedule a single batch"""
-    posts = Database.get_batch_posts(batch_id)
-    
+    # SECURITY: batch_id comes from forgeable callback data - verify ownership first
+    batches = Database.get_user_batches(user.id)
+    batch = next((b for b in batches if b['id'] == batch_id), None)
+    if not batch:
+        await query.edit_message_text("❌ Batch not found.")
+        return
+
+    posts = Database.get_batch_posts(batch_id, user_id=user.id)
+
     if not posts:
         await query.edit_message_text("❌ No posts in this batch to schedule.")
         return
-    
+
     # Get scheduling config
     start_hour, end_hour, interval_hours = Database.get_scheduling_config(user.id)
-    
+
     # Calculate schedule times
     from bot.utils import calculate_schedule_times
     schedule_times = calculate_schedule_times(start_hour, end_hour, interval_hours, len(posts))
-    
+
     # Schedule the batch
-    Database.schedule_batch(batch_id, schedule_times)
-    
-    # Import scheduler and schedule posts
-    # Note: This function needs context parameter to access shared scheduler
-    from bot.scheduler import PostScheduler
-    scheduler = PostScheduler()
-    logger.warning("Using fallback scheduler instance in batch scheduling - jobs may not persist")
+    Database.schedule_batch(batch_id, schedule_times, user_id=user.id)
+
+    scheduler = get_shared_scheduler(context)
     post_ids = [post['id'] for post in posts]
-    await scheduler.schedule_posts(post_ids, schedule_times)
-    
-    batch = Database.get_user_batches(user.id)
-    batch = next((b for b in batch if b['id'] == batch_id), None)
+    if scheduler:
+        await scheduler.schedule_posts(post_ids, schedule_times)
+    else:
+        # Scheduled times are stored in the DB; the monitor job will pick them up
+        logger.error("Shared scheduler unavailable in schedule_single_batch - relying on overdue monitor")
     
     keyboard = [[InlineKeyboardButton("🔙 Back to Batches", callback_data="batch_list")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -7039,7 +7082,7 @@ async def handle_new_caption_input(update: Update, user, text: str, session_data
         action_text = "updated"
     
     # Update the caption in database
-    success = Database.update_post_description(post_id, new_caption)
+    success = Database.update_post_description(post_id, new_caption, user_id=user.id)
     
     if success:
         # Show success message and move to next post
@@ -7240,7 +7283,7 @@ async def handle_batch_mode2_description(update: Update, user, description: str,
         f"Send another media or use /finish when done."
     )
 
-async def schedule_all_batches(query, user):
+async def schedule_all_batches(query, user, context=None):
     """Schedule all pending batches"""
     batches = Database.get_user_batches(user.id)
     pending_batches = [b for b in batches if b['status'] == 'pending' and b['post_count'] > 0]
@@ -7252,7 +7295,7 @@ async def schedule_all_batches(query, user):
     # Schedule each batch
     total_scheduled = 0
     for batch in pending_batches:
-        posts = Database.get_batch_posts(batch['id'])
+        posts = Database.get_batch_posts(batch['id'], user_id=user.id)
         if posts:
             # Get scheduling config
             start_hour, end_hour, interval_hours = Database.get_scheduling_config(user.id)
@@ -7262,16 +7305,16 @@ async def schedule_all_batches(query, user):
             schedule_times = calculate_schedule_times(start_hour, end_hour, interval_hours, len(posts))
             
             # Schedule the batch
-            Database.schedule_batch(batch['id'], schedule_times)
-            
-            # Import scheduler and schedule posts
-            # Note: This function needs context parameter to access shared scheduler
-            from bot.scheduler import PostScheduler
-            scheduler = PostScheduler()
-            logger.warning("Using fallback scheduler instance in batch scheduling - jobs may not persist")
+            Database.schedule_batch(batch['id'], schedule_times, user_id=user.id)
+
+            scheduler = get_shared_scheduler(context)
             post_ids = [post['id'] for post in posts]
-            await scheduler.schedule_posts(post_ids, schedule_times)
-            
+            if scheduler:
+                await scheduler.schedule_posts(post_ids, schedule_times)
+            else:
+                # Scheduled times are stored in the DB; the monitor job will pick them up
+                logger.error("Shared scheduler unavailable in schedule_all_batches - relying on overdue monitor")
+
             total_scheduled += len(posts)
     
     keyboard = [[InlineKeyboardButton("🔙 Back to Batches", callback_data="batch_list")]]
@@ -7512,19 +7555,19 @@ Use /cancel to abort this mode.
             except Exception as e3:
                 logger.error(f"Failed to send fallback message: {e3}")
 
-async def handle_clearscheduled_callback(query, user, data):
+async def handle_clearscheduled_callback(query, user, data, context=None):
     """Handle clearscheduled confirmation callbacks"""
     if data == "clearscheduled_confirm_all":
         # Clear all scheduled posts
         cleared_count = Database.clear_scheduled_posts(user.id)
-        
+
         # Also cancel the scheduled jobs from the scheduler
         try:
-            # Note: This function needs context parameter to access shared scheduler
-            from bot.scheduler import PostScheduler
-            scheduler = PostScheduler()
-            logger.warning("Using fallback scheduler instance for cancellation - may not affect active jobs")
-            scheduler.cancel_user_posts(user.id)
+            scheduler = get_shared_scheduler(context)
+            if scheduler:
+                scheduler.cancel_user_posts(user.id)
+            else:
+                logger.error("Shared scheduler unavailable in clearscheduled - active jobs not cancelled")
         except Exception as e:
             logger.warning(f"Failed to cancel scheduled jobs: {e}")
             pass  # Continue even if scheduler cancel fails
@@ -7712,9 +7755,9 @@ async def handle_retry_callback(query, user, data):
         
         success_count = 0
         for post in failed_posts:
-            if Database.retry_failed_post(post['id']):
+            if Database.retry_failed_post(post['id'], user.id):
                 success_count += 1
-        
+
         await query.edit_message_text(
             f"✅ **Retry Complete**\n\n"
             f"Successfully reset **{success_count}** failed posts to pending status.\n"
@@ -7725,8 +7768,8 @@ async def handle_retry_callback(query, user, data):
         
     elif data.startswith("retry_post_"):
         post_id = int(data.replace("retry_post_", ""))
-        
-        if Database.retry_failed_post(post_id):
+
+        if Database.retry_failed_post(post_id, user.id):
             await query.edit_message_text(
                 f"✅ **Post Retry Successful**\n\n"
                 f"Post #{post_id} has been reset to pending status and will be rescheduled automatically.\n\n"
@@ -7800,9 +7843,9 @@ async def handle_retry_callback(query, user, data):
         
         success_count = 0
         for post in failed_posts:
-            if Database.retry_failed_post(post['id']):
+            if Database.retry_failed_post(post['id'], user.id):
                 success_count += 1
-        
+
         # Get channel name
         channels = Database.get_user_channels(user.id)
         channel_name = next((ch['channel_name'] for ch in channels if ch['channel_id'] == channel_id), f"Channel {channel_id}")
@@ -9073,7 +9116,7 @@ Choose an option below:
     
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def handle_overdue_callback(query, user, data):
+async def handle_overdue_callback(query, user, data, context=None):
     """Handle overdue post management callbacks"""
     action = data.replace("overdue_", "")
     
@@ -9136,12 +9179,13 @@ async def handle_overdue_callback(query, user, data):
         posted_count = 0
         failed_count = 0
         
-        # Actually post all overdue posts immediately using scheduler
-        # Note: This callback function needs access to context to get the shared scheduler
-        from .scheduler import PostScheduler
-        scheduler = PostScheduler()
-        logger.warning("Using fallback scheduler instance for overdue posting - using private method")
-        
+        # Actually post all overdue posts immediately using the shared scheduler
+        scheduler = get_shared_scheduler(context)
+        if not scheduler:
+            logger.error("Shared scheduler unavailable for overdue posting")
+            await query.edit_message_text("❌ Scheduler unavailable. Please try again.")
+            return
+
         for post in overdue_posts:
             try:
                 # Actually post the content to Telegram
@@ -9178,9 +9222,11 @@ async def handle_overdue_callback(query, user, data):
             await query.edit_message_text("✅ No overdue posts found for this channel.")
             return
 
-        from .scheduler import PostScheduler
-        scheduler = PostScheduler()
-        logger.warning("Using fallback scheduler instance for channel overdue posting")
+        scheduler = get_shared_scheduler(context)
+        if not scheduler:
+            logger.error("Shared scheduler unavailable for channel overdue posting")
+            await query.edit_message_text("❌ Scheduler unavailable. Please try again.")
+            return
         posted_count = 0
         failed_count = 0
         for post in overdue_posts:
@@ -9213,10 +9259,18 @@ async def handle_overdue_callback(query, user, data):
             return
         
         try:
+            # SECURITY: post_id comes from forgeable callback data - verify ownership first
+            post = Database.get_post_by_id(post_id)
+            if not post or post.get('user_id') != user.id:
+                await query.edit_message_text("❌ Post not found or access denied.")
+                return
+
             # Actually post the content to Telegram instead of just marking as posted
-            from .scheduler import PostScheduler
-            scheduler = PostScheduler()
-            logger.warning("Using fallback scheduler instance for individual overdue posting")
+            scheduler = get_shared_scheduler(context)
+            if not scheduler:
+                logger.error("Shared scheduler unavailable for individual overdue posting")
+                await query.edit_message_text("❌ Scheduler unavailable. Please try again.")
+                return
             await scheduler._post_to_channel(post_id)
             
             keyboard = [
@@ -10367,14 +10421,14 @@ async def handle_editposts_schedule_quick(query, user, post_id, hours, context):
         new_time = current_time + timedelta(hours=hours)
         
         # Update database
-        success = Database.update_post_schedule(post_id, new_time)
+        success = Database.update_post_schedule(post_id, new_time, user_id=user.id)
         
         if success:
             # Update scheduler if available
             if context and context.application and context.application.bot_data:
                 scheduler = context.application.bot_data.get('scheduler')
                 if scheduler:
-                    scheduler.schedule_post(post_id, new_time)
+                    await scheduler.schedule_single_post(post_id, new_time)
             
             await query.answer(f"Rescheduled to {new_time.strftime('%Y-%m-%d %H:%M')}", show_alert=True)
             
@@ -10624,7 +10678,7 @@ async def handle_editposts_input(update: Update, user, session_data: dict, conte
                 ])
         
         # Update the post
-        success = Database.update_post_description(editing_post_id, new_caption, caption_entities_json)
+        success = Database.update_post_description(editing_post_id, new_caption, caption_entities_json, user_id=user.id)
         
         if success:
             # Reset session and confirm
@@ -10654,14 +10708,14 @@ async def handle_editposts_input(update: Update, user, session_data: dict, conte
             new_time = tz.localize(new_time)
             
             # Update the post
-            success = Database.update_post_schedule(editing_post_id, new_time)
+            success = Database.update_post_schedule(editing_post_id, new_time, user_id=user.id)
             
             if success:
                 # Update scheduler
                 if context and context.application and context.application.bot_data:
                     scheduler = context.application.bot_data.get('scheduler')
                     if scheduler:
-                        scheduler.schedule_post(editing_post_id, new_time)
+                        await scheduler.schedule_single_post(editing_post_id, new_time)
                 
                 # Reset session
                 mode, old_session = Database.get_user_session(user.id)
@@ -11089,7 +11143,7 @@ async def handle_editposts_media_input(update: Update, user, file_path: str, med
     old_file_path = post.get('file_path') if post else None
     
     # Update the post with new media
-    success = Database.update_post_media(editing_post_id, file_path, media_type)
+    success = Database.update_post_media(editing_post_id, file_path, media_type, user_id=user.id)
     
     if success:
         # Delete old file
@@ -11587,11 +11641,11 @@ async def handle_recurring_confirm_delete(query, user, post_id: int, context=Non
         if context and context.application.bot_data.get('scheduler'):
             try:
                 scheduler = context.application.bot_data['scheduler']
-                scheduler.cancel_post(post_id)
-            except:
-                pass
-        
-        success = Database.delete_post(post_id)
+                await scheduler.cancel_post_job(post_id)
+            except Exception as e:
+                logger.warning(f"Could not cancel job for post {post_id}: {e}")
+
+        success = Database.delete_post(post_id, user.id)
         
         if success:
             if file_path and os.path.exists(file_path):
@@ -11652,8 +11706,8 @@ async def handle_recurring_caption_input(update: Update, user, text: str, sessio
                 for e in caption_entities
             ])
     
-    success = Database.update_post_description(post_id, new_caption, caption_entities_json)
-    
+    success = Database.update_post_description(post_id, new_caption, caption_entities_json, user_id=user.id)
+
     if success:
         Database.update_user_session(user.id, BotStates.IDLE)
         
