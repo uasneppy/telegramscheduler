@@ -58,10 +58,17 @@ async def auth_gate(update, context):
 
 async def post_init(application):
     """Initialize scheduler after the application starts"""
-    scheduler = PostScheduler()
+    # Reuse the application's bot (and its HTTP pool) instead of a second Bot
+    scheduler = PostScheduler(bot=application.bot)
     scheduler.start()
     # Store scheduler in application context
     application.bot_data['scheduler'] = scheduler
+
+async def post_shutdown(application):
+    """Shut the scheduler down cleanly when the application stops"""
+    scheduler = application.bot_data.get('scheduler')
+    if scheduler:
+        scheduler.stop()
 
 def main():
     """Main function to run the bot"""
@@ -84,8 +91,9 @@ def main():
     # Create the Application with custom HTTP request
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     
-    # Set up post-init callback
+    # Set up lifecycle callbacks
     application.post_init = post_init
+    application.post_shutdown = post_shutdown
 
     # SECURITY: user allowlist gate runs before every other handler
     if ALLOWED_USER_IDS:

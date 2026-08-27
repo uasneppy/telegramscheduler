@@ -335,10 +335,6 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"No valid media or text found in message from user {user.id}")
 
 # Keep backward compatibility
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle photo uploads and text messages (backward compatibility)"""
-    await media_handler(update, context)
-
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             user, mode: str, session_data: dict, media_type: str):
     """Handle media upload based on current mode"""
@@ -513,11 +509,6 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(error_message, parse_mode='Markdown')
 
 # Keep backward compatibility
-async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, 
-                            user, mode: str, session_data: dict):
-    """Handle photo upload based on current mode (backward compatibility)"""
-    await handle_media_upload(update, context, user, mode, session_data, 'photo')
-
 async def handle_mode1_media(update: Update, user, file_path: str, media_type: str, session_data: dict):
     """Handle media upload in Mode 1 (bulk)"""
     
@@ -575,10 +566,6 @@ async def handle_mode1_media(update: Update, user, file_path: str, media_type: s
     )
 
 # Keep backward compatibility
-async def handle_mode1_photo(update: Update, user, file_path: str, session_data: dict):
-    """Handle photo upload in Mode 1 (bulk) - backward compatibility"""
-    await handle_mode1_media(update, user, file_path, 'photo', session_data)
-
 async def handle_mode2_media(update: Update, user, file_path: str, media_type: str, session_data: dict):
     """Handle media upload in Mode 2 (individual) - instant save with caption"""
     import json
@@ -593,7 +580,8 @@ async def handle_mode2_media(update: Update, user, file_path: str, media_type: s
         # Serialize entities to JSON for storage
         caption_entities_json = json.dumps([
             {'type': e.type, 'offset': e.offset, 'length': e.length, 
-             'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+             'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language,
+                     'custom_emoji_id': e.custom_emoji_id}
             for e in caption_entities
         ])
     
@@ -657,10 +645,6 @@ async def handle_mode2_media(update: Update, user, file_path: str, media_type: s
     )
 
 # Keep backward compatibility
-async def handle_mode2_photo(update: Update, user, file_path: str, session_data: dict):
-    """Handle photo upload in Mode 2 (individual) - backward compatibility"""
-    await handle_mode2_media(update, user, file_path, 'photo', session_data)
-
 async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                            user, mode: str, session_data: dict, media_group_id: str):
     """Handle media group (album) uploads in Mode 2"""
@@ -673,26 +657,44 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if media_group_id not in context.user_data['media_groups']:
         context.user_data['media_groups'][media_group_id] = {
             'messages': [],
-            'processed': False
+            'processed': False,
+            'last_update': asyncio.get_running_loop().time()
         }
-    
-    # Add this message to the group
+
+    # Add this message to the group and refresh the debounce timer
     context.user_data['media_groups'][media_group_id]['messages'].append(update.message)
-    
+    context.user_data['media_groups'][media_group_id]['last_update'] = asyncio.get_running_loop().time()
+
     # Set a delay to process the complete group (Telegram sends group messages quickly)
     if not context.user_data['media_groups'][media_group_id]['processed']:
-        # Schedule processing after a short delay to collect all messages
-        import asyncio
-        asyncio.create_task(process_media_group_delayed(
+        # Schedule processing after a debounced delay to collect all messages
+        task = asyncio.create_task(process_media_group_delayed(
             context, user, mode, session_data, media_group_id, 1.0
         ))
+        # Surface exceptions - a bare fire-and-forget task swallows them silently
+        task.add_done_callback(
+            lambda t: t.exception() and logger.error(
+                f"Media group {media_group_id} processing failed: {t.exception()}", exc_info=t.exception()
+            )
+        )
         context.user_data['media_groups'][media_group_id]['processed'] = True
 
-async def process_media_group_delayed(context, user, mode: str, session_data: dict, 
+async def process_media_group_delayed(context, user, mode: str, session_data: dict,
                                     media_group_id: str, delay: float):
     """Process a complete media group after delay - create single unified post"""
-    await asyncio.sleep(delay)
-    
+    # Debounce: wait until no new album item has arrived for `delay` seconds
+    # (a fixed sleep splits slow-arriving albums into multiple posts)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 15.0  # hard cap so we never wait forever
+    while loop.time() < deadline:
+        group = context.user_data.get('media_groups', {}).get(media_group_id)
+        if not group:
+            return
+        quiet_for = loop.time() - group['last_update']
+        if quiet_for >= delay:
+            break
+        await asyncio.sleep(delay - quiet_for)
+
     if 'media_groups' not in context.user_data:
         return
         
@@ -771,15 +773,16 @@ async def process_media_group_delayed(context, user, mode: str, session_data: di
             file = await context.bot.get_file(media_file.file_id)
             filename = generate_unique_filename(original_filename)
             
-            # Use streaming download for efficiency
+            # Use streaming download for efficiency (pass user_id so album
+            # files land in the per-user organized directory like other media)
             try:
                 from bot.utils import save_media_streaming
-                file_path = await save_media_streaming(file, filename, media_type)
+                file_path = await save_media_streaming(file, filename, media_type, user_id=user.id)
             except Exception as e:
                 logger.error(f"Streaming failed, falling back to byte array download: {e}")
                 file_data = await file.download_as_bytearray()
-                file_path = save_media(bytes(file_data), filename, media_type)
-            
+                file_path = save_media(bytes(file_data), filename, media_type, user_id=user.id)
+
             # Add to media bundle
             media_bundle.append({
                 'file_path': file_path,
@@ -1037,60 +1040,88 @@ async def send_post_preview_to_user(update_or_query, post_id: int, user_id: int)
     # Get post details
     conn = Database.get_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute('''
-        SELECT file_path, media_type, description
-        FROM posts 
+        SELECT file_path, media_type, description, media_bundle_json
+        FROM posts
         WHERE id = ? AND user_id = ?
     ''', (post_id, user_id))
-    
+
     row = cursor.fetchone()
     conn.close()
-    
+
     if not row:
         await update_or_query.answer("❌ Post not found!", show_alert=True)
         return
-    
-    file_path, media_type, description = row
-    
+
+    file_path, media_type, description, media_bundle_json = row
+
+    # Albums: preview as a media group
+    if media_type == 'album' and media_bundle_json:
+        try:
+            from telegram import InputMediaPhoto, InputMediaVideo
+            bundle = json.loads(media_bundle_json)
+            open_files = []
+            media_group = []
+            try:
+                for i, item in enumerate(bundle[:10]):
+                    if not os.path.exists(item['file_path']):
+                        continue
+                    f = open(item['file_path'], 'rb')
+                    open_files.append(f)
+                    caption = f"🔍 Preview\n\n{description or 'No caption'}" if i == 0 else None
+                    if item['media_type'] in ('photo', 'document_image'):
+                        media_group.append(InputMediaPhoto(media=f, caption=caption))
+                    elif item['media_type'] in ('video', 'document_video'):
+                        media_group.append(InputMediaVideo(media=f, caption=caption))
+                if media_group:
+                    await update_or_query.message.reply_media_group(media=media_group)
+                    await update_or_query.answer("✅ Preview sent!")
+                else:
+                    await update_or_query.answer("❌ Album media files not found!", show_alert=True)
+            finally:
+                for f in open_files:
+                    f.close()
+        except Exception as e:
+            logger.error(f"Error sending album preview for post {post_id}: {e}")
+            await update_or_query.answer("❌ Error sending preview!", show_alert=True)
+        return
+
     if not os.path.exists(file_path):
         await update_or_query.answer("❌ Media file not found!", show_alert=True)
         return
-    
+
     try:
         # Send the actual media as preview
         with open(file_path, 'rb') as media_file:
-            if media_type == 'photo':
+            if media_type in ('photo', 'document_image'):
                 await update_or_query.message.reply_photo(
                     photo=media_file,
-                    caption=f"🔍 *Preview*\n\n{description or 'No caption'}" if description else "🔍 *Preview*\n\nNo caption",
-                    parse_mode='Markdown'
+                    caption=f"🔍 Preview\n\n{description or 'No caption'}" if description else "🔍 Preview\n\nNo caption"
                 )
-            elif media_type == 'video':
+            elif media_type in ('video', 'document_video'):
                 await update_or_query.message.reply_video(
                     video=media_file,
-                    caption=f"🔍 *Preview*\n\n{description or 'No caption'}" if description else "🔍 *Preview*\n\nNo caption",
-                    parse_mode='Markdown'
+                    caption=f"🔍 Preview\n\n{description or 'No caption'}" if description else "🔍 Preview\n\nNo caption"
                 )
             elif media_type == 'audio':
                 await update_or_query.message.reply_audio(
                     audio=media_file,
-                    caption=f"🔍 *Preview*\n\n{description or 'No caption'}" if description else "🔍 *Preview*\n\nNo caption",
-                    parse_mode='Markdown'
+                    caption=f"🔍 Preview\n\n{description or 'No caption'}" if description else "🔍 Preview\n\nNo caption"
                 )
             elif media_type == 'animation':
                 await update_or_query.message.reply_animation(
                     animation=media_file,
-                    caption=f"🔍 *Preview*\n\n{description or 'No caption'}" if description else "🔍 *Preview*\n\nNo caption",
-                    parse_mode='Markdown'
+                    caption=f"🔍 Preview\n\n{description or 'No caption'}" if description else "🔍 Preview\n\nNo caption"
                 )
-            elif media_type == 'document':
+            else:
+                # 'document' and any unknown media type: send as a document so
+                # the preview never silently sends nothing
                 await update_or_query.message.reply_document(
                     document=media_file,
-                    caption=f"🔍 *Preview*\n\n{description or 'No caption'}" if description else "🔍 *Preview*\n\nNo caption",
-                    parse_mode='Markdown'
+                    caption=f"🔍 Preview\n\n{description or 'No caption'}" if description else "🔍 Preview\n\nNo caption"
                 )
-        
+
         await update_or_query.answer("✅ Preview sent!")
         
     except Exception as e:
@@ -1542,63 +1573,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             "I'm not sure what to do with this message. Use /help for available commands."
         )
 
-async def handle_mode2_description(update: Update, user, description: str, session_data: dict):
-    """Handle description input in Mode 2"""
-    
-    file_path = session_data.get('current_media_path') or session_data.get('current_photo_path')
-    media_type = session_data.get('current_media_type', 'photo')
-    
-    if not file_path:
-        await update.message.reply_text("❌ No media found. Please upload media first.")
-        return
-    
-    # Process description
-    final_description = None if description.lower() == 'skip' else description
-    
-    # Get the selected channel from session data
-    selected_channel_id = session_data.get('selected_channel_id')
-    
-    # Add media to database with the assigned channel
-    post_id = Database.add_post(user.id, file_path, media_type=media_type, description=final_description, mode=2, channel_id=selected_channel_id)
-    
-    # Update session data
-    media_items = session_data.get('media_items', [])
-    media_items.append({
-        'post_id': post_id,
-        'file_path': file_path,
-        'media_type': media_type,
-        'description': final_description,
-        'uploaded_at': datetime.now().isoformat()
-    })
-    
-    session_data['media_items'] = media_items
-    session_data['current_media_path'] = None
-    session_data['current_media_type'] = None
-    Database.update_user_session(user.id, BotStates.MODE2_PHOTOS, session_data)
-    
-    # Format media type for display
-    media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
-    desc_text = f'"{final_description}"' if final_description else "no description"
-    
-    # Show comprehensive progress for Mode 2
-    media_summary = {}
-    for item in media_items:
-        media_type_key = item['media_type']
-        media_summary[media_type_key] = media_summary.get(media_type_key, 0) + 1
-    
-    progress_text = f"✅ {media_icon} {media_type.title()} saved with {desc_text}! ({len(media_items)} total)\n\n"
-    progress_text += "*Ready to schedule:*\n"
-    for media_type_key, count in media_summary.items():
-        icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type_key, '📁')
-        progress_text += f"• {icon} {count} {media_type_key}{'s' if count > 1 else ''}\n"
-    
-    progress_text += f"\n📤 Continue uploading or use /schedule when ready."
-    
-    await update.message.reply_text(
-        progress_text,
-        parse_mode='Markdown'
-    )
-
 async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /schedule command"""
     user = update.effective_user
@@ -1683,12 +1657,24 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     """Handle inline keyboard callbacks"""
     query = update.callback_query
     await query.answer()
-    
+
     user = query.from_user
     data = query.data
-    
+
     logger.info(f"Callback received - User: {user.id}, Data: {data}")
-    
+
+    try:
+        await _dispatch_callback(query, user, data, context)
+    except Exception as e:
+        # Without this, any exception leaves the button silently dead
+        logger.error(f"Error handling callback {data!r} from user {user.id}: {e}", exc_info=True)
+        try:
+            await query.message.reply_text("❌ Something went wrong handling that button. Please try again.")
+        except Exception:
+            pass
+
+async def _dispatch_callback(query, user, data, context):
+    """Route callback data to the matching handler"""
     if data == "schedule_current":
         await execute_scheduling(query, user, context)
     elif data == "schedule_next_slot":
@@ -1701,6 +1687,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         await prompt_recurring_schedule(query, user)
     elif data == "schedule_cancel":
         await query.edit_message_text("❌ Scheduling cancelled.")
+    elif data == "cancel":
+        # Generic cancel button used by several menus
+        Database.update_user_session(user.id, BotStates.IDLE)
+        await show_main_menu(query, user)
     # Remove this obsolete channel selection - posts already have channels assigned
     elif data.startswith("channels_"):
         await handle_channel_callback(query, user, data)
@@ -2611,7 +2601,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `/multibatch` - Advanced multi-channel batch system
 • `/bulkedit` - Redistribute scheduled posts evenly across time range
 • `/retry` - Retry failed posts (individual/bulk/by channel)
-• `/recover_captions` - Automatically recover lost captions from chat history
+• `/recover_captions` - Info about caption recovery (list posts missing captions)
 • `/recover_interactive` - Interactive caption recovery with manual input
 • `/delete_all_captions` - Remove all captions from all your posts
 • `/edit_captions` - Edit captions for scheduled posts one by one
@@ -3423,22 +3413,24 @@ async def stats_channel_details_handler(query, user, channel_id):
     message += f"• Posted: {len(posted_posts)}\n"
     message += f"• Failed: {len(failed_posts)}\n\n"
     
-    # Show upcoming scheduled posts (first 10)
+    # Show upcoming scheduled posts (first 10 - unbounded output exceeds
+    # Telegram's 4096-char message limit and the send fails)
     if scheduled_posts:
         message += "*⏰ Upcoming Posts:*\n"
-        for i, post in enumerate(scheduled_posts):
+        for i, post in enumerate(scheduled_posts[:10]):
             try:
                 from datetime import datetime
                 scheduled_dt = datetime.fromisoformat(post['scheduled_time'])
                 time_str = scheduled_dt.strftime("%m/%d %H:%M")
                 media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(post['media_type'], '📁')
-                
-                # Show full description without truncation, escaped for Markdown
-                desc = escape_markdown(post['description'] or "No description")
-                
+
+                desc = escape_markdown((post['description'] or "No description")[:60])
+
                 message += f"{i+1}. {time_str} {media_icon} - {desc}\n"
             except (ValueError, TypeError, AttributeError) as e:
                 message += f"{i+1}. {post['scheduled_time']} - {post['media_type']}\n"
+        if len(scheduled_posts) > 10:
+            message += f"_... and {len(scheduled_posts) - 10} more_\n"
     
     # Create keyboard with navigation options
     keyboard = []
@@ -4002,25 +3994,28 @@ Use Mode 1 or Mode 2 to upload and schedule content.
     
     # Sort posts by scheduled time
     scheduled_posts.sort(key=lambda x: x['scheduled_time'])
-    
-    for i, post in enumerate(scheduled_posts, 1):  # Show ALL posts
+
+    # Cap the listing - an unbounded loop exceeds Telegram's 4096-char message
+    # limit once there are more than a screenful of posts, and the send fails
+    max_shown = 20
+    for i, post in enumerate(scheduled_posts[:max_shown], 1):
         # Format date and time
         scheduled_dt = post['scheduled_time']
         date_str = scheduled_dt.strftime("%m/%d")
         time_str = scheduled_dt.strftime("%H:%M")
-        
+
         # Get media type icon
         media_icons = {
             'photo': '📸',
-            'video': '🎥', 
+            'video': '🎥',
             'audio': '🎵',
             'animation': '🎬',
             'document': '📄'
         }
         media_icon = media_icons.get(post['media_type'], '📁')
-        
-        # Show full description without truncation
-        description = escape_markdown(post['description'] or 'No description')
+
+        # Truncate long descriptions so the message stays under the size limit
+        description = escape_markdown((post['description'] or 'No description')[:80])
 
         # Add recurring indicator
         recurring_indicator = " 🔄" if post['is_recurring'] else ""
@@ -4028,7 +4023,10 @@ Use Mode 1 or Mode 2 to upload and schedule content.
         message += f"{i}. {media_icon} *{date_str} {time_str}*{recurring_indicator}\n"
         message += f"   ID: #{post['id']}\n"
         message += f"   {description}\n\n"
-    
+
+    if len(scheduled_posts) > max_shown:
+        message += f"_... and {len(scheduled_posts) - max_shown} more posts_\n\n"
+
     message += "*💡 Tip:* Use /stats for detailed analytics"
 
     await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
@@ -5173,116 +5171,6 @@ async def setup_recurring_posts(query, user, interval_hours, recurring_count=Non
     
     Database.update_user_session(user.id, BotStates.IDLE)
 
-async def setup_individual_recurring_post(query, user, interval_hours, recurring_count=None, recurring_end_date=None, first_post_time=None):
-    """Set up recurring posts for individual mode"""
-    # Get the post data from the current recurring mode session.
-    # Don't gate on session mode here: by this point the flow has moved through
-    # several states (waiting_recurring_count, RECURRING_START_TIME, ...) -
-    # the file_path check below is the real validation.
-    mode, session_data = Database.get_user_session(user.id)
-
-    # Check both key names - 'file_path' and 'current_media_path' for compatibility
-    file_path = session_data.get('file_path') or session_data.get('current_media_path')
-    media_type = session_data.get('media_type') or session_data.get('current_media_type', 'photo')
-    description = session_data.get('description', '')
-
-    if not file_path:
-        await query.edit_message_text("❌ No media file found for recurring schedule.")
-        return
-
-    # Get target channel
-    channels = Database.get_user_channels(user.id)
-    
-    if len(channels) > 1:
-        # Show channel selection for individual recurring post
-        keyboard = []
-        for channel in channels:
-            callback_data = f"recur_channel_{channel['channel_id']}_{interval_hours}"
-            if recurring_count:
-                callback_data += f"_count_{recurring_count}"
-            elif recurring_end_date:
-                callback_data += f"_date_{recurring_end_date.isoformat()}"
-            else:
-                callback_data += "_never"
-                
-            keyboard.append([InlineKeyboardButton(
-                f"📺 {channel['channel_name']}", 
-                callback_data=callback_data
-            )])
-        
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="recurring_schedule")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"📺 *Select Channel for Recurring Post*\n\n"
-            f"Choose which channel to post your recurring content:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-    elif len(channels) == 1:
-        target_channel_id = channels[0]['channel_id']
-        channel_name = channels[0]['channel_name']
-    else:
-        await query.edit_message_text("❌ No channels configured!")
-        return
-    
-    from bot.utils import get_current_kyiv_time
-    from datetime import timedelta
-    
-    # Use provided first_post_time or default to 1 minute from now
-    if first_post_time is None:
-        first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
-    
-    Database.add_post(
-        user_id=user.id,
-        file_path=file_path,
-        media_type=media_type,
-        description=description,
-        scheduled_time=first_post_time,
-        mode=3,  # Recurring mode
-        channel_id=target_channel_id,
-        is_recurring=True,
-        recurring_interval_hours=interval_hours,
-        recurring_end_date=recurring_end_date,
-        recurring_count=recurring_count
-    )
-    
-    interval_text = f"{interval_hours} hours"
-    if interval_hours == 24:
-        interval_text = "24 hours (daily)"
-    elif interval_hours == 48:
-        interval_text = "48 hours (every 2 days)"  
-    elif interval_hours == 168:
-        interval_text = "168 hours (weekly)"
-    
-    end_info = ""
-    if recurring_count:
-        end_info = f"• *Repetitions:* {recurring_count} times\n"
-    elif recurring_end_date:
-        end_info = f"• *End Date:* {recurring_end_date.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
-    else:
-        end_info = f"• *Duration:* Infinite (manual stop required)\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        f"✅ *Individual Recurring Post Activated!*\n\n"
-        f"*📺 Channel:* {channel_name}\n" 
-        f"*⏰ Interval:* Every {interval_text}\n"
-        f"*🚀 First post:* {first_post_time.strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
-        f"{end_info}\n"
-        f"*📱 Notifications:* You'll get notified for each post\n\n"
-        f"Use /stats to monitor your recurring posts.\n"
-        f"Use /reset to stop all recurring posts.",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    # Clear the session since we've scheduled the post
-    Database.update_user_session(user.id, BotStates.IDLE)
-
 async def setup_individual_recurring_post_with_channel(query, user, interval_hours, channel_id, recurring_count=None, recurring_end_date=None, first_post_time=None):
     """Set up individual recurring post with specific channel"""
     # Get the post data from the current recurring mode session.
@@ -6238,7 +6126,7 @@ async def multibatch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if batches:
         batch_summary = f"\n\n*Current Batches:* {len(batches)}"
         for batch in batches[:3]:  # Show first 3 batches
-            batch_summary += f"\n• {batch['batch_name']} → {batch['channel_name']} ({batch['post_count']} posts)"
+            batch_summary += f"\n• {escape_markdown(batch['batch_name'])} → {escape_markdown(batch['channel_name'])} ({batch['post_count']} posts)"
         if len(batches) > 3:
             batch_summary += f"\n• ... and {len(batches) - 3} more"
     
@@ -6304,7 +6192,7 @@ async def handle_batch_callback(query, user, data, context=None):
         if batches:
             batch_summary = f"\n\n*Current Batches:* {len(batches)}"
             for batch in batches[:3]:
-                batch_summary += f"\n• {batch['batch_name']} → {batch['channel_name']} ({batch['post_count']} posts)"
+                batch_summary += f"\n• {escape_markdown(batch['batch_name'])} → {escape_markdown(batch['channel_name'])} ({batch['post_count']} posts)"
             if len(batches) > 3:
                 batch_summary += f"\n• ... and {len(batches) - 3} more"
         
@@ -6420,7 +6308,7 @@ async def handle_batch_name_input(update: Update, user, text: str, session_data:
         
         await update.message.reply_text(
             f"✅ *Batch Created!*\n\n"
-            f"*Name:* {batch_name}\n"
+            f"*Name:* {escape_markdown(batch_name)}\n"
             f"*Channel:* {channel_name}\n\n"
             "Now choose how to add posts:",
             reply_markup=reply_markup,
@@ -6544,7 +6432,7 @@ async def show_batch_details(query, user, batch_id):
     
     await query.edit_message_text(
         f"*📦 Batch Details*\n\n"
-        f"*Name:* {batch['batch_name']}\n"
+        f"*Name:* {escape_markdown(batch['batch_name'])}\n"
         f"*Channel:* {batch['channel_name']}\n"
         f"*Status:* {status_text}\n"
         f"*Posts:* {len(posts)}{post_summary}",
@@ -6590,7 +6478,7 @@ async def schedule_single_batch(query, user, batch_id, context=None):
     
     await query.edit_message_text(
         f"✅ *Batch Scheduled!*\n\n"
-        f"*Batch:* {batch['batch_name'] if batch else 'Unknown'}\n"
+        f"*Batch:* {escape_markdown(batch['batch_name']) if batch else 'Unknown'}\n"
         f"*Posts:* {len(posts)}\n"
         f"*First post:* {schedule_times[0].strftime('%Y-%m-%d %H:%M')} (Kyiv)\n"
         f"*Last post:* {schedule_times[-1].strftime('%Y-%m-%d %H:%M')} (Kyiv)\n\n"
@@ -6630,7 +6518,7 @@ async def batch_finish_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     
     await update.message.reply_text(
         f"✅ *Batch Complete!*\n\n"
-        f"*Batch:* {batch['batch_name'] if batch else 'Unknown'}\n"
+        f"*Batch:* {escape_markdown(batch['batch_name']) if batch else 'Unknown'}\n"
         f"*Channel:* {batch['channel_name'] if batch else 'Unknown'}\n"
         f"*Media uploaded:* {len(media_items)}\n\n"
         "What would you like to do next?",
@@ -6878,6 +6766,8 @@ async def handle_edit_captions_callback(query, user, data):
             await prompt_caption_input(query, user, channel_id, post_index)
     elif data.startswith("edit_captions_done_"):
         channel_id = data.replace("edit_captions_done_", "")
+        # Leave the caption-editing state so later text input isn't misrouted
+        Database.update_user_session(user.id, BotStates.IDLE)
         await query.edit_message_text(
             "✅ *Caption Editing Complete*\n\n"
             "All your caption edits have been saved successfully!",
@@ -7292,30 +7182,42 @@ async def schedule_all_batches(query, user, context=None):
         await query.edit_message_text("❌ No pending batches to schedule.")
         return
     
-    # Schedule each batch
+    # Compute ONE combined slot sequence and hand out consecutive slots to
+    # each batch - scheduling every batch from the same base time would give
+    # them all identical slots and post everything simultaneously
+    from bot.utils import calculate_schedule_times
+    start_hour, end_hour, interval_hours = Database.get_scheduling_config(user.id)
+
+    batch_posts = [(batch, Database.get_batch_posts(batch['id'], user_id=user.id))
+                   for batch in pending_batches]
+    total_posts = sum(len(posts) for _batch, posts in batch_posts)
+
+    if total_posts == 0:
+        await query.edit_message_text("❌ No posts found in the pending batches.")
+        return
+
+    all_slots = calculate_schedule_times(start_hour, end_hour, interval_hours, total_posts)
+    scheduler = get_shared_scheduler(context)
+    if not scheduler:
+        # Scheduled times are stored in the DB; the monitor job will pick them up
+        logger.error("Shared scheduler unavailable in schedule_all_batches - relying on overdue monitor")
+
     total_scheduled = 0
-    for batch in pending_batches:
-        posts = Database.get_batch_posts(batch['id'], user_id=user.id)
-        if posts:
-            # Get scheduling config
-            start_hour, end_hour, interval_hours = Database.get_scheduling_config(user.id)
-            
-            # Calculate schedule times
-            from bot.utils import calculate_schedule_times
-            schedule_times = calculate_schedule_times(start_hour, end_hour, interval_hours, len(posts))
-            
-            # Schedule the batch
-            Database.schedule_batch(batch['id'], schedule_times, user_id=user.id)
+    slot_index = 0
+    for batch, posts in batch_posts:
+        if not posts:
+            continue
+        schedule_times = all_slots[slot_index:slot_index + len(posts)]
+        slot_index += len(posts)
 
-            scheduler = get_shared_scheduler(context)
-            post_ids = [post['id'] for post in posts]
-            if scheduler:
-                await scheduler.schedule_posts(post_ids, schedule_times)
-            else:
-                # Scheduled times are stored in the DB; the monitor job will pick them up
-                logger.error("Shared scheduler unavailable in schedule_all_batches - relying on overdue monitor")
+        # Schedule the batch
+        Database.schedule_batch(batch['id'], schedule_times, user_id=user.id)
 
-            total_scheduled += len(posts)
+        post_ids = [post['id'] for post in posts]
+        if scheduler:
+            await scheduler.schedule_posts(post_ids, schedule_times)
+
+        total_scheduled += len(posts)
     
     keyboard = [[InlineKeyboardButton("🔙 Back to Batches", callback_data="batch_list")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -7380,7 +7282,7 @@ async def delete_batch_confirm(query, user, batch_id):
     
     await query.edit_message_text(
         f"⚠️ *Confirm Delete Batch*\n\n"
-        f"*Batch:* {batch['batch_name']}\n"
+        f"*Batch:* {escape_markdown(batch['batch_name'])}\n"
         f"*Posts:* {batch['post_count']}\n\n"
         "This will delete all posts and media files in this batch. Continue?",
         reply_markup=reply_markup,
@@ -7558,19 +7460,19 @@ Use /cancel to abort this mode.
 async def handle_clearscheduled_callback(query, user, data, context=None):
     """Handle clearscheduled confirmation callbacks"""
     if data == "clearscheduled_confirm_all":
-        # Clear all scheduled posts
-        cleared_count = Database.clear_scheduled_posts(user.id)
-
-        # Also cancel the scheduled jobs from the scheduler
+        # Cancel the scheduler jobs FIRST (while the rows still exist to find
+        # them), without touching the unscheduled queue
         try:
             scheduler = get_shared_scheduler(context)
             if scheduler:
-                scheduler.cancel_user_posts(user.id)
+                scheduler.cancel_user_posts(user.id, clear_queue=False)
             else:
                 logger.error("Shared scheduler unavailable in clearscheduled - active jobs not cancelled")
         except Exception as e:
             logger.warning(f"Failed to cancel scheduled jobs: {e}")
-            pass  # Continue even if scheduler cancel fails
+
+        # Then clear the scheduled posts from the database
+        cleared_count = Database.clear_scheduled_posts(user.id)
         
         await query.edit_message_text(
             f"✅ *Scheduled Posts Cleared*\n\n"
@@ -7641,6 +7543,15 @@ async def handle_clearscheduled_callback(query, user, data, context=None):
             await query.edit_message_text("❌ Channel not found.")
             return
         
+        # Cancel this channel's scheduler jobs before deleting the rows
+        try:
+            scheduler = get_shared_scheduler(context)
+            if scheduler:
+                for post in Database.get_pending_posts(user.id, channel_id=channel_id):
+                    await scheduler.cancel_post_job(post['id'])
+        except Exception as e:
+            logger.warning(f"Failed to cancel channel jobs: {e}")
+
         # Clear scheduled posts for this channel
         cleared_count = Database.clear_scheduled_posts(user.id, channel_id)
         
@@ -8077,10 +7988,10 @@ async def bulkedit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Group by mode (based on description patterns and recurring status)
         if post.get('is_recurring'):
             posts_by_mode["recurring"].append(post)
-        elif post.get('description') and len(post['description']) > 50:
-            posts_by_mode["mode2"].append(post)  # Mode 2 typically has custom descriptions
         elif post.get('batch_id'):
             posts_by_mode["multibatch"].append(post)
+        elif post.get('description') and len(post['description']) > 50:
+            posts_by_mode["mode2"].append(post)
         else:
             posts_by_mode["mode1"].append(post)  # Mode 1 typically has auto descriptions or short ones
     
@@ -8212,10 +8123,10 @@ async def handle_bulk_edit_callback(query, user, data):
             # Group by mode
             if post.get('is_recurring'):
                 posts_by_mode["recurring"].append(post)
-            elif post.get('description') and len(post['description']) > 50:
-                posts_by_mode["mode2"].append(post)
             elif post.get('batch_id'):
                 posts_by_mode["multibatch"].append(post)
+            elif post.get('description') and len(post['description']) > 50:
+                posts_by_mode["mode2"].append(post)
             else:
                 posts_by_mode["mode1"].append(post)
         
@@ -8270,10 +8181,10 @@ async def show_mode_selection_menu(query, user):
     for post in posts:
         if post.get('is_recurring'):
             posts_by_mode["recurring"].append(post)
-        elif post.get('description') and len(post['description']) > 50:
-            posts_by_mode["mode2"].append(post)
         elif post.get('batch_id'):
             posts_by_mode["multibatch"].append(post)
+        elif post.get('description') and len(post['description']) > 50:
+            posts_by_mode["mode2"].append(post)
         else:
             posts_by_mode["mode1"].append(post)
     
@@ -8860,7 +8771,7 @@ async def handle_backup_callback(query, user, data):
         
         await query.edit_message_text(
             f"🗑️ *Delete Backup*\n\n"
-            f"Are you sure you want to delete backup '{backup_name}'?\n\n"
+            f"Are you sure you want to delete backup '{escape_markdown(backup_name)}'?\n\n"
             f"⚠️ *This action cannot be undone!*",
             reply_markup=reply_markup,
             parse_mode='Markdown'
@@ -8873,13 +8784,13 @@ async def handle_backup_callback(query, user, data):
         if success:
             await query.edit_message_text(
                 f"✅ *Backup Deleted*\n\n"
-                f"Backup '{backup_name}' has been successfully deleted.",
+                f"Backup '{escape_markdown(backup_name)}' has been successfully deleted.",
                 parse_mode='Markdown'
             )
         else:
             await query.edit_message_text(
                 f"❌ *Error*\n\n"
-                f"Failed to delete backup '{backup_name}'.",
+                f"Failed to delete backup '{escape_markdown(backup_name)}'.",
                 parse_mode='Markdown'
             )
     
@@ -8930,7 +8841,7 @@ async def handle_restore_callback(query, user, data):
         current_info = f"{len(current_posts)} posts" if current_posts else "No posts"
         
         await query.edit_message_text(
-            f"🔄 *Restore Backup: {backup_name}*\n\n"
+            f"🔄 *Restore Backup: {escape_markdown(backup_name)}*\n\n"
             f"*Current Schedule:* {current_info}\n\n"
             f"How would you like to restore?\n\n"
             f"• *Replace:* Delete current posts and restore backup\n"
@@ -9351,36 +9262,10 @@ async def handle_overdue_callback(query, user, data, context=None):
                 f"Could not reschedule the post. Please try again."
             )
     
-    elif action == "main":
-        # Return to main overdue view - need to create a new message since we can't call command handler
-        keyboard = [
-            [InlineKeyboardButton("🔄 Check Overdue", callback_data="overdue_refresh")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "⏰ *Overdue Posts Management*\n\n"
-            "Use 'Check Overdue' to see any posts that have missed their scheduled time.",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    
-    elif action == "refresh":
-        # Refresh the overdue view - simulate calling the handler
-        keyboard = [
-            [InlineKeyboardButton("🔄 Check Again", callback_data="overdue_refresh")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            "⏰ *Overdue Posts Management*\n\n"
-            "Use 'Check Again' to refresh the overdue posts list.",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-    
+    elif action in ("main", "refresh"):
+        # Show the actual current overdue posts (same view as the main menu button)
+        await handle_main_overdue_callback(query, user)
+
     elif action.startswith("channel_"):
         # Show individual overdue posts for a specific channel
         channel_id = action.replace("channel_", "")
@@ -9546,7 +9431,7 @@ async def handle_reschedule_callback(query, user):
     
     if not channels:
         await query.edit_message_text(
-            "❌ *No channels configured!*\\n\\n"
+            "❌ *No channels configured!*\n\n"
             "Please add a channel first using /channels command before rescheduling.",
             parse_mode="Markdown"
         )
@@ -9562,8 +9447,8 @@ async def handle_reschedule_callback(query, user):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "📅 *No Pending Posts*\\n\\n"
-            "You dont have any pending posts to reschedule.\\n\\n"
+            "📅 *No Pending Posts*\n\n"
+            "You dont have any pending posts to reschedule.\n\n"
             "Upload some posts first, then come back to reschedule them!",
             reply_markup=reply_markup,
             parse_mode="Markdown"
@@ -9712,8 +9597,8 @@ async def handle_reschedule_settings_input(update, user, text, context):
         
         if len(parts) != 3:
             await update.message.reply_text(
-                "❌ *Invalid format!*\\n\\n"
-                "Please use format: `start_hour end_hour interval_hours`\\n\\n"
+                "❌ *Invalid format!*\n\n"
+                "Please use format: `start_hour end_hour interval_hours`\n\n"
                 "*Example:* `9 18 3`",
                 parse_mode="Markdown"
             )
@@ -9798,8 +9683,8 @@ No pending posts were found to reschedule.
         
     except ValueError:
         await update.message.reply_text(
-            "❌ *Invalid numbers!*\\n\\n"
-            "Please enter valid numbers for hours.\\n\\n"
+            "❌ *Invalid numbers!*\n\n"
+            "Please enter valid numbers for hours.\n\n"
             "*Example:* `9 18 3`",
             parse_mode="Markdown"
         )
@@ -9813,7 +9698,7 @@ No pending posts were found to reschedule.
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"❌ *Error during rescheduling:*\\n\\n{str(e)}",
+            f"❌ *Error during rescheduling:*\n\n{str(e)}",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -9847,7 +9732,7 @@ async def settings_handler(update, context):
     last_reminder_text = "Never"
     if last_sent:
         from datetime import datetime
-        time_since = datetime.now() - last_sent
+        time_since = get_current_kyiv_time() - last_sent
         hours_ago = int(time_since.total_seconds() / 3600)
         if hours_ago < 1:
             last_reminder_text = "Less than 1 hour ago"
@@ -9908,7 +9793,7 @@ async def handle_settings_callback(query, user, data):
         last_reminder_text = "Never"
         if last_sent:
             from datetime import datetime
-            time_since = datetime.now() - last_sent
+            time_since = get_current_kyiv_time() - last_sent
             hours_ago = int(time_since.total_seconds() / 3600)
             if hours_ago < 1:
                 last_reminder_text = "Less than 1 hour ago"
@@ -9964,7 +9849,7 @@ Use the buttons below to adjust your settings:
         last_reminder_text = "Never"
         if last_sent:
             from datetime import datetime
-            time_since = datetime.now() - last_sent
+            time_since = get_current_kyiv_time() - last_sent
             hours_ago = int(time_since.total_seconds() / 3600)
             if hours_ago < 1:
                 last_reminder_text = "Less than 1 hour ago"
@@ -10020,7 +9905,7 @@ Use the buttons below to adjust your settings:
         last_reminder_text = "Never"
         if last_sent:
             from datetime import datetime
-            time_since = datetime.now() - last_sent
+            time_since = get_current_kyiv_time() - last_sent
             hours_ago = int(time_since.total_seconds() / 3600)
             if hours_ago < 1:
                 last_reminder_text = "Less than 1 hour ago"
@@ -10673,7 +10558,8 @@ async def handle_editposts_input(update: Update, user, session_data: dict, conte
             if caption_entities:
                 caption_entities_json = json.dumps([
                     {'type': e.type, 'offset': e.offset, 'length': e.length, 
-                     'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+                     'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language,
+                     'custom_emoji_id': e.custom_emoji_id}
                     for e in caption_entities
                 ])
         
@@ -11313,7 +11199,7 @@ async def show_recurring_post_detail(query, user, post: dict, index: int, total:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"🔄 *Recurring Post \\#{post_id}* ({index+1}/{total})\n\n"
+            f"🔄 *Recurring Post #{post_id}* ({index+1}/{total})\n\n"
             f"*📺 Channel:* {escape_markdown(channel_name)}\n"
             f"*{media_icon} Type:* {media_type.capitalize()}\n"
             f"*⏱️ Interval:* {interval_text}\n"
@@ -11702,7 +11588,8 @@ async def handle_recurring_caption_input(update: Update, user, text: str, sessio
         if caption_entities:
             caption_entities_json = json.dumps([
                 {'type': e.type, 'offset': e.offset, 'length': e.length, 
-                 'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language}
+                 'url': e.url, 'user': e.user.id if e.user else None, 'language': e.language,
+                     'custom_emoji_id': e.custom_emoji_id}
                 for e in caption_entities
             ])
     

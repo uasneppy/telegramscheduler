@@ -14,6 +14,55 @@ from .utils import get_kyiv_timezone
 
 logger = logging.getLogger(__name__)
 
+
+# --- Canonical datetime handling -------------------------------------------
+# All timestamps are stored as Kyiv-timezone-aware ISO strings
+# ("2025-07-12T10:00:00+03:00"). Legacy rows in other formats (naive
+# space-separated strings from the old sqlite adapter / CURRENT_TIMESTAMP)
+# are rewritten once by the migration in init_database.
+
+def serialize_dt(dt) -> Optional[str]:
+    """Serialize a datetime (or parseable string) to canonical Kyiv ISO."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        dt = parse_dt(dt)
+        if dt is None:
+            return None
+    if dt.tzinfo is None:
+        dt = get_kyiv_timezone().localize(dt)
+    return dt.astimezone(get_kyiv_timezone()).isoformat()
+
+
+def parse_dt(value, naive_tz: str = 'kyiv') -> Optional[datetime]:
+    """Parse a stored timestamp into a Kyiv-aware datetime.
+
+    naive_tz picks the assumed zone for legacy naive values:
+    'kyiv' for user-facing schedule fields, 'utc' for values written by
+    SQLite's CURRENT_TIMESTAMP (posted_at / created_at).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip())
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None:
+        if naive_tz == 'utc':
+            import pytz
+            dt = pytz.utc.localize(dt)
+        else:
+            dt = get_kyiv_timezone().localize(dt)
+    return dt.astimezone(get_kyiv_timezone())
+
+
+def kyiv_now_iso() -> str:
+    """Current time as canonical Kyiv ISO string."""
+    return datetime.now(get_kyiv_timezone()).isoformat()
+
 def init_database():
     """Initialize the SQLite database with required tables"""
     conn = sqlite3.connect(DATABASE_PATH)
@@ -197,16 +246,76 @@ def init_database():
             UNIQUE(user_id, backup_name)
         )
     ''')
-    
+
+    # Indexes for the hot query patterns (scheduler polling, per-user views)
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_status_sched ON posts(status, scheduled_time)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_user_status ON posts(user_id, status)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_batch ON posts(batch_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id)')
+
+    # Tiny key/value table to track one-time data migrations
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+
+    _migrate_datetime_formats(cursor)
+
     conn.commit()
     conn.close()
     logger.info("Database initialized successfully")
 
+
+def _migrate_datetime_formats(cursor):
+    """One-time rewrite of legacy timestamp formats to canonical Kyiv ISO.
+
+    Historical rows hold a mix of: naive space-separated strings from the old
+    sqlite datetime adapter (Kyiv wall time), naive UTC from CURRENT_TIMESTAMP
+    (posted_at/created_at), and aware ISO strings. Mixed formats break the
+    lexicographic comparisons used in scheduled_time queries.
+    """
+    cursor.execute("SELECT value FROM schema_meta WHERE key = 'dt_normalized_v1'")
+    if cursor.fetchone():
+        return
+
+    # (table, column, assumed zone for naive legacy values)
+    targets = [
+        ('posts', 'scheduled_time', 'kyiv'),
+        ('posts', 'recurring_end_date', 'kyiv'),
+        ('posts', 'cleanup_date', 'kyiv'),
+        ('posts', 'last_retry_at', 'kyiv'),
+        ('posts', 'posted_at', 'utc'),
+        ('posts', 'created_at', 'utc'),
+        ('scheduling_config', 'last_reminder_sent', 'kyiv'),
+    ]
+    rewritten = 0
+    for table, column, naive_tz in targets:
+        key = 'user_id' if table == 'scheduling_config' else 'id'
+        cursor.execute(f"SELECT {key}, {column} FROM {table} WHERE {column} IS NOT NULL")
+        for row_id, raw in cursor.fetchall():
+            parsed = parse_dt(raw, naive_tz=naive_tz)
+            if parsed is None:
+                logger.warning(f"dt migration: could not parse {table}.{column}={raw!r} (row {row_id})")
+                continue
+            canonical = parsed.isoformat()
+            if canonical != raw:
+                cursor.execute(f"UPDATE {table} SET {column} = ? WHERE {key} = ?", (canonical, row_id))
+                rewritten += 1
+
+    cursor.execute("INSERT INTO schema_meta (key, value) VALUES ('dt_normalized_v1', 'done')")
+    logger.info(f"Normalized {rewritten} legacy timestamp values to Kyiv ISO format")
+
 class Database:
     @staticmethod
     def get_connection():
-        """Get database connection"""
-        return sqlite3.connect(DATABASE_PATH)
+        """Get database connection (WAL, busy timeout, enforced foreign keys)"""
+        conn = sqlite3.connect(DATABASE_PATH, timeout=15.0)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=15000')
+        conn.execute('PRAGMA foreign_keys=ON')
+        return conn
     
     @staticmethod
     def add_post(user_id: int, file_path: str, media_type: str = 'photo', description: Optional[str] = None, 
@@ -230,8 +339,8 @@ class Database:
                              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, 
                              media_bundle_json, caption_entities)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, file_path, media_type, description, scheduled_time, mode, channel_id,
-              is_recurring, recurring_interval_hours, recurring_end_date, recurring_count, 
+        ''', (user_id, file_path, media_type, description, serialize_dt(scheduled_time), mode, channel_id,
+              is_recurring, recurring_interval_hours, serialize_dt(recurring_end_date), recurring_count,
               media_bundle_json, caption_entities))
         
         post_id = cursor.lastrowid
@@ -362,16 +471,114 @@ class Database:
         return posts
     
     @staticmethod
+    def claim_post_for_sending(post_id: int) -> bool:
+        """Atomically move a post from 'pending' to 'sending'.
+
+        Returns False if the post was already claimed/processed - this is what
+        prevents the monitor job and a slow in-flight upload from publishing
+        the same post twice.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE posts
+            SET status = 'sending', last_retry_at = ?
+            WHERE id = ? AND status = 'pending'
+        ''', (kyiv_now_iso(), post_id))
+
+        conn.commit()
+        claimed = cursor.rowcount > 0
+        conn.close()
+        return claimed
+
+    @staticmethod
+    def reset_stale_sending_posts(max_age_minutes: int = 30) -> int:
+        """Return posts stuck in 'sending' (e.g. after a crash mid-upload) to 'pending'."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cutoff = (datetime.now(get_kyiv_timezone()) - timedelta(minutes=max_age_minutes)).isoformat()
+        # last_retry_at doubles as the claim timestamp; fall back to scheduled_time
+        cursor.execute('''
+            UPDATE posts
+            SET status = 'pending'
+            WHERE status = 'sending'
+              AND COALESCE(last_retry_at, scheduled_time) < ?
+        ''', (cutoff,))
+
+        conn.commit()
+        count = cursor.rowcount
+        conn.close()
+
+        if count:
+            logger.warning(f"Reset {count} stale 'sending' posts back to pending")
+        return count
+
+    @staticmethod
+    def reschedule_recurring_post(post_id: int, next_time: datetime):
+        """Set the next occurrence for a recurring post and return it to 'pending'."""
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE posts
+            SET scheduled_time = ?, status = 'pending'
+            WHERE id = ?
+        ''', (serialize_dt(next_time), post_id))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Rescheduled recurring post {post_id} for {next_time}")
+
+    @staticmethod
+    def purge_deleted_posts() -> int:
+        """Hard-delete soft-deleted posts and their media files."""
+        from .utils import delete_media_file
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, file_path, media_bundle_json FROM posts WHERE status = 'deleted'")
+        rows = cursor.fetchall()
+        if not rows:
+            conn.close()
+            return 0
+
+        file_paths = []
+        for _post_id, file_path, bundle_json in rows:
+            if file_path:
+                file_paths.append(file_path)
+            if bundle_json:
+                try:
+                    for item in json.loads(bundle_json):
+                        if item.get('file_path'):
+                            file_paths.append(item['file_path'])
+                except (ValueError, TypeError):
+                    pass
+
+        cursor.execute("DELETE FROM posts WHERE status = 'deleted'")
+        conn.commit()
+        conn.close()
+
+        # Delete files only after the rows are gone so a failure never leaves
+        # rows pointing at missing files
+        for path in file_paths:
+            delete_media_file(path)
+
+        logger.info(f"Purged {len(rows)} soft-deleted posts and {len(file_paths)} media files")
+        return len(rows)
+
+    @staticmethod
     def mark_post_as_posted(post_id: int):
         """Mark a post as successfully posted"""
         conn = Database.get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
-            UPDATE posts 
-            SET status = 'posted', posted_at = CURRENT_TIMESTAMP
+            UPDATE posts
+            SET status = 'posted', posted_at = ?
             WHERE id = ?
-        ''', (post_id,))
+        ''', (kyiv_now_iso(), post_id))
         
         conn.commit()
         conn.close()
@@ -402,10 +609,10 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute('''
-            UPDATE posts 
+            UPDATE posts
             SET cleanup_date = ?
             WHERE id = ?
-        ''', (cleanup_date, post_id))
+        ''', (serialize_dt(cleanup_date), post_id))
         
         conn.commit()
         conn.close()
@@ -460,12 +667,12 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute('''
-            UPDATE posts 
-            SET retry_count = retry_count + 1, 
+            UPDATE posts
+            SET retry_count = retry_count + 1,
                 last_retry_at = ?,
                 status = 'pending'
             WHERE id = ?
-        ''', (datetime.now().isoformat(), post_id))
+        ''', (kyiv_now_iso(), post_id))
         
         # Get the new retry count
         cursor.execute('SELECT retry_count FROM posts WHERE id = ?', (post_id,))
@@ -477,38 +684,6 @@ class Database:
         
         logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
         return retry_count
-    
-    @staticmethod
-    def get_posts_for_retry(max_retries: int = 3) -> List[Dict]:
-        """Get failed posts that are eligible for retry"""
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT id, user_id, file_path, media_type, description, scheduled_time, 
-                   mode, channel_id, retry_count, failure_reason
-            FROM posts 
-            WHERE status = 'failed' AND retry_count < ?
-            ORDER BY last_retry_at ASC
-        ''', (max_retries,))
-        
-        posts = []
-        for row in cursor.fetchall():
-            posts.append({
-                'id': row[0],
-                'user_id': row[1],
-                'file_path': row[2],
-                'media_type': row[3] or 'photo',
-                'description': row[4],
-                'scheduled_time': datetime.fromisoformat(row[5]) if row[5] else None,
-                'mode': row[6],
-                'channel_id': row[7],
-                'retry_count': row[8] or 0,
-                'failure_reason': row[9]
-            })
-        
-        conn.close()
-        return posts
     
     @staticmethod
     def reschedule_all_posts_from_today(user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: Optional[str] = None) -> int:
@@ -572,10 +747,13 @@ class Database:
             # Calculate how many time slots we need (based on max posts per channel)
             max_posts_per_channel = max(len(posts) for posts in posts_by_channel.values())
             
-            # Calculate schedule times for the number of time slots we need
+            # Calculate schedule times for the number of time slots we need.
+            # Work in naive Kyiv wall-clock time (timedelta on pytz-aware
+            # datetimes keeps a stale offset across DST transitions); localize
+            # at write time below.
             kyiv_tz = get_kyiv_timezone()
-            current_time = datetime.now(kyiv_tz)
-            
+            current_time = datetime.now(kyiv_tz).replace(tzinfo=None)
+
             # First, try to use remaining slots today
             next_slot = current_time.replace(minute=0, second=0, microsecond=0)
             
@@ -619,8 +797,9 @@ class Database:
                     if current_slot <= time_slot_times[-1]:
                         current_slot += timedelta(days=1)
             
-            # Already timezone-aware, no need to localize
-            
+            # Localize each wall-clock slot with its correct DST offset
+            time_slot_times = [kyiv_tz.localize(t) for t in time_slot_times]
+
             # Schedule all channels simultaneously at each time slot
             total_posts_scheduled = 0
             for time_slot_index in range(max_posts_per_channel):
@@ -631,10 +810,10 @@ class Database:
                     if time_slot_index < len(posts):
                         post_id = posts[time_slot_index]
                         cursor.execute('''
-                            UPDATE posts 
+                            UPDATE posts
                             SET scheduled_time = ?, retry_count = 0, failure_reason = NULL
-                            WHERE id = ?
-                        ''', (scheduled_time.isoformat(), post_id))
+                            WHERE id = ? AND user_id = ?
+                        ''', (serialize_dt(scheduled_time), post_id, user_id))
                         total_posts_scheduled += 1
             
             logger.info(f"Scheduled {total_posts_scheduled} posts across {len(posts_by_channel)} channels for simultaneous posting - all channels post at same time slots")
@@ -910,65 +1089,64 @@ class Database:
         return 'idle', {}
     
     @staticmethod
-    def clear_user_posts(user_id: int, mode: Optional[int] = None, channel_id: Optional[str] = None,
-                         scheduled_only: bool = False):
-        """Clear pending posts for a user, optionally filtered by mode and channel
-        
-        Args:
-            user_id: User ID
-            mode: Optional mode filter
-            channel_id: Optional channel filter  
-            scheduled_only: If True, only clear posts with scheduled_time IS NULL (unscheduled posts only)
+    def _clear_pending_posts(user_id: int, scheduled: bool, mode: Optional[int] = None,
+                             channel_id: Optional[str] = None) -> int:
+        """Delete a user's pending posts (scheduled or unscheduled) and their media.
+
+        Rows are deleted and committed BEFORE files are removed, so a failure
+        can never leave rows pointing at missing files. Album bundle files are
+        removed as well.
         """
         from .utils import delete_media_file
+
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
-        # Build query conditions - only clear unscheduled posts to preserve scheduled ones
-        conditions = ["user_id = ?", "status = 'pending'", "scheduled_time IS NULL"]
+
+        conditions = ["user_id = ?", "status = 'pending'",
+                      "scheduled_time IS NOT NULL" if scheduled else "scheduled_time IS NULL"]
         params = [user_id]
-        
+
         if mode:
             conditions.append("mode = ?")
             params.append(mode)
-        
         if channel_id:
             conditions.append("channel_id = ?")
             params.append(channel_id)
-        
+
         where_clause = " AND ".join(conditions)
-        
-        # First get the file paths for cleanup
-        cursor.execute(f'''
-            SELECT id, file_path FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
-        posts_to_clear = cursor.fetchall()
-        count = len(posts_to_clear)
-        
-        # Delete the physical files
-        for post_id, file_path in posts_to_clear:
-            delete_media_file(file_path)
-        
-        # Then delete the database records
-        cursor.execute(f'''
-            DELETE FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
+
+        cursor.execute(f'SELECT id, file_path, media_bundle_json FROM posts WHERE {where_clause}', params)
+        rows = cursor.fetchall()
+        count = len(rows)
+
+        cursor.execute(f'DELETE FROM posts WHERE {where_clause}', params)
         conn.commit()
         conn.close()
-        
-        # Enhanced logging for better debugging
-        filter_info = []
-        if mode:
-            filter_info.append(f"mode {mode}")
+
+        # Now that the rows are gone, remove the files (including album bundles)
+        for _post_id, file_path, bundle_json in rows:
+            if file_path:
+                delete_media_file(file_path)
+            if bundle_json:
+                try:
+                    for item in json.loads(bundle_json):
+                        if item.get('file_path'):
+                            delete_media_file(item['file_path'])
+                except (ValueError, TypeError):
+                    pass
+
+        kind = "scheduled" if scheduled else "unscheduled"
+        filter_info = [f"mode {mode}"] if mode else []
         if channel_id:
             filter_info.append(f"channel {channel_id}")
         filter_str = f" ({', '.join(filter_info)})" if filter_info else ""
-        
-        logger.info(f"Cleared {count} unscheduled pending posts for user {user_id}{filter_str} (scheduled posts preserved)")
+        logger.info(f"Cleared {count} {kind} pending posts for user {user_id}{filter_str}")
+        return count
+
+    @staticmethod
+    def clear_user_posts(user_id: int, mode: Optional[int] = None, channel_id: Optional[str] = None):
+        """Clear a user's unscheduled pending posts (scheduled posts are preserved)."""
+        return Database._clear_pending_posts(user_id, scheduled=False, mode=mode, channel_id=channel_id)
     
     @staticmethod
     def get_unscheduled_posts(user_id: int) -> List[Dict]:
@@ -977,117 +1155,13 @@ class Database:
     
     @staticmethod
     def clear_queued_posts(user_id: int, channel_id: Optional[str] = None) -> int:
-        """Clear all queued (pending) posts for a user and return count of cleared posts"""
-        from .utils import delete_media_file
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        
-        # Build query conditions for unscheduled posts
-        conditions = ["user_id = ?", "status = 'pending'", "scheduled_time IS NULL"]
-        params = [user_id]
-        
-        if channel_id:
-            conditions.append("channel_id = ?")
-            params.append(channel_id)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # First get the file paths and IDs of pending posts that haven't been scheduled yet
-        cursor.execute(f'''
-            SELECT id, file_path FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
-        unscheduled_posts = cursor.fetchall()
-        count = len(unscheduled_posts)
-        
-        # Log details about what's being cleared
-        channel_info = f" for channel {channel_id}" if channel_id else ""
-        if count > 0:
-            post_ids = [str(post[0]) for post in unscheduled_posts]
-            logger.info(f"Clearing {count} queued (unscheduled) posts for user {user_id}{channel_info}: IDs {', '.join(post_ids)}")
-        else:
-            logger.info(f"No queued posts to clear for user {user_id}{channel_info}")
-        
-        # Delete the physical files
-        for post_id, file_path in unscheduled_posts:
-            delete_media_file(file_path)
-        
-        # Then delete the database records - only unscheduled pending posts
-        cursor.execute(f'''
-            DELETE FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
-        # Log how many scheduled posts remain
-        cursor.execute('''
-            SELECT COUNT(*) FROM posts 
-            WHERE user_id = ? AND status = 'pending' AND scheduled_time IS NOT NULL
-        ''', (user_id,))
-        scheduled_remaining = cursor.fetchone()[0]
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Cleared {count} queued posts for user {user_id}{channel_info}. {scheduled_remaining} scheduled posts remain.")
-        return count
-    
+        """Clear all queued (unscheduled pending) posts for a user; returns count."""
+        return Database._clear_pending_posts(user_id, scheduled=False, channel_id=channel_id)
+
     @staticmethod
     def clear_scheduled_posts(user_id: int, channel_id: Optional[str] = None) -> int:
-        """Clear all scheduled posts for a user and return count of cleared posts"""
-        from .utils import delete_media_file
-        conn = Database.get_connection()
-        cursor = conn.cursor()
-        
-        # Build query conditions for scheduled posts
-        conditions = ["user_id = ?", "status = 'pending'", "scheduled_time IS NOT NULL"]
-        params = [user_id]
-        
-        if channel_id:
-            conditions.append("channel_id = ?")
-            params.append(channel_id)
-        
-        where_clause = " AND ".join(conditions)
-        
-        # First get the file paths and IDs of scheduled posts
-        cursor.execute(f'''
-            SELECT id, file_path FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
-        scheduled_posts = cursor.fetchall()
-        count = len(scheduled_posts)
-        
-        # Log details about what's being cleared
-        channel_info = f" for channel {channel_id}" if channel_id else ""
-        if count > 0:
-            post_ids = [str(post[0]) for post in scheduled_posts]
-            logger.info(f"Clearing {count} scheduled posts for user {user_id}{channel_info}: IDs {', '.join(post_ids)}")
-        else:
-            logger.info(f"No scheduled posts to clear for user {user_id}{channel_info}")
-        
-        # Delete the physical files
-        for post_id, file_path in scheduled_posts:
-            delete_media_file(file_path)
-        
-        # Then delete the database records - only scheduled pending posts
-        cursor.execute(f'''
-            DELETE FROM posts 
-            WHERE {where_clause}
-        ''', params)
-        
-        # Log how many queued posts remain
-        cursor.execute('''
-            SELECT COUNT(*) FROM posts 
-            WHERE user_id = ? AND status = 'pending' AND scheduled_time IS NULL
-        ''', (user_id,))
-        queued_remaining = cursor.fetchone()[0]
-        
-        conn.commit()
-        conn.close()
-        
-        logger.info(f"Cleared {count} scheduled posts for user {user_id}{channel_info}. {queued_remaining} queued posts remain.")
-        return count
+        """Clear all scheduled pending posts for a user; returns count."""
+        return Database._clear_pending_posts(user_id, scheduled=True, channel_id=channel_id)
 
     @staticmethod
     def delete_scheduled_post(user_id: int, post_id: int) -> bool:
@@ -1189,7 +1263,7 @@ class Database:
         
         if settings:
             enabled, threshold, last_sent = settings
-            last_sent_dt = datetime.fromisoformat(last_sent) if last_sent else None
+            last_sent_dt = parse_dt(last_sent) if last_sent else None
             return enabled if enabled is not None else True, threshold if threshold is not None else 5, last_sent_dt
         else:
             # Return default values
@@ -1239,10 +1313,10 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute('''
-            UPDATE scheduling_config 
-            SET last_reminder_sent = ? 
+            UPDATE scheduling_config
+            SET last_reminder_sent = ?
             WHERE user_id = ?
-        ''', (datetime.now().isoformat(), user_id))
+        ''', (kyiv_now_iso(), user_id))
         
         conn.commit()
         conn.close()
@@ -1253,8 +1327,8 @@ class Database:
         conn = Database.get_connection()
         cursor = conn.cursor()
         
-        # Get posts that are overdue by more than 5 minutes
-        cutoff_time = (datetime.now() - timedelta(minutes=5)).isoformat()
+        # Get posts that are overdue by more than 5 minutes (Kyiv-aware, matching stored format)
+        cutoff_time = (datetime.now(get_kyiv_timezone()) - timedelta(minutes=5)).isoformat()
         
         cursor.execute('''
             SELECT id, user_id, scheduled_time, channel_id, description
@@ -1297,16 +1371,16 @@ class Database:
         ''')
         
         users_to_remind = []
-        now = datetime.now()
-        
+        now = datetime.now(get_kyiv_timezone())
+
         for row in cursor.fetchall():
             user_id, threshold, last_sent, post_count = row
             # Only remind if post count is below threshold
             if post_count <= threshold:
                 # Check if we haven't sent a reminder recently (within 24 hours)
                 if last_sent:
-                    last_sent_dt = datetime.fromisoformat(last_sent)
-                    if (now - last_sent_dt).total_seconds() < 86400:  # 24 hours
+                    last_sent_dt = parse_dt(last_sent)
+                    if last_sent_dt and (now - last_sent_dt).total_seconds() < 86400:  # 24 hours
                         continue
                 users_to_remind.append((user_id, post_count))
         
@@ -1320,15 +1394,21 @@ class Database:
         cursor = conn.cursor()
         
         try:
+            # Upsert: re-adding an existing channel updates its name without
+            # resetting is_default/is_active or changing the row id (which
+            # INSERT OR REPLACE would do)
             cursor.execute('''
-                INSERT OR REPLACE INTO user_channels 
+                INSERT INTO user_channels
                 (user_id, channel_id, channel_name, is_default, is_active)
-                VALUES (?, ?, ?, FALSE, TRUE)
-            ''', (user_id, channel_id, channel_name))
-            
+                VALUES (?, ?, ?, ?, TRUE)
+                ON CONFLICT(user_id, channel_id) DO UPDATE SET
+                    channel_name = excluded.channel_name,
+                    is_active = TRUE
+            ''', (user_id, channel_id, channel_name, is_default))
+
             conn.commit()
             conn.close()
-            
+
             logger.info(f"Added channel {channel_id} for user {user_id}")
             return True
             
@@ -1938,7 +2018,7 @@ class Database:
                     UPDATE posts
                     SET scheduled_time = ?
                     WHERE id = ?
-                ''', (scheduled_times[i].isoformat(), post_id))
+                ''', (serialize_dt(scheduled_times[i]), post_id))
 
         # Mark batch as scheduled
         cursor.execute('''
@@ -1965,7 +2045,7 @@ class Database:
 
         try:
             query = 'UPDATE posts SET scheduled_time = ? WHERE id = ?'
-            params = [scheduled_time.isoformat(), post_id]
+            params = [serialize_dt(scheduled_time), post_id]
             if user_id is not None:
                 query += ' AND user_id = ?'
                 params.append(user_id)
@@ -2534,6 +2614,16 @@ class Database:
             
             for post_data in backup_data:
                 try:
+                    # SECURITY: re-verify channel ownership at restore time -
+                    # the user may have lost the channel since the backup was made
+                    backup_channel = post_data.get('channel_id')
+                    if backup_channel and not Database.user_has_channel(user_id, backup_channel):
+                        skipped_count += 1
+                        logger.warning(
+                            f"Skipping restored post for user {user_id}: no longer owns channel {backup_channel}"
+                        )
+                        continue
+
                     # Check if file still exists
                     file_path = post_data['file_path']
                     file_exists = os.path.exists(file_path)
@@ -2570,7 +2660,7 @@ class Database:
                         file_path,  # Use the potentially corrected path
                         post_data.get('media_type', 'photo'),
                         post_data['description'],
-                        post_data['scheduled_time'],
+                        serialize_dt(post_data['scheduled_time']),
                         post_data['mode'],
                         post_data['channel_id'],
                         post_data['is_recurring'],
