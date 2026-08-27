@@ -7,7 +7,11 @@ Main entry point for the application
 import asyncio
 import logging
 import os
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler,
+    TypeHandler, ApplicationHandlerStop
+)
 from telegram.request import HTTPXRequest
 
 from bot.handlers import (
@@ -22,7 +26,7 @@ from bot.handlers import (
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
-from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR
+from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR, ALLOWED_USER_IDS
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +39,22 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+async def auth_gate(update, context):
+    """Reject updates from users outside ALLOWED_USER_IDS before any handler runs.
+
+    Registered in group -1 so it runs first for every update type (messages,
+    callbacks, media). ApplicationHandlerStop prevents all later handlers.
+    """
+    user = update.effective_user
+    if user is None or user.id not in ALLOWED_USER_IDS:
+        user_id = user.id if user else "unknown"
+        logger.warning(f"Rejected update from unauthorized user {user_id}")
+        if update.callback_query:
+            await update.callback_query.answer("⛔ You are not authorized to use this bot.", show_alert=True)
+        elif update.effective_message:
+            await update.effective_message.reply_text("⛔ You are not authorized to use this bot.")
+        raise ApplicationHandlerStop
 
 async def post_init(application):
     """Initialize scheduler after the application starts"""
@@ -66,7 +86,17 @@ def main():
     
     # Set up post-init callback
     application.post_init = post_init
-    
+
+    # SECURITY: user allowlist gate runs before every other handler
+    if ALLOWED_USER_IDS:
+        application.add_handler(TypeHandler(Update, auth_gate), group=-1)
+        logger.info(f"Access restricted to {len(ALLOWED_USER_IDS)} allowed user(s)")
+    else:
+        logger.warning(
+            "ALLOWED_USER_IDS is not set - the bot is open to EVERY Telegram user. "
+            "Set ALLOWED_USER_IDS=<your telegram user id> to restrict access."
+        )
+
     # Add handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("mode1", mode1_handler))

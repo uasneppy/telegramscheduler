@@ -11,7 +11,6 @@ import calendar
 from typing import List, Tuple, Dict, Optional
 from PIL import Image
 from config import UPLOADS_DIR, TIMEZONE, MAX_FILE_SIZE
-import aiofiles
 
 logger = logging.getLogger(__name__)
 

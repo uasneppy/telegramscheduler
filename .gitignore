@@ -1,0 +1,20 @@
+# Runtime data - never commit the database or uploaded media
+bot_data.db
+*.db
+*.sqlite3
+uploads/
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets / environment
+.env
+.env.*
+
+# OS junk
+.DS_Store
