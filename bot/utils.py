@@ -9,8 +9,7 @@ from datetime import datetime, timedelta
 import pytz
 import calendar
 from typing import List, Tuple, Dict, Optional
-from PIL import Image
-from config import UPLOADS_DIR, TIMEZONE, MAX_FILE_SIZE
+from config import UPLOADS_DIR, TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -51,49 +50,56 @@ def cleanup_old_media_files():
     Clean up media files that are 7+ days old and have been successfully posted
     This function should be called periodically
     """
-    from bot.database import Database
-    
+    from bot.database import Database, serialize_dt
+    from config import DATA_DIR
+
     current_time = get_current_kyiv_time()
-    cleanup_cutoff = current_time - timedelta(days=7)
-    
-    logger.info(f"Starting media cleanup for files older than {cleanup_cutoff}")
-    
+    # Serialize the cutoff the same way posted_at is stored so the SQL
+    # string comparison is format-consistent
+    cleanup_cutoff = serialize_dt(current_time - timedelta(days=7))
+
+    logger.info(f"Starting media cleanup for files posted before {cleanup_cutoff}")
+
     # Get all posted files that are ready for cleanup
     conn = Database.get_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute('''
         SELECT id, file_path, user_id, media_type, posted_at
-        FROM posts 
-        WHERE status = 'posted' 
-        AND posted_at < ? 
+        FROM posts
+        WHERE status = 'posted'
+        AND posted_at < ?
         AND cleanup_date IS NULL
     ''', (cleanup_cutoff,))
-    
+
     cleanup_candidates = cursor.fetchall()
     cleaned_count = 0
-    
+    now_iso = serialize_dt(current_time)
+
     for post_id, file_path, user_id, media_type, posted_at in cleanup_candidates:
         try:
-            # Check if file exists and delete it
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                logger.info(f"Cleaned up media file: {file_path}")
+            # Resolve legacy relative paths against DATA_DIR (same rule as the scheduler)
+            actual_path = file_path if os.path.isabs(file_path) else os.path.join(DATA_DIR, file_path)
+
+            # Delete the file; a missing file also counts as handled
+            if os.path.exists(actual_path):
+                os.remove(actual_path)
+                logger.info(f"Cleaned up media file: {actual_path}")
                 cleaned_count += 1
-            
+
             # Mark as cleaned up in database
             cursor.execute('''
-                UPDATE posts 
-                SET cleanup_date = ? 
+                UPDATE posts
+                SET cleanup_date = ?
                 WHERE id = ?
-            ''', (current_time, post_id))
-            
+            ''', (now_iso, post_id))
+
         except Exception as e:
             logger.error(f"Failed to cleanup file {file_path}: {e}")
-    
+
     conn.commit()
     conn.close()
-    
+
     logger.info(f"Media cleanup completed: {cleaned_count} files cleaned up")
     return cleaned_count
 
@@ -182,27 +188,8 @@ def save_media(file_data: bytes, filename: str, media_type: str = 'photo', user_
         logger.error(f"Failed to save {media_type} file {filename}: {e}")
         raise ValueError(f"Could not save file: {e}")
     
-    # Verify the image can be opened only for photos (with memory optimization)
-    if media_type == 'photo':
-        try:
-            # Use lazy loading for large images to prevent memory issues
-            with Image.open(file_path) as img:
-                # Don't load the entire image into memory for verification
-                img.load = lambda: None  # Disable auto-loading
-                img.verify()
-        except Exception as e:
-            logger.warning(f"Image verification failed for {filename}: {e}")
-            # Don't delete the file for verification failures - user might still want it
-            # os.remove(file_path)
-            # raise ValueError(f"Invalid image file: {e}")
-            logger.info(f"Saved {media_type} file despite verification warning: {file_path}")
-    
     logger.info(f"Saved {media_type}: {file_path}")
     return file_path
-
-def save_photo(file_data: bytes, filename: str) -> str:
-    """Save photo data to the uploads directory (backward compatibility)"""
-    return save_media(file_data, filename, 'photo')
 
 def delete_media_file(file_path: str) -> bool:
     """Delete a media file from the uploads directory"""
@@ -232,24 +219,29 @@ def get_media_type_from_extension(filename: str) -> str:
     else:
         return 'document'
 
-def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int, 
+def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int,
                            num_posts: int, start_date: Optional[datetime] = None) -> List[datetime]:
-    """Calculate schedule times for posts with proper timezone handling"""
+    """Calculate schedule times for posts with proper timezone handling.
+
+    Arithmetic runs on naive Kyiv wall-clock times and each result is
+    localized at the end - replace()/timedelta on pytz-localized datetimes
+    keeps a stale UTC offset across DST transitions.
+    """
     kyiv_tz = get_kyiv_timezone()
-    
+
     if start_date is None:
         start_date = get_current_kyiv_time().replace(hour=0, minute=0, second=0, microsecond=0)
         start_date += timedelta(days=1)  # Start from tomorrow
-    
-    # Ensure start_date is timezone-aware
-    if start_date.tzinfo is None:
-        start_date = kyiv_tz.localize(start_date)
-    
+
+    # Work in naive Kyiv wall-clock time
+    if start_date.tzinfo is not None:
+        start_date = start_date.astimezone(kyiv_tz).replace(tzinfo=None)
+
     schedule_times = []
     current_time = start_date.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-    
+
     posts_scheduled = 0
-    
+
     while posts_scheduled < num_posts:
         # Check if current time is within the daily window
         if start_hour <= current_time.hour < end_hour:
@@ -260,8 +252,9 @@ def calculate_schedule_times(start_hour: int, end_hour: int, interval_hours: int
             # Move to the next day at start hour
             next_day = current_time + timedelta(days=1)
             current_time = next_day.replace(hour=start_hour, minute=0, second=0, microsecond=0)
-    
-    return schedule_times
+
+    # Localize each wall-clock time with its correct DST offset
+    return [kyiv_tz.localize(t) for t in schedule_times]
 
 def format_schedule_summary(schedule_times: List[datetime], max_display: int = 15) -> str:
     """Format schedule times for display, truncating for large batches"""
@@ -372,12 +365,19 @@ def calculate_custom_date_schedule(start_datetime: datetime, interval_hours: int
 
 def calculate_evenly_distributed_schedule(start_hour: int, end_hour: int, num_posts: int, start_date: Optional[datetime] = None, interval_hours: Optional[int] = None) -> List[datetime]:
     """Calculate evenly distributed schedule times for posts within daily time window"""
+    kyiv_tz = get_kyiv_timezone()
+
     if start_date is None:
         start_date = get_current_kyiv_time().replace(hour=0, minute=0, second=0, microsecond=0)
         start_date += timedelta(days=1)  # Start from tomorrow
-    
+
+    # Work in naive Kyiv wall-clock time; localize at the end so each slot
+    # gets its correct DST offset (see calculate_schedule_times)
+    if start_date.tzinfo is not None:
+        start_date = start_date.astimezone(kyiv_tz).replace(tzinfo=None)
+
     schedule_times = []
-    
+
     if num_posts <= 0:
         return schedule_times
     
@@ -449,8 +449,9 @@ def calculate_evenly_distributed_schedule(start_hour: int, end_hour: int, num_po
             
             # Move to next day
             current_date += timedelta(days=1)
-    
-    return schedule_times
+
+    # Localize each wall-clock time with its correct DST offset
+    return [kyiv_tz.localize(t) if t.tzinfo is None else t for t in schedule_times]
 
 def parse_bulk_edit_input(text: str) -> Tuple[bool, int, int, int, str, Optional[datetime], str]:
     """Parse bulk edit input for time redistribution with optional interval and start date"""
@@ -582,26 +583,6 @@ def parse_schedule_input(text: str) -> Tuple[bool, int, int, int, str]:
     except ValueError:
         return False, 0, 0, 0, "Please provide valid numbers for scheduling parameters"
 
-def cleanup_old_files(days_old: int = 7):
-    """Clean up old uploaded files"""
-    cutoff_time = datetime.now() - timedelta(days=days_old)
-    
-    for filename in os.listdir(UPLOADS_DIR):
-        if filename == '.gitkeep':
-            continue
-            
-        file_path = os.path.join(UPLOADS_DIR, filename)
-        
-        if os.path.isfile(file_path):
-            file_time = datetime.fromtimestamp(os.path.getctime(file_path))
-            
-            if file_time < cutoff_time:
-                try:
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up old file: {file_path}")
-                except Exception as e:
-                    logger.error(f"Failed to remove old file {file_path}: {e}")
-
 def get_media_icon(media_type: str) -> str:
     """Get emoji icon for media type"""
     icons = {
@@ -649,16 +630,18 @@ def generate_mini_calendar(year: int, month: int, posts_by_date: Dict[str, List[
     return calendar_str
 
 def escape_markdown(text: str) -> str:
-    """Escape markdown special characters to prevent parsing errors"""
+    """Escape special characters for Telegram's LEGACY Markdown parse mode.
+
+    The bot sends messages with parse_mode='Markdown' (legacy), where only
+    _ * ` [ are special. Escaping MarkdownV2-only characters (. - ! etc.)
+    here would render visible backslashes in messages.
+    """
     if not text:
         return text
-    
-    # Characters that need to be escaped in Telegram markdown
-    escape_chars = ['*', '_', '`', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-    
-    for char in escape_chars:
+
+    for char in ('_', '*', '`', '['):
         text = text.replace(char, f'\\{char}')
-    
+
     return text
 
 def format_daily_schedule(date_str: str, posts: List[Dict]) -> str:

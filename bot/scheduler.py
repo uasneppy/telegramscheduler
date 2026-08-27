@@ -17,25 +17,32 @@ from telegram.request import HTTPXRequest
 
 from .database import Database
 from .utils import get_kyiv_timezone, get_current_kyiv_time, cleanup_old_media_files, cleanup_empty_directories
-from config import BOT_TOKEN, CHANNEL_ID, UPLOADS_DIR, DATA_DIR
+from config import BOT_TOKEN, DATA_DIR
 
 logger = logging.getLogger(__name__)
 
+# Late jobs are executed rather than dropped (APScheduler's default grace is
+# 1 second, which silently discards any job that fires late)
+MISFIRE_GRACE_SECONDS = 3600
+
 class PostScheduler:
-    def __init__(self):
+    def __init__(self, bot: Optional[Bot] = None):
         self.scheduler = AsyncIOScheduler(timezone=get_kyiv_timezone())
-        
-        # Create HTTP request with improved connection pooling
-        request = HTTPXRequest(
-            connection_pool_size=50,   # Increased for heavy file posting
-            pool_timeout=120.0,        # Extended timeout for large files
-            read_timeout=600.0,        # 10 minutes for large file uploads
-            write_timeout=600.0,       # 10 minutes for large file uploads 
-            connect_timeout=60.0       # 1 minute connection timeout
-        )
-        
-        self.bot = Bot(token=BOT_TOKEN, request=request)
-        
+
+        if bot is not None:
+            # Reuse the Application's already-initialized bot and its HTTP pool
+            self.bot = bot
+        else:
+            # Fallback: standalone bot with its own pool sized for heavy uploads
+            request = HTTPXRequest(
+                connection_pool_size=50,   # Increased for heavy file posting
+                pool_timeout=120.0,        # Extended timeout for large files
+                read_timeout=600.0,        # 10 minutes for large file uploads
+                write_timeout=600.0,       # 10 minutes for large file uploads
+                connect_timeout=60.0       # 1 minute connection timeout
+            )
+            self.bot = Bot(token=BOT_TOKEN, request=request)
+
     def start(self):
         """Start the scheduler"""
         self.scheduler.start()
@@ -82,8 +89,13 @@ class PostScheduler:
     
     def _schedule_existing_posts(self):
         """Schedule all existing pending posts from database"""
+        # A crash mid-send can leave posts stuck in 'sending' - rescue them first
+        Database.reset_stale_sending_posts(max_age_minutes=0)
+
         pending_posts = Database.get_pending_posts()
-        
+
+        current_time = get_current_kyiv_time()
+        overdue_index = 0
         for post in pending_posts:
             if post['scheduled_time']:
                 # Handle both timezone-aware and timezone-naive datetimes from database
@@ -92,7 +104,14 @@ class PostScheduler:
                     # Database times without timezone info are assumed to be in Kyiv timezone
                     kyiv_tz = get_kyiv_timezone()
                     scheduled_time = kyiv_tz.localize(scheduled_time)
-                
+
+                if scheduled_time <= current_time:
+                    # Post came due while the bot was down - send it shortly after
+                    # startup (staggered) instead of waiting for the monitor
+                    scheduled_time = current_time + timedelta(seconds=15 + overdue_index * 3)
+                    overdue_index += 1
+                    logger.info(f"Post {post['id']} was overdue at startup; rescheduled for {scheduled_time}")
+
                 self._schedule_single_post(post['id'], scheduled_time)
     
     async def schedule_posts(self, post_ids: list, scheduled_times: list):
@@ -158,7 +177,8 @@ class PostScheduler:
             trigger=DateTrigger(run_date=scheduled_time),
             args=[post_id],
             id=job_id,
-            replace_existing=True
+            replace_existing=True,
+            misfire_grace_time=MISFIRE_GRACE_SECONDS
         )
         
         logger.info(f"Scheduled post {post_id} for {scheduled_time}")
@@ -176,10 +196,17 @@ class PostScheduler:
                 # Add a small delay at the start to prevent overwhelming Telegram API
                 await asyncio.sleep(1.0)  # 1 second delay before each post
                 
+                # Atomically claim the post (pending -> sending) on the first
+                # attempt. This prevents the monitor from scheduling a second
+                # send while a slow upload is still in flight.
+                if retry_count == 0 and not Database.claim_post_for_sending(post_id):
+                    logger.warning(f"Post {post_id} not found or already being processed - skipping")
+                    return
+
                 # Get complete post details from database using new get_post_by_id method
                 post_data = Database.get_post_by_id(post_id)
-                
-                if not post_data or post_data['status'] != 'pending':
+
+                if not post_data or post_data['status'] not in ('pending', 'sending'):
                     logger.warning(f"Post {post_id} not found or already processed")
                     return
                 
@@ -204,7 +231,8 @@ class PostScheduler:
                                 offset=e['offset'],
                                 length=e['length'],
                                 url=e.get('url'),
-                                language=e.get('language')
+                                language=e.get('language'),
+                                custom_emoji_id=e.get('custom_emoji_id')
                             )
                             for e in entities_data
                         ]
@@ -241,7 +269,8 @@ class PostScheduler:
                 
                 # Handle album posts separately
                 if media_type == 'album' and media_bundle_json:
-                    await self._post_album_to_channel(post_id, media_bundle_json, description, target_channel, user_id)
+                    await self._post_album_to_channel(post_id, media_bundle_json, description,
+                                                      target_channel, user_id, caption_entities)
                     return
                 
                 # Convert stored relative paths to absolute data paths
@@ -418,17 +447,23 @@ class PostScheduler:
                     Database.mark_post_as_failed(post_id, f"Unexpected error: {e}")
                     break
     
-    def cancel_user_posts(self, user_id: int):
-        """Cancel all scheduled posts for a user"""
+    def cancel_user_posts(self, user_id: int, clear_queue: bool = True):
+        """Cancel all scheduled jobs for a user's posts.
+
+        clear_queue=True also deletes the user's unscheduled queue (the /cancel
+        command's behavior); pass False when the caller manages DB rows itself
+        (e.g. /clearscheduled, which must not wipe the unscheduled queue).
+        """
         pending_posts = Database.get_pending_posts(user_id)
-        
+
         for post in pending_posts:
             job_id = f"post_{post['id']}"
             if self.scheduler.get_job(job_id):
                 self.scheduler.remove_job(job_id)
-        
-        Database.clear_user_posts(user_id)
-        logger.info(f"Cancelled all posts for user {user_id}")
+
+        if clear_queue:
+            Database.clear_user_posts(user_id)
+        logger.info(f"Cancelled all posts for user {user_id} (clear_queue={clear_queue})")
     
     def get_scheduled_jobs_count(self) -> int:
         """Get number of scheduled jobs"""
@@ -438,14 +473,17 @@ class PostScheduler:
         """Perform daily cleanup of old media files"""
         try:
             logger.info("Starting daily media cleanup...")
-            
+
             # Clean up old media files
             cleaned_files = cleanup_old_media_files()
-            
+
+            # Hard-delete soft-deleted posts and their media
+            purged = Database.purge_deleted_posts()
+
             # Clean up empty directories
             cleaned_dirs = await cleanup_empty_directories()
-            
-            logger.info(f"Daily cleanup completed: {cleaned_files} files and {cleaned_dirs} directories cleaned")
+
+            logger.info(f"Daily cleanup completed: {cleaned_files} files, {purged} deleted posts purged, {cleaned_dirs} directories cleaned")
             
         except Exception as e:
             logger.error(f"Daily cleanup failed: {e}")
@@ -454,7 +492,10 @@ class PostScheduler:
         """Monitor scheduled posts and detect/recover from issues"""
         try:
             logger.info("Running scheduled post monitoring...")
-            
+
+            # Rescue posts stuck in 'sending' (e.g. process died mid-upload)
+            Database.reset_stale_sending_posts(max_age_minutes=30)
+
             # Get posts that should have been posted but weren't
             overdue_posts = []
             try:
@@ -668,9 +709,10 @@ class PostScheduler:
         if should_continue and post['recurring_interval_hours']:
             # Schedule next occurrence
             next_time = get_current_kyiv_time() + timedelta(hours=post['recurring_interval_hours'])
-            
-            # Update the scheduled_time in database for the next occurrence
-            Database.update_post_schedule(post_id, next_time)
+
+            # Set the next occurrence and return the post to 'pending'
+            # (it was claimed as 'sending' for this send)
+            Database.reschedule_recurring_post(post_id, next_time)
             
             # Create new job for next occurrence
             job_id = f"post_{post_id}"
@@ -680,7 +722,8 @@ class PostScheduler:
                 run_date=next_time,
                 args=[post_id],
                 id=job_id,
-                replace_existing=True
+                replace_existing=True,
+                misfire_grace_time=MISFIRE_GRACE_SECONDS
             )
             
             logger.info(f"Scheduled next recurring post {post_id} for {next_time}")
@@ -689,8 +732,8 @@ class PostScheduler:
             Database.mark_post_as_posted(post_id)
             logger.info(f"Recurring post {post_id} completed")
 
-    async def _post_album_to_channel(self, post_id: int, media_bundle_json: str, description: str, 
-                                   target_channel: str, user_id: int):
+    async def _post_album_to_channel(self, post_id: int, media_bundle_json: str, description: str,
+                                   target_channel: str, user_id: int, caption_entities=None):
         """Post an album (multiple media) to channel using sendMediaGroup"""
         open_files = []  # Track open file handles
         
@@ -740,12 +783,14 @@ class PostScheduler:
                 if media_type in ['photo', 'document_image']:
                     media_obj = InputMediaPhoto(
                         media=f,
-                        caption=description if i == 0 else None  # Caption only on first item
+                        caption=description if i == 0 else None,  # Caption only on first item
+                        caption_entities=caption_entities if i == 0 else None
                     )
                 elif media_type in ['video', 'document_video']:
                     media_obj = InputMediaVideo(
                         media=f,
-                        caption=description if i == 0 else None  # Caption only on first item
+                        caption=description if i == 0 else None,  # Caption only on first item
+                        caption_entities=caption_entities if i == 0 else None
                     )
                 else:
                     logger.warning(f"Unsupported media type for album: {media_type}, skipping")
@@ -787,14 +832,20 @@ class PostScheduler:
             
             # Mark post as successfully posted
             Database.mark_post_as_posted(post_id)
-            
-            # Set cleanup date for media files (7 days from now)
-            from datetime import datetime, timedelta
-            cleanup_date = datetime.now() + timedelta(days=7)
-            if hasattr(Database, 'set_post_cleanup_date'):
-                Database.set_post_cleanup_date(post_id, cleanup_date)
-            
+
+            # Set cleanup date for media files (7 days from now, Kyiv-aware)
+            Database.set_post_cleanup_date(post_id, get_current_kyiv_time() + timedelta(days=7))
+
             logger.info(f"Album post {post_id} sent successfully with {len(media_group)} items")
+
+            # Notify user (same as the single-post path)
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text=f"✅ Album post #{post_id} ({len(media_group)} items) has been successfully published to the channel!"
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify user {user_id}: {e}")
             
         except Exception as e:
             logger.error(f"Failed to post album {post_id}: {e}")
@@ -831,72 +882,6 @@ class PostScheduler:
         except Exception as e:
             logger.error(f"Error scheduling single post {post_id}: {e}")
             raise
-
-    async def _handle_post_failure(self, post_id: int, user_id: int, failure_reason: str):
-        """Handle post failure with retry logic"""
-        retry_count = Database.increment_retry_count(post_id)
-        max_retries = 3
-        
-        if retry_count < max_retries:
-            # Calculate retry delay using exponential backoff
-            delay_minutes = 2 ** retry_count  # 2, 4, 8 minutes
-            retry_time = get_current_kyiv_time() + timedelta(minutes=delay_minutes)
-            
-            # Schedule retry
-            self._schedule_single_post(post_id, retry_time)
-            
-            logger.info(f"Scheduled retry {retry_count}/{max_retries} for post {post_id} at {retry_time}")
-            
-            # Notify user about retry
-            try:
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⚠️ Post #{post_id} failed but will retry in {delay_minutes} minutes (attempt {retry_count}/{max_retries})"
-                )
-            except Exception:
-                pass
-        else:
-            # Maximum retries exceeded, mark as permanently failed
-            Database.mark_post_as_failed(post_id, failure_reason)
-            
-            # Notify user of permanent failure
-            try:
-                await self.bot.send_message(
-                    chat_id=user_id,
-                    text=f"❌ Post #{post_id} permanently failed after {max_retries} attempts: {failure_reason}"
-                )
-            except Exception:
-                pass
-
-    async def schedule_retry_posts(self):
-        """Schedule retries for eligible failed posts"""
-        retry_posts = Database.get_posts_for_retry()
-        
-        for post in retry_posts:
-            retry_count = Database.increment_retry_count(post['id'])
-            max_retries = 3
-            
-            if retry_count <= max_retries:
-                # Calculate retry delay
-                delay_minutes = 2 ** (retry_count - 1)  # 1, 2, 4 minutes
-                retry_time = get_current_kyiv_time() + timedelta(minutes=delay_minutes)
-                
-                # Schedule retry
-                self._schedule_single_post(post['id'], retry_time)
-                
-                logger.info(f"Scheduled automatic retry for post {post['id']} at {retry_time}")
-                
-                # Notify user
-                try:
-                    await self.bot.send_message(
-                        chat_id=post['user_id'],
-                        text=f"🔄 Automatically retrying post #{post['id']} in {delay_minutes} minutes"
-                    )
-                except Exception:
-                    pass
-            else:
-                # Mark as permanently failed
-                Database.mark_post_as_failed(post['id'], post['failure_reason'])
 
     async def _diagnose_telegram_error(self, error: Exception, post_id: int) -> dict:
         """Diagnose Telegram errors and provide actionable solutions"""
