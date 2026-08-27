@@ -84,53 +84,89 @@ async def extract_and_save_media(update: Update, user_id: int, media_type: str) 
     return file_path
 
 
+def build_main_menu(user):
+    """Build the main menu as a live dashboard: (message, reply_markup).
+
+    Shared by /start and every "back to menu" navigation so both stay in sync.
+    """
+    stats = Database.get_dashboard_stats(user.id)
+
+    # First run: no channels yet - show guided onboarding instead of the menu
+    if stats['channels'] == 0:
+        keyboard = [
+            [InlineKeyboardButton("➕ Add my first channel", callback_data="channels_add")],
+            [InlineKeyboardButton("❓ Help", callback_data="main_help")]
+        ]
+        message = (
+            f"👋 *Welcome, {escape_markdown(user.first_name or 'there')}!*\n\n"
+            "I schedule posts to your Telegram channels - bulk uploads, "
+            "captions, albums, recurring posts and more.\n\n"
+            "*Let's set up your first channel:*\n\n"
+            "*1.* Add this bot as an *administrator* to your channel "
+            "(with permission to post)\n"
+            "*2.* Tap the button below\n"
+            "*3.* Forward me any post from the channel - or send its "
+            "`@name` / `-100...` ID\n\n"
+            "I'll verify you're an admin and send a quick self-deleting "
+            "test post to confirm everything works."
+        )
+        return message, InlineKeyboardMarkup(keyboard)
+
+    # Dashboard summary line(s)
+    summary = (
+        f"📺 *{stats['channels']}* channels · "
+        f"📥 *{stats['queued']}* queued · "
+        f"📅 *{stats['scheduled']}* scheduled"
+    )
+    if stats['next_post']:
+        np = stats['next_post']
+        summary += (f"\n⏭ Next post: *{np['time'].strftime('%d.%m %H:%M')}* → "
+                    f"{escape_markdown(np['channel_name'])}")
+
+    keyboard = [
+        [InlineKeyboardButton("📤 Bulk upload", callback_data="main_mode1"),
+         InlineKeyboardButton("📝 With captions", callback_data="main_mode2")],
+        [InlineKeyboardButton("🎯 Guided captioning", callback_data="main_mode3"),
+         InlineKeyboardButton("📦 Batches", callback_data="main_multibatch")],
+        [InlineKeyboardButton("🔄 Recurring posts", callback_data="main_recurring"),
+         InlineKeyboardButton("♻️ Manage recurring", callback_data="recurring_manage_menu")],
+    ]
+    # Alert rows appear only when there is something to act on
+    if stats['failed']:
+        keyboard.append([InlineKeyboardButton(
+            f"⚠️ {stats['failed']} failed - review & retry", callback_data="main_retry")])
+    if stats['overdue']:
+        keyboard.append([InlineKeyboardButton(
+            f"⏰ {stats['overdue']} overdue - manage", callback_data="main_overdue")])
+    keyboard.extend([
+        [InlineKeyboardButton("👁 Preview", callback_data="main_preview"),
+         InlineKeyboardButton("📅 Calendar", callback_data="main_calendar")],
+        [InlineKeyboardButton("✏️ Edit posts", callback_data="main_editposts"),
+         InlineKeyboardButton("🔁 Reschedule all", callback_data="main_reschedule")],
+        [InlineKeyboardButton("📺 Channels", callback_data="main_channels"),
+         InlineKeyboardButton("📊 Statistics", callback_data="main_stats")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="main_settings"),
+         InlineKeyboardButton("❓ Help", callback_data="main_help")],
+    ])
+
+    message = (
+        f"👋 *Hi, {escape_markdown(user.first_name or 'there')}!*\n\n"
+        f"{summary}\n\n"
+        "Choose an action:"
+    )
+    return message, InlineKeyboardMarkup(keyboard)
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     if not update or not update.effective_user or not update.message:
         logger.error("Invalid update in start_handler")
         return
-    
+
     user = update.effective_user
-    
-    # Create main menu keyboard
-    keyboard = [
-        [InlineKeyboardButton("📸 Mode 1: Bulk Upload", callback_data="main_mode1")],
-        [InlineKeyboardButton("📝 Mode 2: Individual Upload", callback_data="main_mode2")],
-        [InlineKeyboardButton("🎯 Mode 3: Guided Captioning", callback_data="main_mode3")],
-        [InlineKeyboardButton("🔄 Recurring Posts", callback_data="main_recurring")],
-        [InlineKeyboardButton("👁️ Preview Posts", callback_data="main_preview")],
-        [InlineKeyboardButton("📅 Calendar View", callback_data="main_calendar")],
-        [InlineKeyboardButton("⏰ Manage Overdue", callback_data="main_overdue")],
-        [InlineKeyboardButton("✏️ Edit Posts", callback_data="main_editposts")],
-        [InlineKeyboardButton("🔄 Manage Recurring", callback_data="recurring_manage_menu")],
-        [InlineKeyboardButton("🔁 Reschedule All", callback_data="main_reschedule")],
-        [InlineKeyboardButton("📺 Manage Channels", callback_data="main_channels")],
-        [InlineKeyboardButton("📊 View Statistics", callback_data="main_stats")],
-        [InlineKeyboardButton("❓ Help & Commands", callback_data="main_help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    welcome_message = f"""
-👋 *Welcome {user.first_name}!*
 
-🤖 *Channel Post Scheduler Bot*
+    message, reply_markup = build_main_menu(user)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-*🎯 Features:*
-• *Mode 1:* Bulk photo upload with auto-scheduling
-• *Mode 2:* Individual photos with custom descriptions  
-• *Multi-channel:* Post to different channels
-• *Recurring:* Set up automatic recurring posts
-• *Smart scheduling:* Kyiv timezone, custom intervals
-• *Quality preservation:* Send as documents for uncompressed media
-
-*💡 For uncompressed media:* Send images/videos as documents
-*🕐 Default Schedule:* 10 AM to 8 PM, every 2 hours (Kyiv time)
-
-Choose an option below to get started:
-"""
-    
-    await update.message.reply_text(welcome_message, reply_markup=reply_markup, parse_mode='Markdown')
-    
     # Reset user session
     Database.update_user_session(user.id, BotStates.IDLE)
 
@@ -148,7 +184,11 @@ async def mode1_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not channels:
         await update.message.reply_text(
             "❌ *No channels configured!*\n\n"
-            "Please add a channel first using /channels command before using Mode 1.",
+            "Please add a channel first before uploading.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+                [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+            ]),
             parse_mode='Markdown'
         )
         return
@@ -266,7 +306,11 @@ async def mode2_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not channels:
         await update.message.reply_text(
             "❌ *No channels configured!*\n\n"
-            "Please add a channel first using /channels command before using Mode 2.",
+            "Please add a channel first before uploading.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+                [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+            ]),
             parse_mode='Markdown'
         )
         return
@@ -295,9 +339,22 @@ async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Media handler called - User: {user.id}, Mode: {mode}")
     
+    # While waiting for a channel ID, a forwarded channel post identifies the
+    # channel directly - much easier than finding the -100... ID by hand
+    if mode == BotStates.WAITING_CHANNEL_ID:
+        forwarded_chat = None
+        origin = getattr(update.message, 'forward_origin', None)
+        if origin is not None and getattr(origin, 'chat', None) is not None:
+            forwarded_chat = origin.chat
+        elif getattr(update.message, 'forward_from_chat', None) is not None:
+            forwarded_chat = update.message.forward_from_chat
+        if forwarded_chat is not None and forwarded_chat.type == 'channel':
+            await handle_forwarded_channel(update, user, forwarded_chat, session_data)
+            return
+
     # Check if this is part of a media group (album)
     media_group_id = update.message.media_group_id
-    
+
     if media_group_id and mode == BotStates.MODE2_PHOTOS:
         logger.info(f"Processing media group {media_group_id} for user {user.id}")
         await handle_media_group(update, context, user, mode, session_data, media_group_id)
@@ -378,7 +435,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.warning(f"Invalid mode for media upload: {mode} for user {user.id}")
         if update.message:
             await update.message.reply_text(
-                "Please start with /mode1, /mode2, /mode3, recurring posts, or /multibatch first to upload media."
+                "Please pick an upload mode first - use /start and choose 'Bulk upload' or 'With captions' (or /mode1, /mode2)."
             )
         return
     
@@ -536,34 +593,46 @@ async def handle_mode1_media(update: Update, user, file_path: str, media_type: s
     session_data['media_items'] = media_items
     Database.update_user_session(user.id, BotStates.MODE1_PHOTOS, session_data)
     
-    # Format media type for display
-    media_icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type, '📁')
-    
-    # Show progress with current uploads
+    # Build a single live status message instead of one reply per file -
+    # a 30-photo upload used to produce 30 bot messages of chat noise
     media_summary = {}
     for item in media_items:
         media_type_key = item['media_type']
         media_summary[media_type_key] = media_summary.get(media_type_key, 0) + 1
-    
-    # Add quality indicator for display
-    quality_text = ""
-    if media_type in ['document_image', 'document_video']:
-        quality_text = " (uncompressed)"
-    elif media_type == 'photo':
-        quality_text = " (compressed)"
-    
-    progress_text = f"✅ {media_icon} {media_type.replace('document_', '').title()}{quality_text} uploaded! ({len(media_items)} total)\n\n"
-    progress_text += "*Current uploads:*\n"
+
+    summary_bits = []
     for media_type_key, count in media_summary.items():
-        icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(media_type_key, '📁')
-        progress_text += f"• {icon} {count} {media_type_key}{'s' if count > 1 else ''}\n"
-    
-    progress_text += "\n📤 Continue uploading more files or use /schedule when ready."
-    
-    await update.message.reply_text(
-        progress_text,
-        parse_mode='Markdown'
+        icon = {'photo': '📸', 'video': '🎥', 'audio': '🎵', 'animation': '🎬', 'document': '📄'}.get(
+            media_type_key.replace('document_image', 'document').replace('document_video', 'document'), '📁')
+        summary_bits.append(f"{icon} {count} {media_type_key.replace('document_', '')}{'s' if count > 1 else ''}")
+
+    progress_text = (
+        f"📥 *Received {len(media_items)} item{'s' if len(media_items) > 1 else ''}* "
+        f"({', '.join(summary_bits)})\n\n"
+        "Keep sending media, or:"
     )
+    reply_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Schedule now", callback_data="upload_done")],
+        [InlineKeyboardButton("👁 Preview", callback_data="main_preview"),
+         InlineKeyboardButton("🗑 Discard all", callback_data="upload_discard")],
+    ])
+
+    status_msg_id = session_data.get('upload_status_msg_id')
+    edited = False
+    if status_msg_id:
+        try:
+            await update.get_bot().edit_message_text(
+                progress_text, chat_id=update.effective_chat.id,
+                message_id=status_msg_id, reply_markup=reply_markup, parse_mode='Markdown'
+            )
+            edited = True
+        except Exception:
+            edited = False  # message deleted / too old - send a fresh one
+
+    if not edited:
+        sent = await update.message.reply_text(progress_text, reply_markup=reply_markup, parse_mode='Markdown')
+        session_data['upload_status_msg_id'] = sent.message_id
+        Database.update_user_session(user.id, BotStates.MODE1_PHOTOS, session_data)
 
 # Keep backward compatibility
 async def handle_mode2_media(update: Update, user, file_path: str, media_type: str, session_data: dict):
@@ -1247,7 +1316,7 @@ async def main_preview_handler(query, user):
     if not all_posts:
         await query.edit_message_text(
             "📭 *No posts found for preview.*\n\n"
-            "Upload some media first using Mode 1 or Mode 2, then you can preview them here.\n\n"
+            "Upload some media first using /mode1 or /mode2, then you can preview them here.\n\n"
             "Click the button below to go back to the main menu.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back to Menu", callback_data="main_menu")]]),
             parse_mode='Markdown'
@@ -1329,7 +1398,7 @@ async def handle_preview_channel_selection(query, user, channel_selection):
     if not pending_posts:
         await query.edit_message_text(
             f"📭 *No posts found for {channel_name}.*\n\n"
-            "Upload some media for this channel first using Mode 1 or Mode 2.\n\n"
+            "Upload some media for this channel first using bulk upload (/mode1) or upload with captions (/mode2).\n\n"
             "Click the button below to go back to channel selection.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Choose Another Channel", callback_data="main_preview")],
@@ -1419,7 +1488,7 @@ async def handle_preview_navigation_for_channel(query, user, channel_selection, 
     if not pending_posts:
         await query.edit_message_text(
             f"📭 *No posts found for {channel_name}.*\n\n"
-            "Upload some media for this channel first using Mode 1 or Mode 2.",
+            "Upload some media for this channel first using bulk upload (/mode1) or upload with captions (/mode2).",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Choose Another Channel", callback_data="main_preview")],
                 [InlineKeyboardButton("🏠 Back to Menu", callback_data="back_to_main")]
@@ -1576,28 +1645,37 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /schedule command"""
     user = update.effective_user
-    mode, session_data = Database.get_user_session(user.id)
-    
-    # Check if user has unscheduled photos to schedule
+
+    message, reply_markup = build_schedule_options(user)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+def build_schedule_options(user):
+    """Build the scheduling options panel: (message, reply_markup).
+
+    Shared by the /schedule command and the upload status message's
+    "Schedule now" button.
+    """
+    # Check if user has unscheduled posts to schedule
     pending_posts = Database.get_unscheduled_posts(user.id)
-    
+
     if not pending_posts:
-        await update.message.reply_text(
-            "❌ No photos to schedule. Please upload photos first using /mode1 or /mode2."
-        )
-        return
-    
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Bulk upload", callback_data="main_mode1"),
+             InlineKeyboardButton("📝 With captions", callback_data="main_mode2")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+        ])
+        return ("❌ No posts to schedule yet.\n\nUpload some media first:", keyboard)
+
     # Check if user has channels configured
     channels = Database.get_user_channels(user.id)
-    
+
     if not channels:
-        await update.message.reply_text(
-            "❌ *No channels configured!*\n\n"
-            "Please add a channel first using /channels command.",
-            parse_mode='Markdown'
-        )
-        return
-    
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+        ])
+        return ("❌ *No channels configured!*\n\nAdd a channel first:", keyboard)
+
     # Get current scheduling config
     start_hour, end_hour, interval_hours = Database.get_scheduling_config(user.id)
     
@@ -1650,8 +1728,8 @@ async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 Choose an option:
 """
-    
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+    return message, reply_markup
 
 async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard callbacks"""
@@ -1686,7 +1764,28 @@ async def _dispatch_callback(query, user, data, context):
     elif data == "schedule_recurring":
         await prompt_recurring_schedule(query, user)
     elif data == "schedule_cancel":
-        await query.edit_message_text("❌ Scheduling cancelled.")
+        await query.edit_message_text(
+            "❌ Scheduling cancelled.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]])
+        )
+    elif data.startswith("cfg_s_") or data.startswith("cfg_e_") or data.startswith("cfg_i_"):
+        # Tap-based schedule configuration picker
+        await handle_schedule_config_callback(query, user, data)
+    elif data == "upload_done":
+        # "Schedule now" button on the upload status message
+        message, reply_markup = build_schedule_options(user)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    elif data == "upload_discard":
+        # Confirm before discarding the queued uploads
+        await query.edit_message_text(
+            "🗑 *Discard all queued (unscheduled) posts?*\n\n"
+            "Scheduled posts are not affected.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, discard", callback_data="clearqueue_confirm"),
+                 InlineKeyboardButton("❌ Keep them", callback_data="clearqueue_cancel")]
+            ]),
+            parse_mode='Markdown'
+        )
     elif data == "cancel":
         # Generic cancel button used by several menus
         Database.update_user_session(user.id, BotStates.IDLE)
@@ -1838,6 +1937,9 @@ async def _dispatch_callback(query, user, data, context):
         post_id = int(parts[0])
         hours = int(parts[1])
         await handle_editposts_schedule_quick(query, user, post_id, hours, context)
+    elif data.startswith("editposts_postnext_"):
+        post_id = int(data.replace("editposts_postnext_", ""))
+        await handle_editposts_post_next(query, user, post_id, context)
     elif data.startswith("editposts_schedcustom_"):
         post_id = int(data.replace("editposts_schedcustom_", ""))
         await handle_editposts_schedule_custom(query, user, post_id)
@@ -1989,10 +2091,14 @@ async def execute_scheduling(query, user, context=None, selected_channel_id=None
             f"You'll receive notifications when each post is published."
         )
     
+    done_nav = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👁 Preview schedule", callback_data="main_preview"),
+         InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+    ])
     try:
-        await query.edit_message_text(msg, parse_mode='Markdown')
+        await query.edit_message_text(msg, reply_markup=done_nav, parse_mode='Markdown')
     except Exception:
-        await query.message.reply_text(msg, parse_mode='Markdown')
+        await query.message.reply_text(msg, reply_markup=done_nav, parse_mode='Markdown')
     
     # Clear only the posts that were just scheduled (channel-specific clearing)
     # Get the unique channels that were scheduled
@@ -2182,10 +2288,14 @@ async def execute_next_slot_scheduling(query, user, context=None):
             f"You'll receive notifications when each post is published."
         )
     
+    done_nav = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👁 Preview schedule", callback_data="main_preview"),
+         InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+    ])
     try:
-        await query.edit_message_text(msg, parse_mode='Markdown')
+        await query.edit_message_text(msg, reply_markup=done_nav, parse_mode='Markdown')
     except Exception:
-        await query.message.reply_text(msg, parse_mode='Markdown')
+        await query.message.reply_text(msg, reply_markup=done_nav, parse_mode='Markdown')
     
     # Clear only the posts that were just scheduled (channel-specific clearing)
     # Get the unique channels that were scheduled
@@ -2196,21 +2306,104 @@ async def execute_next_slot_scheduling(query, user, context=None):
     # Reset user session
     Database.update_user_session(user.id, BotStates.IDLE)
 
+def _hour_grid(hours, prefix, columns=6):
+    """Build an inline-keyboard grid of hour buttons."""
+    rows = []
+    for i in range(0, len(hours), columns):
+        rows.append([InlineKeyboardButton(f"{h:02d}", callback_data=f"{prefix}{h}")
+                     for h in hours[i:i + columns]])
+    return rows
+
 async def prompt_custom_schedule(query, user):
-    """Prompt user for custom schedule settings"""
+    """Prompt user for custom schedule settings - tap-based picker.
+
+    Typed "start end interval" input still works as a fallback.
+    """
     Database.update_user_session(user.id, BotStates.WAITING_SCHEDULE_INPUT)
-    
+
+    keyboard = _hour_grid(list(range(0, 24)), "cfg_s_")
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
     await query.edit_message_text(
-        "⚙️ *Custom Schedule Settings*\n\n"
-        "Please send your schedule in this format:\n"
-        "`start_hour end_hour interval_hours`\n\n"
-        "*Examples:*\n"
-        "• `10 20 2` - 10am to 8pm, every 2 hours\n"
-        "• `9 18 3` - 9am to 6pm, every 3 hours\n"
-        "• `8 22 1` - 8am to 10pm, every hour\n\n"
-        "*Note:* Times are in Kyiv timezone (24-hour format)",
+        "⚙️ *Schedule Settings - Step 1 of 3*\n\n"
+        "*Tap the hour of the first post of the day* (Kyiv time):\n\n"
+        "_Or type all three at once, e.g. `10 20 2` = 10:00-20:00 every 2 hours._",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
+
+async def handle_schedule_config_callback(query, user, data):
+    """Tap-based schedule config: cfg_s_{h} -> cfg_e_{h} -> cfg_i_{n}."""
+    mode, session_data = Database.get_user_session(user.id)
+
+    if data.startswith("cfg_s_"):
+        start_hour = int(data.replace("cfg_s_", ""))
+        session_data['cfg_start'] = start_hour
+        Database.update_user_session(user.id, BotStates.WAITING_SCHEDULE_INPUT, session_data)
+
+        keyboard = _hour_grid(list(range(start_hour + 1, 24)), "cfg_e_")
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="schedule_custom"),
+                         InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+        await query.edit_message_text(
+            f"⚙️ *Schedule Settings - Step 2 of 3*\n\n"
+            f"Daily window starts at *{start_hour:02d}:00*.\n"
+            f"*Tap the hour it should end:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif data.startswith("cfg_e_"):
+        end_hour = int(data.replace("cfg_e_", ""))
+        start_hour = session_data.get('cfg_start')
+        if start_hour is None or end_hour <= start_hour:
+            await query.answer("Please pick the start hour first", show_alert=True)
+            return
+        session_data['cfg_end'] = end_hour
+        Database.update_user_session(user.id, BotStates.WAITING_SCHEDULE_INPUT, session_data)
+
+        window = end_hour - start_hour
+        intervals = [i for i in (1, 2, 3, 4, 6, 8, 12) if i <= window]
+        keyboard = [[InlineKeyboardButton(f"every {i}h", callback_data=f"cfg_i_{i}")
+                     for i in intervals[j:j + 4]] for j in range(0, len(intervals), 4)]
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f"cfg_s_{start_hour}"),
+                         InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+        await query.edit_message_text(
+            f"⚙️ *Schedule Settings - Step 3 of 3*\n\n"
+            f"Daily window: *{start_hour:02d}:00 - {end_hour:02d}:00*.\n"
+            f"*Tap the posting interval:*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
+
+    elif data.startswith("cfg_i_"):
+        interval_hours = int(data.replace("cfg_i_", ""))
+        start_hour = session_data.get('cfg_start')
+        end_hour = session_data.get('cfg_end')
+        if start_hour is None or end_hour is None:
+            await query.answer("Please pick the hours first", show_alert=True)
+            return
+
+        Database.update_scheduling_config(user.id, start_hour, end_hour, interval_hours)
+        session_data.pop('cfg_start', None)
+        session_data.pop('cfg_end', None)
+        Database.update_user_session(user.id, BotStates.IDLE, session_data)
+
+        pending_posts = Database.get_unscheduled_posts(user.id)
+        preview = ""
+        keyboard = [[InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]]
+        if pending_posts:
+            schedule_times = calculate_schedule_times(start_hour, end_hour, interval_hours, len(pending_posts))
+            preview = f"\n*Preview for your {len(pending_posts)} queued posts:*\n{format_schedule_summary(schedule_times)}\n"
+            keyboard.insert(0, [InlineKeyboardButton("✅ Schedule posts now", callback_data="schedule_current")])
+
+        await query.edit_message_text(
+            f"✅ *Schedule saved!*\n\n"
+            f"*Window:* {start_hour:02d}:00 - {end_hour:02d}:00 (Kyiv)\n"
+            f"*Interval:* every {interval_hours}h\n"
+            f"{preview}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
 async def prompt_custom_date_schedule(query, user):
     """Prompt user for custom date settings"""
@@ -2527,7 +2720,7 @@ async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await update.message.reply_text(
-        f"✅ *Mode 2 Complete!*\n\n"
+        f"✅ *Upload Complete!*\n\n"
         f"You've uploaded {len(media_items)} media files with descriptions.\n"
         f"Use /schedule to set posting times.",
         parse_mode='Markdown'
@@ -2557,8 +2750,12 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "❌ *Operation Cancelled*\n\n"
-        "All pending posts have been cleared.\n"
-        "Use /mode1 or /mode2 to start again.",
+        "All pending posts have been cleared.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Bulk upload", callback_data="main_mode1"),
+             InlineKeyboardButton("📝 With captions", callback_data="main_mode2")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+        ]),
         parse_mode='Markdown'
     )
 
@@ -2568,8 +2765,8 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Create inline keyboard with options
     keyboard = [
-        [InlineKeyboardButton("📸 Mode 1 Help", callback_data="help_mode1"),
-         InlineKeyboardButton("📝 Mode 2 Help", callback_data="help_mode2")],
+        [InlineKeyboardButton("📸 Bulk Upload Help", callback_data="help_mode1"),
+         InlineKeyboardButton("📝 Upload-with-Captions Help", callback_data="help_mode2")],
         [InlineKeyboardButton("🔄 Recurring Help", callback_data="help_recurring"),
          InlineKeyboardButton("📺 Channels Help", callback_data="help_channels")],
         [InlineKeyboardButton("🔧 Management Help", callback_data="help_management"),
@@ -2584,7 +2781,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 *🎯 Quick Start:*
 1. Add a channel using 📺 Manage Channels
-2. Choose your upload mode (Mode 1, Mode 2, or Recurring)
+2. Choose your upload mode (bulk, with captions, or recurring)
 3. Upload your media files (photos, videos, audio, documents)
 4. Schedule them with flexible timing options
 
@@ -2718,56 +2915,102 @@ async def handle_channel_input(update: Update, user, text: str, session_data: di
             await update.message.reply_text("Please enter a valid channel name:")
             return
 
-        # SECURITY: verify the requesting user actually administers this channel
-        # before registering it - otherwise any user could post through the bot
-        # to any channel where the bot is admin.
-        try:
-            chat_ref = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
-            member = await update.get_bot().get_chat_member(chat_id=chat_ref, user_id=user.id)
-            if member.status not in ('administrator', 'creator'):
-                logger.warning(
-                    f"User {user.id} tried to register channel {channel_id} "
-                    f"where their status is '{member.status}'"
-                )
-                await update.message.reply_text(
-                    "❌ You must be an *administrator* of that channel to register it.\n\n"
-                    "Ask a channel admin to promote you, then try again.",
-                    parse_mode='Markdown'
-                )
-                Database.update_user_session(user.id, BotStates.IDLE)
-                return
-        except Exception as e:
-            logger.warning(f"Channel verification failed for user {user.id}, channel {channel_id}: {e}")
+        await verify_and_register_channel(update, user, channel_id, channel_name)
+
+async def handle_forwarded_channel(update: Update, user, forwarded_chat, session_data: dict):
+    """Register a channel identified by a forwarded post from it."""
+    channel_id = str(forwarded_chat.id)
+    channel_name = forwarded_chat.title or channel_id
+    await verify_and_register_channel(update, user, channel_id, channel_name)
+
+async def verify_and_register_channel(update: Update, user, channel_id: str, channel_name: str):
+    """Verify admin rights, send a self-deleting test post, then register.
+
+    Shared by the typed-ID path and the forwarded-post path. Verifying and
+    test-posting at setup time means posting problems surface immediately,
+    not at the scheduled time.
+    """
+    bot = update.get_bot()
+    chat_ref = int(channel_id) if channel_id.lstrip('-').isdigit() else channel_id
+
+    # SECURITY: verify the requesting user actually administers this channel
+    # before registering it - otherwise any user could post through the bot
+    # to any channel where the bot is admin.
+    try:
+        member = await bot.get_chat_member(chat_id=chat_ref, user_id=user.id)
+        if member.status not in ('administrator', 'creator'):
+            logger.warning(
+                f"User {user.id} tried to register channel {channel_id} "
+                f"where their status is '{member.status}'"
+            )
             await update.message.reply_text(
-                "❌ *Could not verify the channel.*\n\n"
-                "Make sure:\n"
-                "1. The channel ID is correct\n"
-                "2. This bot is added to the channel as an *admin*\n"
-                "3. You are an *admin* of the channel\n\n"
-                "Then try again with /channels.",
+                "❌ You must be an *administrator* of that channel to register it.\n\n"
+                "Ask a channel admin to promote you, then try again.",
                 parse_mode='Markdown'
             )
             Database.update_user_session(user.id, BotStates.IDLE)
             return
-
-        # Add the channel
-        success = Database.add_user_channel(user.id, channel_id, channel_name, False)
-        
-        if success:
-            await update.message.reply_text(
-                f"✅ *Channel Added Successfully!*\n\n"
-                f"*Name:* {channel_name}\n"
-                f"*ID:* {channel_id}\n\n"
-                f"You can now use this channel for posting. Use /channels to manage your channels.",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.message.reply_text(
-                "❌ Failed to add channel. It might already exist or there was an error."
-            )
-        
-        # Reset session
+    except Exception as e:
+        logger.warning(f"Channel verification failed for user {user.id}, channel {channel_id}: {e}")
+        await update.message.reply_text(
+            "❌ *Could not verify the channel.*\n\n"
+            "Make sure:\n"
+            "1. The channel ID is correct\n"
+            "2. This bot is added to the channel as an *admin*\n"
+            "3. You are an *admin* of the channel\n\n"
+            "Then try again with /channels.",
+            parse_mode='Markdown'
+        )
         Database.update_user_session(user.id, BotStates.IDLE)
+        return
+
+    # Confirm the bot can actually post: send a test message and delete it
+    posting_ok = True
+    try:
+        test_msg = await bot.send_message(chat_id=chat_ref, text="✅ Scheduler bot connected (test - auto-deleted)")
+        try:
+            await bot.delete_message(chat_id=chat_ref, message_id=test_msg.message_id)
+        except Exception:
+            pass  # posting worked; failing to delete is cosmetic
+    except Exception as e:
+        posting_ok = False
+        logger.warning(f"Test post to channel {channel_id} failed: {e}")
+
+    # Add the channel
+    success = Database.add_user_channel(user.id, channel_id, channel_name, False)
+
+    nav = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Start uploading", callback_data="main_mode1"),
+         InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+    ])
+
+    if success and posting_ok:
+        await update.message.reply_text(
+            f"✅ *Channel Added Successfully!*\n\n"
+            f"*Name:* {escape_markdown(channel_name)}\n"
+            f"*ID:* `{channel_id}`\n\n"
+            f"Test post confirmed - I can publish to this channel. 🎉",
+            reply_markup=nav,
+            parse_mode='Markdown'
+        )
+    elif success:
+        await update.message.reply_text(
+            f"⚠️ *Channel added, but the test post failed.*\n\n"
+            f"*Name:* {escape_markdown(channel_name)}\n"
+            f"*ID:* `{channel_id}`\n\n"
+            f"I verified you're an admin, but I couldn't post to the channel myself. "
+            f"Give me the *Post messages* permission in the channel's admin settings, "
+            f"otherwise scheduled posts will fail.",
+            reply_markup=nav,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Failed to add channel. It might already exist or there was an error."
+        )
+
+    # Reset session
+    Database.update_user_session(user.id, BotStates.IDLE)
 
 async def handle_channel_callback(query, user, data):
     """Handle channel management callbacks"""
@@ -2777,13 +3020,16 @@ async def handle_channel_callback(query, user, data):
         Database.update_user_session(user.id, BotStates.WAITING_CHANNEL_ID)
         await query.edit_message_text(
             "📺 *Add New Channel*\n\n"
-            "Please send the channel ID or username:\n\n"
-            "*Format:*\n"
-            "• @channelname (for public channels)\n"
-            "• -1001234567890 (for private channels/groups)\n\n"
-            "*Important:* Make sure:\n"
+            "*Easiest way:* forward me any post from your channel - "
+            "I'll detect it automatically. 📩\n\n"
+            "Or send the channel ID:\n"
+            "• `@channelname` (public channels)\n"
+            "• `-1001234567890` (private channels)\n\n"
+            "*Before that, make sure:*\n"
             "1. You are an admin of the channel\n"
-            "2. Your bot is added as an admin with posting permissions",
+            "2. This bot is added as an admin with posting permission\n\n"
+            "I'll verify both and send a self-deleting test post.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]),
             parse_mode='Markdown'
         )
         
@@ -3099,26 +3345,32 @@ async def handle_clearqueue_callback(query, user, data):
     """Handle clearqueue confirmation callbacks"""
     action = data.replace("clearqueue_", "")
     
+    nav = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload more", callback_data="main_mode1"),
+         InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+    ])
+
     if action == "confirm":
         # Clear all queued posts
         cleared_count = Database.clear_queued_posts(user.id)
-        
+
         if cleared_count > 0:
             await query.edit_message_text(
                 f"✅ *Queue Cleared Successfully!*\n\n"
-                f"Removed *{cleared_count} photos* from your queue.\n\n"
-                f"You can now upload new photos and schedule them.",
+                f"Removed *{cleared_count} posts* from your queue.",
+                reply_markup=nav,
                 parse_mode='Markdown'
             )
         else:
             await query.edit_message_text(
-                "📭 *No photos to clear.*\n\n"
+                "📭 *No posts to clear.*\n\n"
                 "Your queue was already empty.",
+                reply_markup=nav,
                 parse_mode='Markdown'
             )
-    
+
     elif action == "cancel":
-        await query.edit_message_text("❌ Queue clearing cancelled.")
+        await query.edit_message_text("❌ Queue clearing cancelled.", reply_markup=nav)
 
 async def handle_main_menu_callback(query, user, data):
     """Handle main menu button callbacks"""
@@ -3138,7 +3390,11 @@ async def handle_main_menu_callback(query, user, data):
         if not channels:
             await query.edit_message_text(
                 "❌ *No channels configured!*\n\n"
-                "Please add a channel first using /channels command before using Mode 1.",
+                "Please add a channel first before uploading.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+                    [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+                ]),
                 parse_mode='Markdown'
             )
             return
@@ -3153,7 +3409,11 @@ async def handle_main_menu_callback(query, user, data):
         if not channels:
             await query.edit_message_text(
                 "❌ *No channels configured!*\n\n"
-                "Please add a channel first using /channels command before using Mode 2.",
+                "Please add a channel first before uploading.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+                    [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+                ]),
                 parse_mode='Markdown'
             )
             return
@@ -3168,7 +3428,11 @@ async def handle_main_menu_callback(query, user, data):
         if not channels:
             await query.edit_message_text(
                 "❌ *No channels configured!*\n\n"
-                "Please add a channel first using /channels command before using Mode 3.",
+                "Please add a channel first before uploading.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add a channel", callback_data="channels_add")],
+                    [InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]
+                ]),
                 parse_mode='Markdown'
             )
             return
@@ -3211,6 +3475,19 @@ async def handle_main_menu_callback(query, user, data):
     elif action == "editposts":
         # Show edit posts menu
         await show_editposts_menu(query, user)
+
+    elif action == "multibatch":
+        # Multi-channel batch scheduler
+        await show_multibatch_menu(query, user)
+
+    elif action == "retry":
+        # Failed posts recovery (dashboard alert button / digest link)
+        message, reply_markup = build_retry_menu(user)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+    elif action == "settings":
+        message, reply_markup = build_settings_view(user)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def channels_handler_inline(query, user):
     """Handle inline channels management"""
@@ -3438,7 +3715,7 @@ async def stats_channel_details_handler(query, user, channel_id):
     # Add individual post management buttons for Mode 2 posts
     mode2_posts = [p for p in scheduled_posts if p['mode'] == 2]
     if mode2_posts:
-        keyboard.append([InlineKeyboardButton("✏️ Edit Mode 2 Posts", callback_data=f"edit_mode2_{channel_id}")])
+        keyboard.append([InlineKeyboardButton("✏️ Edit Captioned Posts", callback_data=f"edit_mode2_{channel_id}")])
     
     keyboard.extend([
         [InlineKeyboardButton("🔙 Back to Channels", callback_data="stats_channels")],
@@ -3481,7 +3758,7 @@ async def edit_mode2_posts_handler(query, user, channel_id):
             reply_markup = InlineKeyboardMarkup(keyboard)
             
             await query.edit_message_text(
-                f"*✏️ Edit Mode 2 Posts - {channel['channel_name']}*\n\n"
+                f"*✏️ Edit Captioned Posts - {channel['channel_name']}*\n\n"
                 "No Mode 2 scheduled posts found for editing.",
                 reply_markup=reply_markup,
                 parse_mode='Markdown'
@@ -3489,7 +3766,7 @@ async def edit_mode2_posts_handler(query, user, channel_id):
             return
         
         # Build post list with edit buttons
-        message = f"*✏️ Edit Mode 2 Posts - {channel['channel_name']}*\n\n"
+        message = f"*✏️ Edit Captioned Posts - {channel['channel_name']}*\n\n"
         message += f"Select a post to edit its schedule:\n\n"
         
         keyboard = []
@@ -3827,8 +4104,8 @@ async def handle_individual_post_description_edit(update: Update, user, text: st
 async def help_handler_inline(query, user):
     """Handle inline help display"""
     keyboard = [
-        [InlineKeyboardButton("📸 Mode 1 Help", callback_data="help_mode1")],
-        [InlineKeyboardButton("📝 Mode 2 Help", callback_data="help_mode2")],
+        [InlineKeyboardButton("📸 Bulk Upload Help", callback_data="help_mode1")],
+        [InlineKeyboardButton("📝 Upload-with-Captions Help", callback_data="help_mode2")],
         [InlineKeyboardButton("📺 Channels Help", callback_data="help_channels")],
         [InlineKeyboardButton("🔄 Recurring Help", callback_data="help_recurring")],
         [InlineKeyboardButton("📅 View Scheduled Posts", callback_data="help_scheduled_posts")],
@@ -3862,43 +4139,9 @@ Choose a topic for detailed help:
     await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def show_main_menu(query, user):
-    """Show the main menu"""
-    keyboard = [
-        [InlineKeyboardButton("📸 Mode 1: Bulk Upload", callback_data="main_mode1")],
-        [InlineKeyboardButton("📝 Mode 2: Individual Upload", callback_data="main_mode2")],
-        [InlineKeyboardButton("🎯 Mode 3: Guided Captioning", callback_data="main_mode3")],
-        [InlineKeyboardButton("🔄 Recurring Posts", callback_data="main_recurring")],
-        [InlineKeyboardButton("👁️ Preview Posts", callback_data="main_preview")],
-        [InlineKeyboardButton("📅 Calendar View", callback_data="main_calendar")],
-        [InlineKeyboardButton("⏰ Manage Overdue", callback_data="main_overdue")],
-        [InlineKeyboardButton("✏️ Edit Posts", callback_data="main_editposts")],
-        [InlineKeyboardButton("🔄 Manage Recurring", callback_data="recurring_manage_menu")],
-        [InlineKeyboardButton("🔁 Reschedule All", callback_data="main_reschedule")],
-        [InlineKeyboardButton("📺 Manage Channels", callback_data="main_channels")],
-        [InlineKeyboardButton("📊 View Statistics", callback_data="main_stats")],
-        [InlineKeyboardButton("❓ Help & Commands", callback_data="main_help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    message = f"""
-👋 *Welcome back {user.first_name}!*
+    """Show the main menu (live dashboard)"""
+    message, reply_markup = build_main_menu(user)
 
-🤖 *Channel Post Scheduler Bot*
-
-*🎯 Features:*
-• *Mode 1:* Bulk photo upload with auto-scheduling
-• *Mode 2:* Individual photos with custom descriptions  
-• *Multi-channel:* Post to different channels
-• *Recurring:* Set up automatic recurring posts
-• *Smart scheduling:* Kyiv timezone, custom intervals
-• *Quality preservation:* Send as documents for uncompressed media
-
-*💡 For uncompressed media:* Send images/videos as documents
-*🕐 Default Schedule:* 10 AM to 8 PM, every 2 hours (Kyiv time)
-
-Choose an option below:
-"""
-    
     try:
         await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
         logger.info(f"Main menu successfully displayed for user {user.id}")
@@ -3980,7 +4223,7 @@ async def help_channel_posts_handler(query, user, channel_id):
 
 ❌ No scheduled posts for this channel.
 
-Use Mode 1 or Mode 2 to upload and schedule content.
+Use /mode1 or /mode2 to upload and schedule content.
 """
         await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
         return
@@ -4259,7 +4502,7 @@ async def handle_help_callback(query, user, data):
     
     if topic == "mode1":
         message = """
-📸 **Mode 1: Bulk Photo Upload Help**
+📸 **Bulk Upload Help**
 
 **Perfect for:** Multiple photos without descriptions
 
@@ -4284,7 +4527,7 @@ async def handle_help_callback(query, user, data):
         
     elif topic == "mode2":
         message = """
-📝 **Mode 2: Individual Photo Upload Help**
+📝 **Upload with Captions Help**
 
 **Perfect for:** Photos with custom descriptions
 
@@ -4482,6 +4725,9 @@ async def handle_recurring_callback(query, user, data, context=None):
         return
     elif action == "start_custom":
         await handle_recurring_start_choice(query, user, "custom", context)
+        return
+    elif action in ("start_in1h", "start_today18", "start_tomorrow10"):
+        await handle_recurring_start_choice(query, user, action.replace("start_", ""), context)
         return
     
     # Handle recurring post schedule options (new format with post_id)
@@ -5291,7 +5537,10 @@ async def show_recurring_start_time_options(query, user, config: dict):
     
     keyboard = [
         [InlineKeyboardButton("🚀 Start Now (in 1 minute)", callback_data="recurring_start_now")],
-        [InlineKeyboardButton("📅 Custom Date & Time", callback_data="recurring_start_custom")],
+        [InlineKeyboardButton("⏱ In 1 hour", callback_data="recurring_start_in1h"),
+         InlineKeyboardButton("🌆 Today 18:00", callback_data="recurring_start_today18")],
+        [InlineKeyboardButton("🌅 Tomorrow 10:00", callback_data="recurring_start_tomorrow10"),
+         InlineKeyboardButton("📅 Custom...", callback_data="recurring_start_custom")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -5348,7 +5597,10 @@ async def show_recurring_start_time_options_from_message(update: Update, user, c
     
     keyboard = [
         [InlineKeyboardButton("🚀 Start Now (in 1 minute)", callback_data="recurring_start_now")],
-        [InlineKeyboardButton("📅 Custom Date & Time", callback_data="recurring_start_custom")],
+        [InlineKeyboardButton("⏱ In 1 hour", callback_data="recurring_start_in1h"),
+         InlineKeyboardButton("🌆 Today 18:00", callback_data="recurring_start_today18")],
+        [InlineKeyboardButton("🌅 Tomorrow 10:00", callback_data="recurring_start_tomorrow10"),
+         InlineKeyboardButton("📅 Custom...", callback_data="recurring_start_custom")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -5381,7 +5633,20 @@ async def handle_recurring_start_choice(query, user, start_type: str, context=No
         # Start in 1 minute
         first_post_time = get_current_kyiv_time() + timedelta(minutes=1)
         await finalize_recurring_post(query, user, session_data, recurring_config, first_post_time, context)
-    
+
+    elif start_type in ("in1h", "today18", "tomorrow10"):
+        # Quick presets - no typing needed
+        now = get_current_kyiv_time()
+        if start_type == "in1h":
+            first_post_time = now + timedelta(hours=1)
+        elif start_type == "today18":
+            first_post_time = now.replace(hour=18, minute=0, second=0, microsecond=0)
+            if first_post_time <= now:
+                first_post_time += timedelta(days=1)
+        else:  # tomorrow10
+            first_post_time = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        await finalize_recurring_post(query, user, session_data, recurring_config, first_post_time, context)
+
     elif start_type == "custom":
         # Ask for custom datetime input
         current_time = get_current_kyiv_time()
@@ -6136,7 +6401,7 @@ async def multibatch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 Create separate batches of posts for different channels! This lets you:
 • Upload photos for multiple channels at once
 • Schedule each batch independently
-• Mix Mode 1 (bulk) and Mode 2 (with descriptions)
+• Mix bulk uploads and uploads with captions
 
 *Available Channels:* {len(channels)}{batch_summary}
 
@@ -6175,47 +6440,50 @@ async def handle_batch_callback(query, user, data, context=None):
         channel_id = data.replace("batch_channel_", "")
         await create_batch_for_channel(query, user, channel_id)
     elif data == "batch_back":
-        # Show main batch menu again
-        channels = Database.get_user_channels(user.id)
-        batches = Database.get_user_batches(user.id)
-        
-        keyboard = [
-            [InlineKeyboardButton("📦 Create New Batch", callback_data="batch_create")],
-            [InlineKeyboardButton("📋 View My Batches", callback_data="batch_list")],
-            [InlineKeyboardButton("📅 Schedule All Batches", callback_data="batch_schedule_all")],
-            [InlineKeyboardButton("🗑️ Clear All Batches", callback_data="batch_clear_all")],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        batch_summary = ""
-        if batches:
-            batch_summary = f"\n\n*Current Batches:* {len(batches)}"
-            for batch in batches[:3]:
-                batch_summary += f"\n• {escape_markdown(batch['batch_name'])} → {escape_markdown(batch['channel_name'])} ({batch['post_count']} posts)"
-            if len(batches) > 3:
-                batch_summary += f"\n• ... and {len(batches) - 3} more"
-        
-        message = f"""
-🔥 *Multi-Channel Batch Scheduler*
-
-Create separate batches of posts for different channels! This lets you:
-• Upload photos for multiple channels at once
-• Schedule each batch independently
-• Mix Mode 1 (bulk) and Mode 2 (with descriptions)
-
-*Available Channels:* {len(channels)}{batch_summary}
-
-Choose an option:
-"""
-        
-        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        await show_multibatch_menu(query, user)
     elif data.startswith("batch_clear_confirmed"):
         # Clear all batches
         batches = Database.get_user_batches(user.id)
         for batch in batches:
             Database.delete_batch(batch['id'], user.id)
         await query.edit_message_text("✅ All batches cleared successfully!")
+
+async def show_multibatch_menu(query, user):
+    """Show the multi-channel batch menu (shared by /multibatch inline paths)"""
+    channels = Database.get_user_channels(user.id)
+    batches = Database.get_user_batches(user.id)
+
+    keyboard = [
+        [InlineKeyboardButton("📦 Create New Batch", callback_data="batch_create")],
+        [InlineKeyboardButton("📋 View My Batches", callback_data="batch_list")],
+        [InlineKeyboardButton("📅 Schedule All Batches", callback_data="batch_schedule_all")],
+        [InlineKeyboardButton("🗑️ Clear All Batches", callback_data="batch_clear_all")],
+        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    batch_summary = ""
+    if batches:
+        batch_summary = f"\n\n*Current Batches:* {len(batches)}"
+        for batch in batches[:3]:
+            batch_summary += f"\n• {escape_markdown(batch['batch_name'])} → {escape_markdown(batch['channel_name'])} ({batch['post_count']} posts)"
+        if len(batches) > 3:
+            batch_summary += f"\n• ... and {len(batches) - 3} more"
+
+    message = f"""
+🔥 *Multi-Channel Batch Scheduler*
+
+Create separate batches of posts for different channels! This lets you:
+• Upload photos for multiple channels at once
+• Schedule each batch independently
+• Mix bulk uploads and uploads with captions
+
+*Available Channels:* {len(channels)}{batch_summary}
+
+Choose an option:
+"""
+
+    await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def handle_batch_mode_callback(query, user, data):
     """Handle batch mode selection callbacks"""
@@ -6334,7 +6602,7 @@ async def start_batch_mode1(query, user, batch_id):
     })
     
     await query.edit_message_text(
-        "*📸 Batch Mode 1: Bulk Upload*\n\n"
+        "*📸 Batch Bulk Upload*\n\n"
         "Send me all the photos/media you want for this batch:\n"
         "• Upload one by one or as albums\n"
         "• All types supported (photos, videos, etc.)\n"
@@ -6353,7 +6621,7 @@ async def start_batch_mode2(query, user, batch_id):
     })
     
     await query.edit_message_text(
-        "*📝 Batch Mode 2: With Descriptions*\n\n"
+        "*📝 Batch Batch Upload with Captions*\n\n"
         "Upload media one by one with descriptions:\n"
         "1. Send a photo/video/document\n"
         "2. I'll ask for a description\n"
@@ -7363,7 +7631,7 @@ async def handle_mode_channel_selection(query, user, mode, channel_id):
                 'selected_channel_id': selected_channel['channel_id']
             })
             
-            message = f"""📸 *Mode 1: Bulk Photo Upload*
+            message = f"""📸 *Bulk Upload*
 
 *Target Channel:* {selected_channel['channel_name']} ({selected_channel['channel_id']})
 
@@ -7385,7 +7653,7 @@ Use /cancel to abort this mode.
                 'selected_channel_id': selected_channel['channel_id']
             })
             
-            message = f"""📝 *Mode 2: Individual Photo Upload*
+            message = f"""📝 *Upload with Captions*
 
 *Target Channel:* {selected_channel['channel_name']} ({selected_channel['channel_id']})
 
@@ -7566,19 +7834,26 @@ async def handle_clearscheduled_callback(query, user, data, context=None):
 async def retry_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /retry command to retry failed posts"""
     user = update.effective_user
-    
-    # Get all failed posts for the user
+
+    message, reply_markup = build_retry_menu(user)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+def build_retry_menu(user):
+    """Build the failed-posts recovery menu: (message, reply_markup).
+
+    Shared by the /retry command, the dashboard alert button, and the digest.
+    """
     failed_posts = Database.get_failed_posts(user.id)
-    
+
     if not failed_posts:
-        await update.message.reply_text(
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="back_to_main")]])
+        return (
             "✅ **No Failed Posts**\n\n"
             "You don't have any failed posts to retry.\n"
             "All your posts were published successfully!",
-            parse_mode='Markdown'
+            keyboard
         )
-        return
-    
+
     # Group failed posts by channel for better organization
     posts_by_channel = {}
     channels = Database.get_user_channels(user.id)
@@ -7651,8 +7926,8 @@ Found **{total_failed}** failed posts across channels:
 
 Choose an option below:
 """
-    
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+
+    return message, reply_markup
 
 async def handle_retry_callback(query, user, data):
     """Handle retry-related callback queries"""
@@ -8008,9 +8283,9 @@ async def bulkedit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Mode breakdown
     info_text += "\n*📱 By Upload Mode:*\n"
     if posts_by_mode["mode1"]:
-        info_text += f"• 📸 Mode 1 (Bulk): {len(posts_by_mode['mode1'])} posts\n"
+        info_text += f"• 📸 Bulk uploads: {len(posts_by_mode['mode1'])} posts\n"
     if posts_by_mode["mode2"]:
-        info_text += f"• 📝 Mode 2 (Custom): {len(posts_by_mode['mode2'])} posts\n"
+        info_text += f"• 📝 With captions: {len(posts_by_mode['mode2'])} posts\n"
     if posts_by_mode["recurring"]:
         info_text += f"• 🔄 Recurring: {len(posts_by_mode['recurring'])} posts\n"
     if posts_by_mode["multibatch"]:
@@ -8140,9 +8415,9 @@ async def handle_bulk_edit_callback(query, user, data):
         
         info_text += "\n*📱 By Upload Mode:*\n"
         if posts_by_mode["mode1"]:
-            info_text += f"• 📸 Mode 1 (Bulk): {len(posts_by_mode['mode1'])} posts\n"
+            info_text += f"• 📸 Bulk uploads: {len(posts_by_mode['mode1'])} posts\n"
         if posts_by_mode["mode2"]:
-            info_text += f"• 📝 Mode 2 (Custom): {len(posts_by_mode['mode2'])} posts\n"
+            info_text += f"• 📝 With captions: {len(posts_by_mode['mode2'])} posts\n"
         if posts_by_mode["recurring"]:
             info_text += f"• 🔄 Recurring: {len(posts_by_mode['recurring'])} posts\n"
         if posts_by_mode["multibatch"]:
@@ -9704,34 +9979,42 @@ No pending posts were found to reschedule.
         )
 
 
-async def settings_handler(update, context):
-    """Handle /settings command for reminder configuration"""
-    user = update.effective_user
-    
-    # Get current settings
+NOTIFY_MODE_LABELS = {
+    'all': '📣 Every post',
+    'digest': '📮 Daily digest',
+    'errors': '🔕 Errors only',
+}
+
+def build_settings_view(user):
+    """Build the settings panel: (message, reply_markup).
+
+    Single renderer shared by /settings and every settings button, so the
+    panel always looks the same after any change.
+    """
     enabled, threshold, last_sent = Database.get_reminder_settings(user.id)
-    
-    # Create inline keyboard for settings
+    notify_mode = Database.get_notify_mode(user.id)
+
     keyboard = [
-        [
-            InlineKeyboardButton(
-                f"🔔 Reminders: {'ON' if enabled else 'OFF'}", 
-                callback_data=f"settings_toggle_reminder"
-            )
-        ],
+        [InlineKeyboardButton(
+            f"🔔 Reminders: {'ON' if enabled else 'OFF'}",
+            callback_data="settings_toggle_reminder"
+        )],
         [
             InlineKeyboardButton("➖", callback_data="settings_threshold_dec"),
             InlineKeyboardButton(f"Threshold: {threshold} posts", callback_data="settings_threshold_info"),
             InlineKeyboardButton("➕", callback_data="settings_threshold_inc")
         ],
+        [InlineKeyboardButton(
+            f"Notifications: {NOTIFY_MODE_LABELS[notify_mode]}",
+            callback_data="settings_notify_cycle"
+        )],
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     # Format last reminder time
     last_reminder_text = "Never"
     if last_sent:
-        from datetime import datetime
         time_since = get_current_kyiv_time() - last_sent
         hours_ago = int(time_since.total_seconds() / 3600)
         if hours_ago < 1:
@@ -9739,206 +10022,68 @@ async def settings_handler(update, context):
         elif hours_ago < 24:
             last_reminder_text = f"{hours_ago} hours ago"
         else:
-            days_ago = hours_ago // 24
-            last_reminder_text = f"{days_ago} days ago"
-    
+            last_reminder_text = f"{hours_ago // 24} days ago"
+
+    notify_help = {
+        'all': "you get a message for every published post",
+        'digest': "you get one summary per day at 9:00 (failures still alert immediately)",
+        'errors': "you are only notified when something fails",
+    }[notify_mode]
+
     message = f"""
-⚙️ *Reminder Settings*
+⚙️ *Settings*
 
-*Current Configuration:*
+*Low-queue reminders:*
 • *Reminders:* {'Enabled ✅' if enabled else 'Disabled ❌'}
-• *Alert Threshold:* {threshold} posts
-• *Last Reminder:* {last_reminder_text}
+• *Alert threshold:* {threshold} posts
+• *Last reminder:* {last_reminder_text}
 
-*How it works:*
-When your unscheduled posts drop to or below {threshold}, you'll receive a reminder notification.
+When your unscheduled posts drop to or below {threshold}, you'll get a reminder (checked hourly, max once per day).
 
-Reminders are checked hourly and sent maximum once per day.
+*Notifications:* {NOTIFY_MODE_LABELS[notify_mode]}
+Right now {notify_help}.
 
-Use the buttons below to adjust your settings:
+Tap a button to change a setting:
 """
-    
+    return message, reply_markup
+
+async def settings_handler(update, context):
+    """Handle /settings command"""
+    user = update.effective_user
+    message, reply_markup = build_settings_view(user)
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
 
-
 async def handle_settings_callback(query, user, data):
-    """Handle settings callback interactions"""
+    """Handle settings button presses: apply the change, re-render the panel."""
     action = data.replace("settings_", "")
-    
+
     if action == "toggle_reminder":
-        # Toggle reminder status
-        enabled, threshold, _ = Database.get_reminder_settings(user.id)
-        new_enabled = not enabled
-        Database.update_reminder_settings(user.id, enabled=new_enabled)
-        
-        # Update the message
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"🔔 Reminders: {'ON' if new_enabled else 'OFF'}", 
-                    callback_data=f"settings_toggle_reminder"
-                )
-            ],
-            [
-                InlineKeyboardButton("➖", callback_data="settings_threshold_dec"),
-                InlineKeyboardButton(f"Threshold: {threshold} posts", callback_data="settings_threshold_info"),
-                InlineKeyboardButton("➕", callback_data="settings_threshold_inc")
-            ],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Format last reminder time
-        _, _, last_sent = Database.get_reminder_settings(user.id)
-        last_reminder_text = "Never"
-        if last_sent:
-            from datetime import datetime
-            time_since = get_current_kyiv_time() - last_sent
-            hours_ago = int(time_since.total_seconds() / 3600)
-            if hours_ago < 1:
-                last_reminder_text = "Less than 1 hour ago"
-            elif hours_ago < 24:
-                last_reminder_text = f"{hours_ago} hours ago"
-            else:
-                days_ago = hours_ago // 24
-                last_reminder_text = f"{days_ago} days ago"
-        
-        message = f"""
-⚙️ *Reminder Settings*
-
-*Current Configuration:*
-• *Reminders:* {'Enabled ✅' if new_enabled else 'Disabled ❌'}
-• *Alert Threshold:* {threshold} posts
-• *Last Reminder:* {last_reminder_text}
-
-*How it works:*
-When your unscheduled posts drop to or below {threshold}, you'll receive a reminder notification.
-
-Reminders are checked hourly and sent maximum once per day.
-
-Use the buttons below to adjust your settings:
-"""
-        
-        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-        
+        enabled, _threshold, _ = Database.get_reminder_settings(user.id)
+        Database.update_reminder_settings(user.id, enabled=not enabled)
     elif action == "threshold_inc":
-        # Increase threshold
-        enabled, threshold, _ = Database.get_reminder_settings(user.id)
-        new_threshold = min(threshold + 1, 50)  # Max 50
-        Database.update_reminder_settings(user.id, threshold=new_threshold)
-        
-        # Update the message
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"🔔 Reminders: {'ON' if enabled else 'OFF'}", 
-                    callback_data=f"settings_toggle_reminder"
-                )
-            ],
-            [
-                InlineKeyboardButton("➖", callback_data="settings_threshold_dec"),
-                InlineKeyboardButton(f"Threshold: {new_threshold} posts", callback_data="settings_threshold_info"),
-                InlineKeyboardButton("➕", callback_data="settings_threshold_inc")
-            ],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Format last reminder time
-        _, _, last_sent = Database.get_reminder_settings(user.id)
-        last_reminder_text = "Never"
-        if last_sent:
-            from datetime import datetime
-            time_since = get_current_kyiv_time() - last_sent
-            hours_ago = int(time_since.total_seconds() / 3600)
-            if hours_ago < 1:
-                last_reminder_text = "Less than 1 hour ago"
-            elif hours_ago < 24:
-                last_reminder_text = f"{hours_ago} hours ago"
-            else:
-                days_ago = hours_ago // 24
-                last_reminder_text = f"{days_ago} days ago"
-        
-        message = f"""
-⚙️ *Reminder Settings*
-
-*Current Configuration:*
-• *Reminders:* {'Enabled ✅' if enabled else 'Disabled ❌'}
-• *Alert Threshold:* {new_threshold} posts
-• *Last Reminder:* {last_reminder_text}
-
-*How it works:*
-When your unscheduled posts drop to or below {new_threshold}, you'll receive a reminder notification.
-
-Reminders are checked hourly and sent maximum once per day.
-
-Use the buttons below to adjust your settings:
-"""
-        
-        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-        
+        _enabled, threshold, _ = Database.get_reminder_settings(user.id)
+        Database.update_reminder_settings(user.id, threshold=min(threshold + 1, 50))
     elif action == "threshold_dec":
-        # Decrease threshold
-        enabled, threshold, _ = Database.get_reminder_settings(user.id)
-        new_threshold = max(threshold - 1, 1)  # Min 1
-        Database.update_reminder_settings(user.id, threshold=new_threshold)
-        
-        # Update the message
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    f"🔔 Reminders: {'ON' if enabled else 'OFF'}", 
-                    callback_data=f"settings_toggle_reminder"
-                )
-            ],
-            [
-                InlineKeyboardButton("➖", callback_data="settings_threshold_dec"),
-                InlineKeyboardButton(f"Threshold: {new_threshold} posts", callback_data="settings_threshold_info"),
-                InlineKeyboardButton("➕", callback_data="settings_threshold_inc")
-            ],
-            [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Format last reminder time
-        _, _, last_sent = Database.get_reminder_settings(user.id)
-        last_reminder_text = "Never"
-        if last_sent:
-            from datetime import datetime
-            time_since = get_current_kyiv_time() - last_sent
-            hours_ago = int(time_since.total_seconds() / 3600)
-            if hours_ago < 1:
-                last_reminder_text = "Less than 1 hour ago"
-            elif hours_ago < 24:
-                last_reminder_text = f"{hours_ago} hours ago"
-            else:
-                days_ago = hours_ago // 24
-                last_reminder_text = f"{days_ago} days ago"
-        
-        message = f"""
-⚙️ *Reminder Settings*
-
-*Current Configuration:*
-• *Reminders:* {'Enabled ✅' if enabled else 'Disabled ❌'}
-• *Alert Threshold:* {new_threshold} posts
-• *Last Reminder:* {last_reminder_text}
-
-*How it works:*
-When your unscheduled posts drop to or below {new_threshold}, you'll receive a reminder notification.
-
-Reminders are checked hourly and sent maximum once per day.
-
-Use the buttons below to adjust your settings:
-"""
-        
-        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-        
+        _enabled, threshold, _ = Database.get_reminder_settings(user.id)
+        Database.update_reminder_settings(user.id, threshold=max(threshold - 1, 1))
+    elif action == "notify_cycle":
+        order = ['all', 'digest', 'errors']
+        current = Database.get_notify_mode(user.id)
+        Database.set_notify_mode(user.id, order[(order.index(current) + 1) % len(order)])
     elif action == "threshold_info":
-        # Just show info, no change
-        await query.answer("Threshold determines when you receive low post alerts", show_alert=True)
+        await query.answer("Reminder fires when unscheduled posts drop to this number")
+        return
+    else:
+        logger.warning(f"Unknown settings action: {action}")
+        return
 
-
-# ============== COMPREHENSIVE POST EDITING MENU ==============
+    message, reply_markup = build_settings_view(user)
+    try:
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    except Exception as e:
+        # "message is not modified" is harmless; anything else should log
+        if 'not modified' not in str(e).lower():
+            raise
 
 async def editposts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /editposts command - show comprehensive edit menu for Mode 2 posts"""
@@ -9977,7 +10122,7 @@ async def editposts_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "✏️ *Edit Scheduled Posts*\n\n"
-        "Select a channel to edit its scheduled Mode 2 posts:\n\n"
+        "Select a channel to edit its scheduled captioned posts:\n\n"
         "*Features:*\n"
         "• Edit captions (with formatting preserved)\n"
         "• Replace media files\n"
@@ -10081,12 +10226,13 @@ async def show_edit_post_details(query, user, post, current_index, total_posts, 
             keyboard.append(nav_row)
         
         # Edit options
-        keyboard.append([InlineKeyboardButton("👁️ Preview Media", callback_data=f"editposts_preview_{post_id}")])
-        keyboard.append([InlineKeyboardButton("📝 Edit Caption", callback_data=f"editposts_caption_{post_id}")])
-        keyboard.append([InlineKeyboardButton("🖼️ Replace Media", callback_data=f"editposts_media_{post_id}")])
-        keyboard.append([InlineKeyboardButton("⏰ Reschedule", callback_data=f"editposts_schedule_{post_id}")])
-        keyboard.append([InlineKeyboardButton("🗑️ Delete Post", callback_data=f"editposts_delete_{post_id}")])
-        keyboard.append([InlineKeyboardButton("🔙 Back to Channels", callback_data="editposts_menu")])
+        keyboard.append([InlineKeyboardButton("👁️ Preview Media", callback_data=f"editposts_preview_{post_id}"),
+                         InlineKeyboardButton("📝 Edit Caption", callback_data=f"editposts_caption_{post_id}")])
+        keyboard.append([InlineKeyboardButton("🖼️ Replace Media", callback_data=f"editposts_media_{post_id}"),
+                         InlineKeyboardButton("⏰ Reschedule", callback_data=f"editposts_schedule_{post_id}")])
+        keyboard.append([InlineKeyboardButton("📌 Post next (in 1 min)", callback_data=f"editposts_postnext_{post_id}")])
+        keyboard.append([InlineKeyboardButton("🗑️ Delete Post", callback_data=f"editposts_delete_{post_id}"),
+                         InlineKeyboardButton("🔙 Back", callback_data="editposts_menu")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
@@ -10291,6 +10437,44 @@ async def handle_editposts_schedule(query, user, post_id):
         logger.error(f"Error in handle_editposts_schedule: {e}", exc_info=True)
         await query.edit_message_text(f"❌ Error: {e}")
 
+
+async def handle_editposts_post_next(query, user, post_id, context):
+    """'Post next' button: publish this post about a minute from now."""
+    try:
+        post = Database.get_post_by_id(post_id)
+
+        if not post or post['user_id'] != user.id:
+            await query.answer("Post not found or access denied", show_alert=True)
+            return
+
+        new_time = get_current_kyiv_time() + timedelta(minutes=1)
+        success = Database.update_post_schedule(post_id, new_time, user_id=user.id)
+
+        if not success:
+            await query.answer("Failed to reschedule", show_alert=True)
+            return
+
+        scheduler = get_shared_scheduler(context)
+        if scheduler:
+            await scheduler.schedule_single_post(post_id, new_time)
+
+        await query.answer(f"📌 Post #{post_id} will be published at {new_time.strftime('%H:%M')}", show_alert=True)
+
+        # Refresh the card
+        mode, session_data = Database.get_user_session(user.id)
+        if session_data and 'edit_post_ids' in session_data:
+            current_index = session_data.get('edit_current_index', 0)
+            channel_id = session_data.get('edit_channel_id')
+            channels = Database.get_user_channels(user.id)
+            channel = next((ch for ch in channels if ch['channel_id'] == channel_id), None)
+            channel_name = channel['channel_name'] if channel else channel_id
+            updated_post = Database.get_post_by_id(post_id)
+            await show_edit_post_details(query, user, updated_post, current_index,
+                                         len(session_data['edit_post_ids']), channel_name)
+
+    except Exception as e:
+        logger.error(f"Error in handle_editposts_post_next: {e}", exc_info=True)
+        await query.answer(f"Error: {e}", show_alert=True)
 
 async def handle_editposts_schedule_quick(query, user, post_id, hours, context):
     """Handle quick schedule adjustment"""
@@ -10523,7 +10707,7 @@ async def show_editposts_menu(query, user):
         
         await query.edit_message_text(
             "✏️ *Edit Scheduled Posts*\n\n"
-            "Select a channel to edit its scheduled Mode 2 posts:",
+            "Select a channel to edit its scheduled captioned posts:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
