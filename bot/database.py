@@ -1608,6 +1608,47 @@ class Database:
         conn.close()
         logger.info(f"Shuffled {len(ids)} queued posts for user {user_id}")
         return len(ids)
+
+    @staticmethod
+    def shuffle_scheduled_posts(user_id: int) -> List[Tuple[int, datetime]]:
+        """Randomly swap scheduled times among already-scheduled future posts.
+
+        Posts keep their channel (times are permuted within each channel so
+        every channel's slot pattern is preserved) and overdue/past posts are
+        left alone. Returns the (post_id, new_time) pairs so the caller can
+        reschedule the corresponding scheduler jobs.
+        """
+        import random
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, channel_id, scheduled_time FROM posts
+            WHERE user_id = ? AND status = 'pending'
+              AND scheduled_time IS NOT NULL AND scheduled_time > ?
+        ''', (user_id, kyiv_now_iso()))
+
+        by_channel: Dict[Optional[str], list] = {}
+        for post_id, channel_id, scheduled_time in cursor.fetchall():
+            dt = parse_dt(scheduled_time)
+            if dt is not None:
+                by_channel.setdefault(channel_id, []).append((post_id, dt))
+
+        reassigned: List[Tuple[int, datetime]] = []
+        for posts in by_channel.values():
+            if len(posts) < 2:
+                continue
+            times = [dt for _, dt in posts]
+            random.shuffle(times)
+            for (post_id, _), new_time in zip(posts, times):
+                cursor.execute('UPDATE posts SET scheduled_time = ? WHERE id = ?',
+                               (serialize_dt(new_time), post_id))
+                reassigned.append((post_id, new_time))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"Shuffled {len(reassigned)} scheduled posts for user {user_id}")
+        return reassigned
     
 
     

@@ -64,6 +64,7 @@ def build_main_menu(user):
          InlineKeyboardButton("📅 Calendar", callback_data="main_calendar")],
         [InlineKeyboardButton("✏️ Edit posts", callback_data="main_editposts"),
          InlineKeyboardButton("🔁 Reschedule all", callback_data="main_reschedule")],
+        [InlineKeyboardButton("🔀 Shuffle scheduled", callback_data="shuffle_scheduled")],
         [InlineKeyboardButton("📺 Channels", callback_data="main_channels"),
          InlineKeyboardButton("📊 Statistics", callback_data="main_stats")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="main_settings"),

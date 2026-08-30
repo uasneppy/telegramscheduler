@@ -16,6 +16,32 @@ def get_shared_scheduler(context):
         return context.application.bot_data.get('scheduler')
     return None
 
+async def execute_scheduled_shuffle(query, user, context):
+    """Randomly swap times among the user's already-scheduled future posts."""
+    scheduler = get_shared_scheduler(context)
+    if not scheduler:
+        await query.answer("⚠️ Scheduler unavailable, try again later", show_alert=True)
+        return
+
+    reassigned = Database.shuffle_scheduled_posts(user.id)
+    if not reassigned:
+        await query.answer("Nothing to shuffle - need at least 2 upcoming posts in a channel",
+                           show_alert=True)
+        return
+
+    for post_id, new_time in reassigned:
+        scheduler._schedule_single_post(post_id, new_time)
+
+    await query.answer(f"🔀 Shuffled {len(reassigned)} scheduled posts!")
+    # Refresh the menu so the "Next post" summary reflects the new order
+    try:
+        message, reply_markup = build_main_menu(user)
+        await query.edit_message_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning(f"Could not refresh menu after shuffle: {e}")
+
+
 async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /schedule command"""
     user = update.effective_user
