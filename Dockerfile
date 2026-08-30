@@ -7,7 +7,8 @@ RUN pip install --no-cache-dir \
     "python-telegram-bot==20.8" \
     "apscheduler>=3.11.0" \
     "pytz>=2025.2" \
-    "pillow>=11.3.0"
+    "pillow>=11.3.0" \
+    "tzdata>=2025.2"
 
 COPY config.py main.py ./
 COPY bot/ ./bot/

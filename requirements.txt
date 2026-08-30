@@ -1,0 +1,6 @@
+python-telegram-bot==22.3
+APScheduler==3.11.0
+pytz==2025.2
+Pillow==11.3.0
+aiofiles==24.1.0
+tzdata==2025.2
