@@ -17,6 +17,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     try:
         await _dispatch_callback(query, user, data, context)
     except Exception as e:
+        if "message is not modified" in str(e).lower():
+            # Double-tap on a button whose refresh produced identical content
+            return
         # Without this, any exception leaves the button silently dead
         logger.error(f"Error handling callback {data!r} from user {user.id}: {e}", exc_info=True)
         try:
@@ -55,6 +58,8 @@ async def _dispatch_callback(query, user, data, context):
             await query.answer("Nothing to shuffle - the queue is empty", show_alert=True)
         else:
             await query.answer(f"🔀 Shuffled {count} queued posts!")
+    elif data == "shuffle_scheduled":
+        await execute_scheduled_shuffle(query, user, context)
     elif data == "upload_discard":
         # Confirm before discarding the queued uploads
         await query.edit_message_text(

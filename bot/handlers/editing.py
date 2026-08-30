@@ -1869,8 +1869,8 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     caption_text = (
-        f"🎯 *Guided Captioning* - Media {index + 1}/{total}\n\n"
-        f"Type your caption for this {media_type}, or tap *Skip* to post without caption.\n\n"
+        f"🎯 <b>Guided Captioning</b> - Media {index + 1}/{total}\n\n"
+        f"Type your caption for this {media_type}, or tap <b>Skip</b> to post without caption.\n\n"
         f"💡 Tip: Use Telegram's formatting menu for bold, italic, etc."
     )
     
@@ -1898,7 +1898,7 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
                     photo=f,
                     caption=caption_text,
                     reply_markup=reply_markup,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
         elif media_type == 'video':
             with open(file_path, 'rb') as f:
@@ -1907,7 +1907,7 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
                     video=f,
                     caption=caption_text,
                     reply_markup=reply_markup,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
         elif media_type == 'animation':
             with open(file_path, 'rb') as f:
@@ -1916,7 +1916,7 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
                     animation=f,
                     caption=caption_text,
                     reply_markup=reply_markup,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
         elif media_type == 'document':
             with open(file_path, 'rb') as f:
@@ -1925,7 +1925,7 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
                     document=f,
                     caption=caption_text,
                     reply_markup=reply_markup,
-                    parse_mode='Markdown'
+                    parse_mode='HTML'
                 )
         else:
             # Fallback to text message with reference
@@ -1933,15 +1933,16 @@ async def show_mode3_caption_prompt(query_or_message, user, session_data: dict, 
                 chat_id=chat_id,
                 text=f"{media_icon} {caption_text}\n\n(Preview not available for this media type)",
                 reply_markup=reply_markup,
-                parse_mode='Markdown'
+                parse_mode='HTML'
             )
     except Exception as e:
         logger.error(f"Error sending Mode 3 preview: {e}", exc_info=True)
         await bot.send_message(
             chat_id=chat_id,
-            text=f"{media_icon} {caption_text}\n\n(Error loading preview: {e})",
+            text=f"{media_icon} Guided Captioning - Media {index + 1}/{total}\n\n"
+                 f"Type your caption, or tap Skip to post without caption.\n\n"
+                 f"(Error loading preview: {e})",
             reply_markup=reply_markup,
-            parse_mode='Markdown'
         )
 
 
