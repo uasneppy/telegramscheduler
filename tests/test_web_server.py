@@ -5,8 +5,11 @@ import html
 import logging
 import re
 import secrets
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
+from aiohttp import web
+from aiohttp.http_exceptions import ContentLengthError, TransferEncodingError
 from yarl import URL
 
 from bot.database import Database, parse_dt
@@ -412,6 +415,213 @@ def test_unexpected_error_is_json_500_and_reported(caplog):
     # A failing reporter, or none at all, still yields the same 500.
     asyncio.run(scenario(broken_reporter))
     asyncio.run(scenario(None))
+
+
+# --- client disconnects and unreadable bodies ---------------------------------------
+
+LOGIN_HEAD = "POST /login HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost:8080\r\n"
+FORM = "Content-Type: application/x-www-form-urlencoded\r\n"
+
+
+@asynccontextmanager
+async def _probed_client(app):
+    """A client for `app` plus a queue that an outermost probe middleware fills with
+    "started" when a handler begins and "finished" when it returns or raises."""
+    events = asyncio.Queue()
+
+    @web.middleware
+    async def probe(request, handler):
+        events.put_nowait("started")
+        try:
+            return await handler(request)
+        finally:
+            events.put_nowait("finished")
+
+    app.middlewares.insert(0, probe)
+    async with app_client(app) as client:
+        yield client, events
+
+
+async def _abort_mid_body(client, events, raw: str, more: str = ""):
+    """Send a request whose body never completes over a raw socket, then close it.
+
+    The close waits until the handler is running, so it cannot race the dispatch.
+    """
+    _, writer = await asyncio.open_connection(client.server.host, client.server.port)
+    writer.write(raw.encode())
+    await writer.drain()
+    assert await asyncio.wait_for(events.get(), 5) == "started"
+    if more:
+        writer.write(more.encode())
+        await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+    assert await asyncio.wait_for(events.get(), 5) == "finished"
+
+
+def _assert_disconnects_are_quiet(
+    caplog, raw: str, more: str = "", times: int = 1, add_routes=None, aiohttp_may_log=False
+):
+    """Aborted requests reach neither on_error nor an ERROR log, and are not failed sign-ins."""
+    reported = []
+
+    async def on_error(exc):
+        reported.append(exc)
+
+    async def scenario():
+        app = _app(on_error=on_error)
+        if add_routes is not None:
+            add_routes(app)
+        async with _probed_client(app) as (client, events):
+            for _ in range(times):
+                await _abort_mid_body(client, events, raw, more)
+            # Not counted by the failed-login limiter: a valid token still signs in.
+            assert (await sign_in(client, 1, BASE)).status == 303
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(scenario())  # returns after the server has shut down
+    assert reported == []
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    if aiohttp_may_log:
+        # With the pure-Python parser, aiohttp's own lingering drain logs the bad
+        # body again after the board has answered; that log is aiohttp's, not ours.
+        errors = [record for record in errors if record.name != "aiohttp.server"]
+    assert errors == []
+
+
+def test_client_disconnect_mid_body_is_not_reported(caplog):
+    raw = LOGIN_HEAD + FORM + "Content-Length: 100\r\n\r\nt=abc"
+    _assert_disconnects_are_quiet(caplog, raw, times=FAIL_LIMIT)
+    gone = [r for r in caplog.records if r.getMessage().startswith("Client went away during POST /login")]
+    assert len(gone) == FAIL_LIMIT
+    assert all(r.levelno == logging.INFO and r.exc_info is None for r in gone)  # no traceback
+
+
+def test_truncated_multipart_body_is_not_reported(caplog):
+    raw = (
+        LOGIN_HEAD
+        + "Content-Type: multipart/form-data; boundary=xyz\r\nContent-Length: 500\r\n\r\n"
+        + '--xyz\r\nContent-Disposition: form-data; name="t"\r\n\r\nabc'
+    )
+    _assert_disconnects_are_quiet(caplog, raw)
+
+
+def test_incomplete_or_bad_chunked_body_then_close_is_not_reported(caplog):
+    head = LOGIN_HEAD + FORM + "Transfer-Encoding: chunked\r\n\r\n"
+    # A chunk shorter than its announced size, then the client goes away.
+    _assert_disconnects_are_quiet(caplog, head + "10\r\nt=ab")
+    caplog.clear()
+    # A valid chunk, then an invalid chunk size once the handler is reading, then a close.
+    # The C parser surfaces this as the disconnect, the pure-Python one as a bad body.
+    _assert_disconnects_are_quiet(caplog, head + "3\r\nt=a\r\n", more="zz\r\nhello\r\n", aiohttp_may_log=True)
+
+
+async def _until_client_gone(request):
+    for _ in range(500):
+        if request.transport is None or request.transport.is_closing():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the client never went away")
+
+
+def test_every_disconnect_error_type_is_quiet(caplog):
+    # aiohttp 3.14 reports a lost connection as ConnectionResetError, but the other
+    # ways a gone peer can surface in a handler are treated the same.
+    raised = {
+        "reset": lambda: ConnectionResetError("Connection lost"),
+        "pipe": lambda: BrokenPipeError(32, "Broken pipe"),
+        "aborted": lambda: ConnectionAbortedError("aborted"),
+        "incomplete": lambda: asyncio.IncompleteReadError(b"", 100),
+    }
+
+    async def raise_after_gone(request):
+        await _until_client_gone(request)
+        raise raised[request.match_info["kind"]]()
+
+    async def write_after_gone(request):
+        response = web.StreamResponse()
+        await response.prepare(request)
+        await _until_client_gone(request)
+        await response.write(b"too late")  # aiohttp's ClientConnectionResetError
+        return response
+
+    def add_routes(app):
+        app.router.add_get("/gone/write", write_after_gone)
+        app.router.add_get("/gone/{kind}", raise_after_gone)
+
+    for kind in (*raised, "write"):
+        caplog.clear()
+        raw = f"GET /gone/{kind} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        _assert_disconnects_are_quiet(caplog, raw, add_routes=add_routes)
+        assert f"Client went away during GET /gone/{kind}" in caplog.text, kind
+
+
+def test_connection_error_with_client_still_connected_is_reported(caplog):
+    # Control: a connection error is only a client disconnect when the client is gone.
+    # Raised while the browser is still waiting (say, a broken upstream), it is a real fault.
+    reported = []
+
+    async def on_error(exc):
+        reported.append(exc)
+
+    async def upstream_down(request):
+        raise ConnectionRefusedError("upstream down")
+
+    async def scenario():
+        app = _app(on_error=on_error)
+        app.router.add_get("/upstream", upstream_down)
+        async with app_client(app) as client:
+            response = await client.get("/upstream")
+            assert response.status == 500
+            assert (await response.json())["error"] == "internal"
+
+    with caplog.at_level(logging.ERROR, logger="bot.web.server"):
+        asyncio.run(scenario())
+    assert len(reported) == 1 and isinstance(reported[0], ConnectionRefusedError)
+    assert "Unexpected web board error on GET /upstream" in caplog.text
+
+
+def test_undecodable_body_is_400_and_not_reported(caplog):
+    # A body that aiohttp cannot decode is the client's fault, sent with the
+    # connection still open; it must not page the admin either.
+    reported = []
+
+    async def on_error(exc):
+        reported.append(exc)
+
+    # The pure-Python HTTP parser (no C extension, or AIOHTTP_NO_EXTENSIONS=1)
+    # hands a bad chunked or short body to the handler as these, unwrapped.
+    parser_errors = {
+        "chunk": lambda: TransferEncodingError("zz"),
+        "length": lambda: ContentLengthError("Not enough data to satisfy content length header."),
+    }
+
+    async def read_bad_body(request):
+        raise parser_errors[request.match_info["kind"]]()
+
+    async def scenario():
+        app = _app(on_error=on_error)
+        app.router.add_get("/bad-body/{kind}", read_bad_body)
+        async with app_client(app) as client:
+            for encoding in ("gzip", "deflate"):
+                response = await client.post(
+                    "/login",
+                    data=b"t=this is not compressed",
+                    headers={**ORIGIN, "Content-Type": "application/x-www-form-urlencoded",
+                             "Content-Encoding": encoding},
+                )
+                assert response.status == 400, encoding
+                assert (await response.json())["error"] == "invalid_request"
+            for kind in parser_errors:
+                response = await client.get(f"/bad-body/{kind}")
+                assert response.status == 400, kind
+                assert (await response.json())["error"] == "invalid_request"
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(scenario())
+    assert reported == []
+    board_errors = [r for r in caplog.records if r.name.startswith("bot") and r.levelno >= logging.ERROR]
+    assert board_errors == []
 
 
 def test_webeerror_maps_to_status():

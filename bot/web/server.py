@@ -4,7 +4,10 @@ Middlewares, outermost first:
 
 1. errors: WebError -> its status with JSON `{"error", "message", **extra}`;
    aiohttp's own HTTP errors (404, 405, 413, ...) -> the same JSON shape;
-   anything else -> logged, reported through `on_error`, JSON 500 `internal`.
+   a body aiohttp cannot decode -> 400 `invalid_request`; a client that went
+   away mid-request -> an info line only. Neither is reported, so a client
+   cannot page the admin. Anything else -> logged with a traceback, reported
+   through `on_error`, JSON 500 `internal`.
 2. security headers: CSP, nosniff and no-referrer on every response, and
    `Cache-Control: no-store` on /api unless the route set its own. The errors
    middleware sits outside it, so it adds the same headers to the responses it builds.
@@ -28,6 +31,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from aiohttp import web
+from aiohttp.http_exceptions import HttpProcessingError
+from aiohttp.web_protocol import RequestPayloadError
 
 from bot.web import auth, queries
 from bot.web.errors import WebError, not_found
@@ -69,6 +74,15 @@ _REFERRER_META = '<meta name="referrer" content="strict-origin">'
 
 ErrorReporter = Callable[[BaseException], Awaitable[None]]
 
+# What a handler sees when the request body is malformed: the C parser wraps the
+# fault in RequestPayloadError, the pure-Python parser raises its own
+# HttpProcessingError (TransferEncodingError, ContentLengthError, ...).
+_BAD_BODY_ERRORS = (RequestPayloadError, HttpProcessingError)
+# What a handler sees when the client goes away mid-request: aiohttp sets
+# ConnectionResetError on the request body, a write to the closed transport
+# raises a ConnectionResetError subclass, readexactly raises IncompleteReadError.
+_DISCONNECT_ERRORS = (ConnectionError, asyncio.IncompleteReadError)
+
 
 def _set_key(mapping, key: str, value) -> None:
     """Store a plain string key on an Application or Request.
@@ -83,6 +97,11 @@ def _set_key(mapping, key: str, value) -> None:
 
 def _is_api(path: str) -> bool:
     return path == "/api" or path.startswith("/api/")
+
+
+def _client_gone(request: web.Request) -> bool:
+    transport = request.transport
+    return transport is None or transport.is_closing()
 
 
 def _json_error(status: int, code: str, message: str, extra: dict | None = None) -> web.Response:
@@ -118,7 +137,25 @@ def _errors_middleware(on_error: ErrorReporter | None):
             response = _json_error(exc.status, code, exc.reason)
             if "Allow" in exc.headers:
                 response.headers["Allow"] = exc.headers["Allow"]
+        except _BAD_BODY_ERRORS as exc:
+            # The body could not be decoded (bad Content-Encoding data, bad chunking):
+            # the client's fault, so no traceback and no report. Only the type is
+            # logged, since the message may quote request bytes.
+            logger.info(
+                "Unreadable request body on %s %s (%s)", request.method, request.path, type(exc).__name__
+            )
+            response = _json_error(400, "invalid_request", "The request body could not be read.")
+            # aiohttp drops the connection after a body it cannot drain; say so to the client.
+            response.force_close()
         except Exception as exc:
+            if isinstance(exc, _DISCONNECT_ERRORS) and _client_gone(request):
+                # Nobody is left to answer, and a client that aborts must not page the
+                # admin. Returning (not raising) keeps aiohttp from logging it as an error;
+                # it drops the response on the closed connection.
+                logger.info(
+                    "Client went away during %s %s (%s)", request.method, request.path, type(exc).__name__
+                )
+                return _json_error(400, "invalid_request", "The request did not complete.")
             logger.exception(
                 "Unexpected web board error on %s %s (user %s)",
                 request.method, request.path, request.get("user_id"),
