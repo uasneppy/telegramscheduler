@@ -2,14 +2,15 @@
 
 
 class WebError(Exception):
-    """An error with an HTTP status and a stable machine-readable code."""
+    """An error with an HTTP status, a stable machine-readable code and optional extra body fields."""
 
-    def __init__(self, status: int, code: str, message: str, **extra):
+    def __init__(self, status: int, code: str, message: str, extra: dict | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
-        self.extra = extra
+        # A dict, not **kwargs, so extra keys such as "status" cannot collide with the arguments.
+        self.extra = dict(extra or {})
 
 
 def invalid_request(message: str) -> WebError:
@@ -21,7 +22,7 @@ def not_found(message: str = "Not found") -> WebError:
 
 
 def conflict(message: str, **extra) -> WebError:
-    return WebError(409, "conflict", message, **extra)
+    return WebError(409, "conflict", message, extra)
 
 
 def too_large(message: str) -> WebError:
