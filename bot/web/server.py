@@ -19,25 +19,37 @@ Middlewares, outermost first:
 
 The login token (`?t=`, form field `t`) and the session cookie are never logged:
 log lines use `request.path`, which has no query string. The access log is
-turned off by the runner (`access_log=None`). Blocking auth and database calls
+turned off by the runner (`access_log=None`), and `start_web` puts a redacting
+filter on aiohttp's own `aiohttp.server` logger, which prints the raw request
+line when it rejects a malformed request. Blocking auth and database calls
 run through `asyncio.to_thread`.
+
+`start_web` / `stop_web` run the app on the bot's event loop (called from
+`main.post_init` / `post_shutdown`). Starting is opt-in and never raises: a
+board that cannot start is logged and the bot carries on without it. The only
+path to the admin chat is `on_error`, rate limited to one message per 30 s.
 """
 
 import asyncio
 import html
 import logging
+import re
+import time
+import traceback
 import warnings
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Protocol
 
 from aiohttp import web
 from aiohttp.http_exceptions import HttpProcessingError
 from aiohttp.web_protocol import RequestPayloadError
 
+import config
 from bot.web import api, auth, queries
 from bot.web.errors import WebError, not_found
 from bot.web.service import SchedulerLike
-from bot.web.settings import origin_of
+from bot.web.settings import origin_of, validate_web_config
 
 logger = logging.getLogger(__name__)
 
@@ -359,3 +371,150 @@ def create_app(
     app.router.add_get("/api/me", _me)
     api.register_routes(app)
     return app
+
+
+# --- log redaction ------------------------------------------------------------------
+
+_REDACTED = "[redacted]"
+# `t=` as a query key (not the tail of another key such as `limit=`) and the session cookie value.
+_TOKEN_QUERY = re.compile(r"(?<![A-Za-z0-9_])(t=)[^\s&#'\"\\]*")
+_SESSION_VALUE = re.compile(rf"({re.escape(SESSION_COOKIE)}=)[^\s;,'\"\\]*")
+
+
+def _redact(text: str) -> str:
+    """`text` with every login token and session id value replaced."""
+    return _SESSION_VALUE.sub(rf"\1{_REDACTED}", _TOKEN_QUERY.sub(rf"\1{_REDACTED}", text))
+
+
+class _LogRedactionFilter(logging.Filter):
+    """Removes login tokens and session ids from log records.
+
+    aiohttp's own logger prints the raw request line (query string included)
+    when it rejects a malformed request, usually inside the exception text. The
+    message is formatted with its args here and the traceback is rendered here, so
+    nothing is left for a handler to print unredacted. Never raises: a record that
+    cannot be redacted is withheld instead.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg, record.args = _redact(record.getMessage()), ()
+            if record.exc_info and not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            if record.exc_text:
+                record.exc_text = _redact(record.exc_text)
+            if record.stack_info:
+                record.stack_info = _redact(record.stack_info)
+        except Exception:
+            record.msg, record.args = "<log record withheld: it could not be redacted>", ()
+            record.exc_info = record.exc_text = record.stack_info = None
+        return True
+
+
+def _install_log_redaction() -> None:
+    """Put the redacting filter on aiohttp's `aiohttp.server` logger, once."""
+    target = logging.getLogger("aiohttp.server")
+    if not any(isinstance(f, _LogRedactionFilter) for f in target.filters):
+        target.addFilter(_LogRedactionFilter())
+
+
+# --- admin error reports ------------------------------------------------------------
+
+ADMIN_REPORT_INTERVAL_SECONDS = 30
+_ADMIN_REPORT_CHARS = 1500  # the last lines of a traceback carry the actual error
+
+
+class _AdminBot(Protocol):
+    async def send_message(self, chat_id, text): ...
+
+
+def _admin_reporter(bot: _AdminBot, chat_id, clock: Callable[[], float] = time.monotonic) -> ErrorReporter:
+    """An `on_error` that sends the end of the traceback to the admin chat.
+
+    At most one message per `ADMIN_REPORT_INTERVAL_SECONDS`; faults in between are
+    only logged, so a fault loop cannot flood the chat or hit Telegram's flood
+    limits (which would delay scheduled posts). The window starts when a send is
+    attempted, so a failing Telegram is not hammered either.
+    """
+    last_sent: float | None = None
+
+    async def report(exc: BaseException) -> None:
+        nonlocal last_sent
+        now = clock()
+        if last_sent is not None and now - last_sent < ADMIN_REPORT_INTERVAL_SECONDS:
+            logger.warning(
+                "Web board error not sent to the admin chat (rate limited): %s", type(exc).__name__
+            )
+            return
+        last_sent = now
+        text = "".join(traceback.format_exception(None, exc, exc.__traceback__))
+        # Redact before cutting, so a cut can never leave half a token behind.
+        summary = _redact(text)[-_ADMIN_REPORT_CHARS:]
+        await bot.send_message(chat_id=chat_id, text=f"🚨 Web board error:\n\n{summary}")
+
+    return report
+
+
+# --- start / stop -------------------------------------------------------------------
+
+
+async def start_web(
+    bot: _AdminBot,
+    scheduler: SchedulerLike,
+    base_url: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+    allowed_user_ids: set[int] | None = None,
+) -> web.AppRunner | None:
+    """Start the board on the running loop; None when it is off or cannot start.
+
+    Arguments default to the `config` values (an explicit `port=0` or empty
+    allowlist is honored, not replaced). No `base_url` means the board is
+    disabled and nothing is logged. An invalid configuration or a port that
+    cannot be bound is logged and the bot carries on without the board; this
+    function does not raise.
+    """
+    base_url = config.WEB_BASE_URL if base_url is None else base_url
+    if not base_url:
+        return None
+    host = config.WEB_HOST if host is None else host
+    port = config.WEB_PORT if port is None else port
+    allowed_user_ids = config.ALLOWED_USER_IDS if allowed_user_ids is None else allowed_user_ids
+
+    problem = validate_web_config(base_url, allowed_user_ids)
+    if problem:
+        logger.error("Web board not started: %s", problem)
+        return None
+
+    runner = None
+    try:
+        _install_log_redaction()
+        chat_id = config.ADMIN_CHAT_ID
+        app = create_app(
+            scheduler, base_url, allowed_user_ids,
+            on_error=_admin_reporter(bot, chat_id) if chat_id else None,
+        )
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, host, port).start()
+    except Exception as exc:
+        # OSError: port in use or bad bind address. Anything else is a bug; keep its traceback.
+        logger.error(
+            "Web board could not start on %s:%s: %s", host, port, exc, exc_info=not isinstance(exc, OSError)
+        )
+        await stop_web(runner)
+        return None
+    logger.info("Web board listening on %s:%s (%s)", host, port, base_url)
+    return runner
+
+
+async def stop_web(runner: web.AppRunner | None) -> None:
+    """Stop the board (a no-op for None). Never raises, so shutdown always reaches the scheduler."""
+    if runner is None:
+        return
+    try:
+        await runner.cleanup()
+    except Exception:
+        logger.exception("Web board did not shut down cleanly")
+    else:
+        logger.info("Web board stopped")

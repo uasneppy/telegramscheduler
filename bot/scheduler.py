@@ -17,6 +17,7 @@ from telegram.request import HTTPXRequest
 
 from .database import Database
 from .utils import get_kyiv_timezone, get_current_kyiv_time, cleanup_old_media_files, cleanup_empty_directories
+from .web.housekeeping import purge_web_data
 from config import BOT_TOKEN, DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -519,7 +520,14 @@ class PostScheduler:
             # Clean up empty directories
             cleaned_dirs = await cleanup_empty_directories()
 
-            logger.info(f"Daily cleanup completed: {cleaned_files} files, {purged} deleted posts purged, {cleaned_dirs} directories cleaned")
+            # Expired web board sign-in tokens and sessions, stale cached thumbnails
+            web_purged = await asyncio.to_thread(purge_web_data)
+
+            logger.info(
+                f"Daily cleanup completed: {cleaned_files} files, {purged} deleted posts purged, "
+                f"{cleaned_dirs} directories cleaned, {web_purged['auth_rows']} web auth rows and "
+                f"{web_purged['thumbnails']} thumbnails purged"
+            )
             
         except Exception as e:
             logger.error(f"Daily cleanup failed: {e}")

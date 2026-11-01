@@ -184,6 +184,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `/edit_captions` - Edit captions for scheduled posts one by one
 • `/clearqueue` - Clear pending (unscheduled) posts
 • `/clearscheduled` - Clear scheduled posts
+• `/web` - Open the web board (if enabled on this server)
 • `/reset` - Clear all user data
 • `/cancel` - Cancel current operation
 • `/help` - This comprehensive help
