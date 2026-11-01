@@ -17,6 +17,9 @@ from html.parser import HTMLParser
 from bot.web.errors import WebError
 
 CAPTION_LIMIT = 1024
+# Raw tagged text above this is refused before parsing, which bounds the work
+# a single request can cost (the board shares the scheduler's event loop).
+_MARKUP_LIMIT = 16 * CAPTION_LIMIT
 
 _SIMPLE_TAGS = {
     "bold": "b",
@@ -36,7 +39,9 @@ _OPTIONAL_KEYS = ("url", "language", "custom_emoji_id")
 
 # A bare & (not one of the references Telegram's HTML accepts) and a < that
 # cannot start a tag are literal text, so they are escaped before parsing.
-_BARE_AMP = re.compile(r"&(?!(?:lt|gt|amp|quot|#[0-9]+|#[xX][0-9a-fA-F]+);)")
+# References are bounded (U+10FFFF needs 7 decimal or 6 hex digits) so a huge
+# one stays literal instead of reaching int() in html.parser.
+_BARE_AMP = re.compile(r"&(?!(?:lt|gt|amp|quot|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)")
 _BARE_LT = re.compile(r"<(?!/?[a-zA-Z])")
 _LANGUAGE_PREFIX = "language-"
 _SAFE_HREF = re.compile(r"(?:https?|tg)://", re.IGNORECASE)
@@ -319,12 +324,17 @@ def _parse_tagged(tagged: str) -> tuple[str | None, list[dict]]:
     """Plain text (None when blank) and tag entities of tagged text."""
     if not isinstance(tagged, str):
         raise CaptionError("The caption must be a string.")
+    if len(tagged) > _MARKUP_LIMIT:
+        raise CaptionError(f"The caption markup is {len(tagged)} characters long; the limit is {_MARKUP_LIMIT}.")
     parser = _TaggedParser()
-    parser.feed(_BARE_LT.sub("&lt;", _BARE_AMP.sub("&amp;", tagged)))
-    if parser.rawdata:
-        # html.parser holds back an unterminated tag, and close() would drop it.
-        raise CaptionError("A tag is missing its closing '>'. Write &lt; for a literal '<'.")
-    parser.close()
+    try:
+        parser.feed(_BARE_LT.sub("&lt;", _BARE_AMP.sub("&amp;", tagged)))
+        if parser.rawdata:
+            # html.parser holds back an unterminated tag, and close() would drop it.
+            raise CaptionError("A tag is missing its closing '>'. Write &lt; for a literal '<'.")
+        parser.close()
+    except ValueError as exc:  # e.g. int() on a character reference; _BARE_AMP should prevent it
+        raise CaptionError("The caption contains an invalid character reference.") from exc
     if parser.stack:
         raise CaptionError(f"<{parser.stack[-1].tag}> is not closed.")
     text = "".join(parser.chunks)
@@ -370,8 +380,8 @@ def tagged_to_caption(
 ) -> tuple[str | None, list[dict] | None]:
     """Tagged text as (plain text, entities) for storage; (None, None) when blank.
 
-    Raises CaptionError for unknown tags, bad nesting, unclosed tags or a
-    caption over CAPTION_LIMIT characters.
+    Raises CaptionError for unknown tags, bad nesting, unclosed tags, a
+    caption over CAPTION_LIMIT characters or markup over 16 times that.
     """
     text, entities = _parse_tagged(tagged)
     if text is None:
@@ -409,7 +419,7 @@ def preview(tagged: str, signature: str | None = None) -> dict:
     error = _too_long(length)
     return {
         "ok": error is None,
-        "html": render_html(text, entities),
+        "html": None if error else render_html(text, entities),
         "length": length,
         "limit": CAPTION_LIMIT,
         "signature_fits": signature_fits(text, signature),

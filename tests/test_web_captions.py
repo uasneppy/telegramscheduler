@@ -1,7 +1,11 @@
 """Caption conversion between Telegram entities and tagged text, and the preview."""
 
+import re
+import time
+
 import pytest
 
+from bot.web import captions
 from bot.web.captions import (
     CAPTION_LIMIT,
     CaptionError,
@@ -199,11 +203,50 @@ def test_preview_reports_errors_without_raising():
     }
     bad = preview("<b>hi")
     assert bad["ok"] is False and bad["error"] and bad["html"] is None and bad["limit"] == 1024
-    too_long = preview("a" * 1025)
+    too_long = preview("<b>" + "a" * 1025 + "</b>")
     assert too_long["ok"] is False and too_long["length"] == 1025 and "1024" in too_long["error"]
+    assert too_long["html"] is None  # over-limit text is not rendered
     assert preview(42)["ok"] is False
     empty = preview("  ")
     assert empty["ok"] is True and empty["html"] == "" and empty["length"] == 0
+
+
+HUGE_CHARREF = "&#" + "1" * 5000 + ";"  # int() refuses more than 4300 digits
+
+
+def test_huge_character_reference_is_literal_text():
+    with pytest.raises(CaptionError):  # literal text, 5003 characters: over the limit
+        tagged_to_caption(HUGE_CHARREF)
+    result = preview(HUGE_CHARREF)
+    assert result["ok"] is False and result["length"] == len(HUGE_CHARREF)
+    assert tagged_to_caption(f'<a href="{HUGE_CHARREF}">x</a>') == (
+        "x",
+        [{"type": "text_link", "offset": 0, "length": 1, "url": HUGE_CHARREF}],
+    )
+    assert preview(f'<a href="{HUGE_CHARREF}">x</a>')["ok"] is True
+
+
+def test_parser_value_error_becomes_caption_error(monkeypatch):
+    # Defence in depth: even with the reference bound removed, no ValueError escapes.
+    monkeypatch.setattr(captions, "_BARE_AMP", re.compile(r"&(?!#[0-9]+;)"))
+    with pytest.raises(CaptionError):
+        tagged_to_caption(HUGE_CHARREF)
+    with pytest.raises(CaptionError):
+        tagged_to_caption(f'<a href="{HUGE_CHARREF}">x</a>')
+    assert preview(HUGE_CHARREF)["ok"] is False
+
+
+def test_oversized_markup_rejected_quickly():
+    assert tagged_to_caption(" " * (16 * CAPTION_LIMIT)) == (None, None)
+    with pytest.raises(CaptionError):
+        tagged_to_caption(" " * (16 * CAPTION_LIMIT + 1))
+    tagged = "<b>a</b>" * 16000  # 128 KB of markup
+    started = time.perf_counter()
+    with pytest.raises(CaptionError):
+        tagged_to_caption(tagged)
+    result = preview(tagged)
+    assert time.perf_counter() - started < 0.5
+    assert result["ok"] is False and result["html"] is None and result["error"]
 
 
 def test_signature_fits_matches_publisher():
