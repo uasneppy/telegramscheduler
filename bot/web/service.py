@@ -10,19 +10,24 @@ through asyncio.to_thread; scheduler calls stay on the event loop.
 
 Bulk actions (spec 6.7) loop over these same single-post functions, so every
 status rule and scheduler sync is the one the single-post path already has.
+
+Replacing media (spec 6.6) follows the repo's rows-then-files order: the row
+is committed first and the old file is removed only afterwards, and a failed
+replace removes the new file and leaves the old state untouched.
 """
 
 import asyncio
 import functools
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Protocol
 
 from bot.database import Database, serialize_dt
-from bot.utils import get_current_kyiv_time
+from bot.utils import delete_media_file, get_current_kyiv_time
 from bot.web.captions import entities_to_json, parse_entities_json, tagged_to_caption
 from bot.web.errors import WebError, conflict, invalid_request
-from bot.web.media import is_album
+from bot.web.media import StoredUpload, is_album, resolve_media_path
 from bot.web.queries import get_owned_post, get_post_detail
 from bot.web.rules import board_status, can_flags
 from bot.web.timeutil import ensure_min_lead, parse_local_time, shift_local
@@ -308,6 +313,66 @@ async def retry_post(user_id: int, post_id: int, scheduler: SchedulerLike, now: 
     await scheduler.schedule_single_post(post_id, when)
     _log(user_id, "retry", post_id)
     return await asyncio.to_thread(get_post_detail, user_id, post_id, now)
+
+
+# --- replace media ---------------------------------------------------------------------------
+
+
+def check_media_replaceable(user_id: int, post_id: int) -> dict:
+    """The user's post as a raw row if its media may be replaced; blocking.
+
+    not_found for a post that is not the user's. conflict (naming the board
+    status) for an album, which is view-only, and for any status that allows no
+    media change. The route calls it before reading the upload body, and
+    replace_media runs it again once the file is stored.
+    """
+    row = get_owned_post(user_id, post_id)
+    if is_album(row):
+        raise conflict("Cannot replace the media of an album post.", status=board_status(row))
+    _require("replace the media of", "media", row)
+    return row
+
+
+def _store_media(user_id: int, post_id: int, stored: StoredUpload) -> str:
+    """Point the post at the stored upload in one conditional UPDATE; returns the file path it had."""
+    old_path = check_media_replaceable(user_id, post_id)["file_path"]
+    fields = {"file_path": stored.file_path, "media_type": stored.media_type}
+    if not _apply_update(user_id, post_id, fields, _EDITABLE):
+        raise _changed(user_id, post_id, "replace the media of")
+    return old_path
+
+
+def _remove_replaced_file(old_path: str, new_path: str) -> None:
+    """Delete the file a post no longer uses; silent when it is already gone or not an upload.
+
+    The stored value is resolved against DATA_DIR first (legacy rows are
+    relative to it), so the file removed is the one the scheduler would have
+    read. The new file is never removed here, whatever the old row said.
+    """
+    real = resolve_media_path(old_path)
+    if real is not None and real != os.path.realpath(new_path):
+        delete_media_file(real)
+
+
+async def replace_media(user_id: int, post_id: int, stored: StoredUpload) -> dict:
+    """Replace a queued, scheduled or failed single-media post's file with an upload already on disk.
+
+    The row is updated first (one conditional UPDATE); only after the commit
+    is the old file removed. If the post cannot take the media any more (it
+    went to sending, was deleted, ...) or the write fails, the new file is
+    removed and the post is untouched. A cancelled call leaves both files in
+    place: the write may or may not have committed, and a stray file is safer
+    than a row that points at nothing. No scheduler call is needed, the post's
+    time does not change. Returns the post detail.
+    """
+    try:
+        old_path = await asyncio.to_thread(_store_media, user_id, post_id, stored)
+    except Exception:
+        await asyncio.to_thread(delete_media_file, stored.file_path)
+        raise
+    await asyncio.to_thread(_remove_replaced_file, old_path, stored.file_path)
+    _log(user_id, "replace media", post_id)
+    return await asyncio.to_thread(get_post_detail, user_id, post_id)
 
 
 # --- bulk -----------------------------------------------------------------------------------
