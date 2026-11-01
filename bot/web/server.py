@@ -34,7 +34,7 @@ from aiohttp import web
 from aiohttp.http_exceptions import HttpProcessingError
 from aiohttp.web_protocol import RequestPayloadError
 
-from bot.web import auth, queries
+from bot.web import api, auth, queries
 from bot.web.errors import WebError, not_found
 from bot.web.service import SchedulerLike
 from bot.web.settings import origin_of
@@ -357,4 +357,5 @@ def create_app(
     app.router.add_post("/login", _login)
     app.router.add_post("/logout", _logout)
     app.router.add_get("/api/me", _me)
+    api.register_routes(app)
     return app
