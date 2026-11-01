@@ -7,9 +7,13 @@ claimed the post in the meantime, nothing changes and the caller gets 409 with
 the post's current status. Only after the commit is the post's APScheduler job
 brought in line with the stored row. SQLite work and caption parsing run
 through asyncio.to_thread; scheduler calls stay on the event loop.
+
+Bulk actions (spec 6.7) loop over these same single-post functions, so every
+status rule and scheduler sync is the one the single-post path already has.
 """
 
 import asyncio
+import functools
 import logging
 from datetime import datetime, timedelta
 from typing import Protocol
@@ -21,12 +25,15 @@ from bot.web.errors import WebError, conflict, invalid_request
 from bot.web.media import is_album
 from bot.web.queries import get_owned_post, get_post_detail
 from bot.web.rules import board_status, can_flags
-from bot.web.timeutil import ensure_min_lead, parse_local_time
+from bot.web.timeutil import ensure_min_lead, parse_local_time, shift_local
 
 logger = logging.getLogger(__name__)
 
 POST_NOW_DELAY = timedelta(seconds=60)
 RETRY_DELAY = timedelta(seconds=10)
+BULK_MAX = 500
+_BULK_ACTIONS = ("delete", "restore", "move_channel", "shift")
+_SHIFT_UNITS = ("hours", "days")
 
 _CHANGE_KEYS = ("caption", "scheduled_time", "channel_id")
 # The posts columns this write path may set (the spec 6.3 sync table).
@@ -301,3 +308,101 @@ async def retry_post(user_id: int, post_id: int, scheduler: SchedulerLike, now: 
     await scheduler.schedule_single_post(post_id, when)
     _log(user_id, "retry", post_id)
     return await asyncio.to_thread(get_post_detail, user_id, post_id, now)
+
+
+# --- bulk -----------------------------------------------------------------------------------
+
+
+def _bulk_ids(ids) -> list[int]:
+    """The request's post ids without repeats, in first-seen order."""
+    if not isinstance(ids, list) or not ids:
+        raise invalid_request("ids must be a non-empty list")
+    if len(ids) > BULK_MAX:
+        raise invalid_request(f"At most {BULK_MAX} posts per request")
+    if not all(isinstance(post_id, int) and not isinstance(post_id, bool) for post_id in ids):
+        raise invalid_request("ids must be integers")
+    return list(dict.fromkeys(ids))
+
+
+def _bulk_shift(shift) -> tuple[str, int]:
+    """The (unit, amount) of a shift request; the one-year bound is checked per post by shift_local."""
+    if not isinstance(shift, dict):
+        raise invalid_request("shift must be an object with unit and amount")
+    unit, amount = shift.get("unit"), shift.get("amount")
+    if not isinstance(unit, str) or unit not in _SHIFT_UNITS:
+        raise invalid_request("Unit must be 'hours' or 'days'")
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        raise invalid_request("Amount must be a whole number")
+    if amount == 0:
+        raise invalid_request("Amount must not be zero")
+    return unit, amount
+
+
+async def _shift_post(
+    user_id: int, post_id: int, unit: str, amount: int, scheduler: SchedulerLike, now: datetime
+) -> None:
+    """Move one Scheduled post's time on the Kyiv wall clock and its job with it.
+
+    Only Scheduled posts shift: a queued post has no time, and a failed post
+    would otherwise be accepted by the shared time write.
+    """
+    row = await asyncio.to_thread(get_owned_post, user_id, post_id)
+    if board_status(row) != "scheduled":
+        raise _refusal("shift", row)
+    try:
+        new_time = shift_local(row["scheduled_time"], unit, amount)
+    except OverflowError:  # a time at the edge of the datetime range
+        raise invalid_request("Time is out of range") from None
+    ensure_min_lead(new_time, now)
+    await _set_scheduled_time(user_id, post_id, new_time, scheduler, now)
+
+
+async def bulk(
+    user_id: int,
+    action: str,
+    ids: list[int],
+    scheduler: SchedulerLike,
+    channel_id: str | None = None,
+    shift: dict | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Apply `action` (delete, restore, move_channel or shift) to up to BULK_MAX of the user's posts.
+
+    A malformed request, or a target channel the user does not own, is
+    invalid_request and changes nothing. Otherwise every distinct id is tried in
+    first-seen order and a post that cannot be changed (not found, wrong status,
+    a shifted time that is too soon or does not exist) is reported as
+    {"id", "ok": False, "error": text} without stopping the rest.
+    Returns {"results": [{"id", "ok", "error"}, ...]}.
+    """
+    if action not in _BULK_ACTIONS:
+        raise invalid_request(f"action must be one of: {', '.join(_BULK_ACTIONS)}")
+    post_ids = _bulk_ids(ids)
+    if now is None:
+        now = get_current_kyiv_time()
+
+    # `apply(post_id)` is the single-post call for this action.
+    if action == "delete":
+        apply = functools.partial(delete_post, user_id, scheduler=scheduler)
+    elif action == "restore":
+        apply = functools.partial(restore_post, user_id, scheduler=scheduler, now=now)
+    elif action == "move_channel":
+        target = await _owned_channel(user_id, channel_id)
+        apply = functools.partial(
+            update_post, user_id, changes={"channel_id": target}, scheduler=scheduler, now=now
+        )
+    else:
+        unit, amount = _bulk_shift(shift)
+        apply = functools.partial(
+            _shift_post, user_id, unit=unit, amount=amount, scheduler=scheduler, now=now
+        )
+
+    results = []
+    for post_id in post_ids:
+        try:
+            await apply(post_id)
+        except WebError as err:
+            results.append({"id": post_id, "ok": False, "error": err.message})
+        else:
+            results.append({"id": post_id, "ok": True, "error": None})
+    return {"results": results}
