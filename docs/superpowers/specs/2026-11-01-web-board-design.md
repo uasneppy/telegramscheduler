@@ -105,7 +105,7 @@ Startup validation (the board is not started, with a logged reason, if any fails
 - **Per-user scoping:** `user_id` comes only from the session. Every post id and channel id from the browser is ownership-checked in `service.py` (including the target channel of a move). A post that belongs to someone else and a post that does not exist both return `404`.
 - **CSRF:** every non-GET request must carry an `Origin` header equal to the origin of `WEB_BASE_URL`, and every non-GET `/api` request must also carry the custom header `X-Board: 1` (not settable cross-site without a CORS preflight, which the server never grants). `SameSite=Lax` is the third layer.
 - **XSS:** caption previews are produced server-side (`captions.py`): all text is HTML-escaped, only the tags `b i u s code pre a blockquote span(spoiler) tg-emoji` are emitted, and `href` is restricted to `http`, `https`, `tg`. The front end writes API strings with `textContent` / `setAttribute`, never `innerHTML` on raw data. Strict headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on `/api`.
-- **Media serving:** by post id only, never by client-supplied path. The resolved real path must lie inside the real `UPLOADS_DIR`, otherwise `404`.
+- **Media serving:** by post id only, never by client-supplied path. The resolved real path must lie inside the real `UPLOADS_DIR`, otherwise `404`. Only a fixed set of image, video and audio content types is served inline; everything else (documents, HTML, SVG) is sent with `Content-Disposition: attachment`, and every media response carries `Content-Security-Policy: sandbox`, so an uploaded HTML or SVG file can never run script on the board's origin.
 - **Brute force:** failed token attempts are limited globally to 20 per 5 minutes (`429` beyond). Tokens are 256-bit, so this is a guardrail rather than the defense.
 - **Logging:** the aiohttp access log is disabled or redacted so `?t=` never reaches logs. Every state-changing request is logged (user id, action, post ids).
 - **Secrets:** the bot token is never exposed to the web layer's responses; tokens and sessions are stored hashed.
@@ -129,7 +129,9 @@ CREATE TABLE IF NOT EXISTS web_sessions (
 );
 ```
 
-The 03:00 `_daily_cleanup` also deletes expired/used login tokens, expired sessions, and cached thumbnails older than 14 days. No changes to the `posts` table.
+The 03:00 `_daily_cleanup` also deletes expired/used login tokens, expired sessions, and cached thumbnails older than 14 days.
+
+One additive column on `posts`: `deleted_from_status TEXT` (added with `ALTER TABLE ... ADD COLUMN`, the repo's migration pattern). The board writes it when it soft-deletes a post so Undo can restore the exact previous status (`pending`, `failed` or `posted`). Without it, undoing the delete of a failed or posted post would turn it into a pending one and risk re-sending it.
 
 ## 6. Post semantics
 
@@ -172,13 +174,13 @@ Scheduler synchronisation:
 | Set / change time (future) | `scheduled_time = t` | `schedule_single_post(id, t)` (replaces the job) - only while the post is pending; a failed post just stores the time and gets its job on Retry |
 | Clear time (unschedule) | `scheduled_time = NULL` | `cancel_post_job(id)` |
 | Delete | `status = 'deleted'` | `cancel_post_job(id)` |
-| Restore | `status = 'pending'`; if the old time is still in the future keep it, otherwise `scheduled_time = NULL` (back to **Queued**) | re-arm job only if the time was kept |
+| Restore | `status = deleted_from_status`. For a previously pending post: keep its time if still in the future, otherwise `scheduled_time = NULL` (back to **Queued**). Failed and posted posts keep their times untouched. A post with no `deleted_from_status` (deleted by the bot, not the board) is not restorable: `409`. | re-arm job only for a pending post whose time was kept |
 | Post now | `scheduled_time = now + 60 s` | `schedule_single_post` |
 | Retry (failed only) | `status = 'pending'`, `retry_count = 0`, `failure_reason = NULL`; keep `scheduled_time` if it is in the future, else `now + 10 s` | `schedule_single_post` |
 | Move channel | `channel_id = c` | none (the job reads the row at send time) |
 | Caption / media change | `description`, `caption_entities` / `file_path`, `media_type` | none (the job reads the row at send time) |
 
-A restored post can never publish unexpectedly: if its time passed while it was deleted it returns to the queue instead of becoming overdue (the 5-minute monitor would otherwise send it within minutes).
+A restored post can never publish unexpectedly: if its time passed while it was deleted it returns to the queue instead of becoming overdue (the 5-minute monitor would otherwise send it within minutes). A restored failed or posted post keeps that status, so Undo can never cause a re-send.
 
 If the scheduler step raises after the commit (it is in-memory and runs on validated input, so this is not expected), the API returns `500`, logs it, and the board refetches stored state. A restart rebuilds all jobs from the database.
 
@@ -199,7 +201,7 @@ The channel's signature is applied at publish time, so moving a post to another 
 - **Auto-detected entities** (URL, mention, hashtag, cashtag, email, phone, bot command) have no tag. When the caption is edited, each original auto entity is carried over to the new text if the exact span of text it covered is still present (mapped with a sequence diff), so fixing a typo elsewhere never strips a link or hashtag.
 - An empty caption is stored as `NULL` for both columns.
 - Limit: 1024 characters for media captions. The editor shows a live counter; the API rejects longer captions with `400`. The channel signature is appended at publish only if the result still fits in 1024, so the panel shows the signature as a grey read-only suffix and warns when it will not fit.
-- The sanitized HTML preview is returned by the server (`caption_html`); the browser only inserts it into a dedicated preview container.
+- The sanitized HTML preview is always produced by the server (`caption_html` in the post detail, and `POST /api/caption/preview` while typing), so there is a single parser and sanitizer; the browser only inserts the result into a dedicated preview container.
 
 ### 6.6 Media
 
@@ -215,7 +217,7 @@ The channel's signature is applied at publish time, so moving a post to another 
 
 ### 6.7 Delete, restore, bulk
 
-- **Delete** is a soft delete (`status='deleted'`) plus `cancel_post_job`. Media is removed by the existing nightly `purge_deleted_posts`. The UI shows an Undo toast; `restore` works until the purge runs.
+- **Delete** is a soft delete (`status='deleted'`, previous status saved in `deleted_from_status`) plus `cancel_post_job`. Media is removed by the existing nightly `purge_deleted_posts`. The UI shows an Undo toast; `restore` works until the purge runs.
 - **Bulk** (`POST /api/posts/bulk`): `action` is `delete`, `restore`, `move_channel` or `shift`; up to 500 ids per call. The result is a per-post list `{id, ok, error?}`. Posts that cannot be changed (sending, wrong status for the action, shift landing in the past, not owned) are reported as skipped and never fail the rest of the batch. The target channel of `move_channel` is ownership-checked once.
 - **Shift** is `{unit: "hours"|"days", amount: int}` (negative allowed, bounded to one year). It applies to Scheduled posts only, uses **Kyiv wall-clock arithmetic** (as `reschedule_all_posts_from_today` does, to stay correct across DST), and re-checks the 60-second minimum per post. The matching scheduler job is moved for each changed post.
 - Bulk delete's Undo calls bulk `restore` with the same ids.
@@ -233,6 +235,7 @@ All routes require a session except `GET /login`, `POST /login` and the static a
 | `GET /api/posts/{id}` | Full post (see 7.1) |
 | `GET /api/posts/{id}/media?i=` | Original file |
 | `GET /api/posts/{id}/thumb?i=&w=` | Cached thumbnail (photos) |
+| `POST /api/caption/preview` | `{caption, channel_id?}` -> `{ok, html, length, limit, signature_fits, error}`. Drives the live preview and counter while typing; always `200`, with `ok=false` and an `error` message when the tags are invalid. |
 | `PATCH /api/posts/{id}` | Any subset of `{caption, scheduled_time, channel_id}`; `scheduled_time: null` unschedules. One atomic update. Returns the updated post. |
 | `PUT /api/posts/{id}/media` | Multipart: `file`, optional `as_file` |
 | `POST /api/posts/{id}/post-now` | Queued/Scheduled to now + 60 s |
