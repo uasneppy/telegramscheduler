@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir \
     "apscheduler>=3.11.0" \
     "pytz>=2025.2" \
     "pillow>=11.3.0" \
+    "aiohttp>=3.10,<4" \
     "tzdata>=2025.2"
 
 COPY config.py main.py ./

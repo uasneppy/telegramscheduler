@@ -194,3 +194,17 @@ def test_dashboard_stats():
     s = Database.get_dashboard_stats(3)
     assert (s['channels'], s['queued'], s['scheduled'], s['failed'], s['overdue']) == (1, 1, 2, 1, 1)
     assert s['next_post']['channel_name'] == 'C'
+
+
+def test_web_schema_present():
+    from bot.database import init_database
+
+    conn = Database.get_connection()
+    c = conn.cursor()
+    tables = {row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert {'web_login_tokens', 'web_sessions'} <= tables
+    post_columns = {row[1] for row in c.execute("PRAGMA table_info(posts)")}
+    assert 'deleted_from_status' in post_columns
+    conn.close()
+
+    init_database()  # idempotent: second run must not raise

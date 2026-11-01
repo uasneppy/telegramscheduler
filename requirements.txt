@@ -4,3 +4,4 @@ pytz==2025.2
 Pillow==11.3.0
 aiofiles==24.1.0
 tzdata==2025.2
+aiohttp==3.14.5

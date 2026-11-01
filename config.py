@@ -35,6 +35,16 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", None)
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 DATABASE_PATH = os.path.join(DATA_DIR, "bot_data.db")
 UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+THUMBS_DIR = os.path.join(DATA_DIR, "thumbs")
+
+# Web board (optional): the board is off unless WEB_BASE_URL is set, e.g.
+# WEB_BASE_URL="https://board.example.com". A trailing "/" is stripped.
+WEB_BASE_URL = (os.getenv("WEB_BASE_URL") or "").strip().rstrip("/") or None
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+try:
+    WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
+except ValueError:
+    WEB_PORT = 8080
 
 # Timezone settings
 TIMEZONE = "Europe/Kiev"  # Kyiv timezone

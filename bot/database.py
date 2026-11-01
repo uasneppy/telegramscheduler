@@ -251,6 +251,31 @@ def init_database():
     except sqlite3.OperationalError:
         pass
     
+    # Add deleted_from_status column so web-board undo can restore a deleted post (migration)
+    try:
+        cursor.execute('ALTER TABLE posts ADD COLUMN deleted_from_status TEXT')
+        logger.info("Added deleted_from_status column to posts table")
+    except sqlite3.OperationalError:
+        pass
+
+    # Web board sign-in: single-use login tokens and browser sessions (hashes only)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS web_login_tokens (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            session_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    ''')
+
     # Create post_backups table for backup functionality
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS post_backups (
