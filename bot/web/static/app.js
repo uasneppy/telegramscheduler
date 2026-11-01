@@ -41,7 +41,10 @@ const state = {
   ids: new Set(),    // ids of the rows shown, so a row never appears twice
   lastDay: null,     // day key of the last day header shown
   request: null,     // AbortController of the list request in flight
-  failed: false,     // a load failed: no automatic loading until Retry or Refresh
+  loaded: false,     // the rows shown are the result of a finished load of this view
+  // The banner message of each source's last failure, null once it last succeeded.
+  // The banner shows while either is set; a list error also stops automatic loading.
+  errors: { me: null, list: null },
   signedOut: false,
   searchTimer: 0,
   toastTimer: 0,
@@ -323,7 +326,12 @@ function postRow(item) {
   select.type = 'checkbox';
   select.disabled = readOnly;
   select.setAttribute('aria-label', `Select post, ${rowLabel(item)}`);
-  row.append(select, timeCell(item), mediaCell(item), bodyCell(item), metaCell(item), actionsCell(item));
+  // Time and meta share a wrapper: on desktop it is display:contents (both stay grid
+  // columns), on phones it is one wrapping line, so the channel never squeezes into
+  // the space a long time leaves.
+  const head = make('div', 'row-head');
+  head.append(timeCell(item), metaCell(item));
+  row.append(select, head, mediaCell(item), bodyCell(item), actionsCell(item));
   return row;
 }
 
@@ -343,6 +351,7 @@ function clearList() {
   state.ids.clear();
   state.lastDay = null;
   state.cursor = null;
+  state.loaded = false;
 }
 
 function appendItems(items) {
@@ -366,11 +375,11 @@ function appendItems(items) {
 function updateListFooter() {
   const busy = state.request !== null;
   el.list.setAttribute('aria-busy', String(busy));
-  const empty = !busy && !state.failed && state.ids.size === 0;
+  const empty = !busy && state.loaded && state.ids.size === 0;
   el.empty.hidden = !empty;
   if (empty) el.empty.textContent = state.channel || state.q ? 'No posts match these filters.' : 'Nothing here yet.';
   if (busy) el.status.textContent = 'Loading…';
-  else if (state.ids.size > 0 && state.cursor === null) el.status.textContent = 'End of list';
+  else if (state.loaded && state.ids.size > 0 && state.cursor === null) el.status.textContent = 'End of list';
   else el.status.textContent = '';
   el.refresh.classList.toggle('is-spinning', busy);
 }
@@ -383,12 +392,9 @@ async function runListRequest(work) {
   updateListFooter();
   try {
     await work(controller.signal, () => state.request === controller);
-    if (state.request === controller) {
-      state.failed = false;
-      hideBanner();
-    }
+    if (state.request === controller) reportSuccess('list');
   } catch (error) {
-    if (state.request === controller) handleError(error);
+    if (state.request === controller) reportFailure('list', error);
   } finally {
     if (state.request === controller) {
       state.request = null;
@@ -401,6 +407,9 @@ async function runListRequest(work) {
 // Load the current tab from its start. keepRows refetches at least as many rows
 // as are shown and swaps them in at once, so a refresh keeps the reader's place.
 function reloadList({ keepRows = false } = {}) {
+  // The hash's channel can only be checked against /api/me's channels, so until
+  // /api/me has answered once the list waits, and asking for it retries /api/me.
+  if (!state.me) return refreshAll();
   const wanted = keepRows ? state.ids.size : 0;
   if (!keepRows) {
     clearList();
@@ -418,11 +427,12 @@ function reloadList({ keepRows = false } = {}) {
     clearList();
     appendItems(items);
     state.cursor = cursor;
+    state.loaded = true;
   });
 }
 
 function loadMore() {
-  if (state.request || !state.cursor || state.failed || state.signedOut) return;
+  if (state.request || !state.cursor || state.errors.list || state.signedOut) return;
   const cursor = state.cursor;
   runListRequest(async (signal, isCurrent) => {
     const page = await getJson(postsUrl(cursor), signal);
@@ -458,6 +468,7 @@ function renderChannels(channels) {
   });
   el.channel.replaceChildren(el.channel.options[0], ...options);
   el.channel.value = state.channel;
+  el.channel.disabled = false; // disabled in the markup until the options are known
 }
 
 function activeChannels() {
@@ -473,42 +484,54 @@ function dropUnknownChannel() {
   writeHash();
 }
 
+// Counts keep the tabs' "–" until the first answer, and the last known numbers
+// after a later failure (the banner says the refresh failed).
 async function loadMe() {
   try {
     state.me = await getJson('/api/me');
     renderCounts(state.me.counts || {});
     dropUnknownChannel();
     renderChannels(activeChannels());
+    reportSuccess('me');
   } catch (error) {
-    handleError(error);
+    reportFailure('me', error);
   }
 }
 
 // --- refresh, banner, toast, signed out ---------------------------------------------
 
+// Refetch /api/me and the list (Refresh, Retry, coming back to the browser tab).
 async function refreshAll() {
   if (state.signedOut) return;
-  state.failed = false;
-  hideBanner();
+  if (!state.me) {
+    // Never answered yet: the list waits for the channel check.
+    await loadMe();
+    if (state.me) await reloadList();
+    else updateListFooter();
+    return;
+  }
   const channelBefore = state.channel;
   await Promise.all([loadMe(), reloadList({ keepRows: true })]);
   if (state.channel !== channelBefore) reloadList();
 }
 
-function handleError(error) {
+function reportFailure(source, error) {
   if (error.name === 'AbortError' || state.signedOut || error.status === 401) return;
-  state.failed = true;
-  if (error instanceof ApiError) {
-    el.bannerText.textContent = error.message;
-  } else {
-    console.error(error); // a bug in this page, not a network or server problem
-    el.bannerText.textContent = 'Something went wrong while showing the posts. Try again.';
-  }
-  el.banner.hidden = false;
+  if (!(error instanceof ApiError)) console.error(error); // a bug in this page, not a network or server problem
+  state.errors[source] = error instanceof ApiError ? error.message : 'Something went wrong on this page. Try again.';
+  renderBanner();
 }
 
-function hideBanner() {
-  el.banner.hidden = true;
+function reportSuccess(source) {
+  state.errors[source] = null;
+  renderBanner();
+}
+
+// The banner stays while /api/me or the list is failing; it goes once both last succeeded.
+function renderBanner() {
+  const message = state.errors.list || state.errors.me;
+  if (message) el.bannerText.textContent = message;
+  el.banner.hidden = !message;
 }
 
 function showToast(text) {
@@ -556,6 +579,9 @@ function syncTabs() {
 function syncControls() {
   syncTabs();
   el.channel.value = state.channel;
+  // Before /api/me answers, only "All channels" exists (and the select is disabled):
+  // show it instead of a blank select.
+  if (el.channel.selectedIndex < 0) el.channel.selectedIndex = 0;
   el.search.value = state.q;
 }
 
@@ -639,10 +665,9 @@ async function start() {
   readHash();
   syncControls();
   bindControls();
-  // The channel list decides whether the hash's channel is still valid, so it comes first.
-  await loadMe();
   writeHash();
-  if (!state.signedOut) reloadList();
+  // /api/me first: its channel list decides whether the hash's channel is valid.
+  await refreshAll();
 }
 
 start();

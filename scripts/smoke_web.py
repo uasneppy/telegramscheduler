@@ -49,18 +49,49 @@ LIST_READY_JS = """() => {
     return list !== null && list.getAttribute('aria-busy') === 'false'
         && (list.querySelector('.post-row') !== null || (empty !== null && !empty.hidden));
 }"""
+# Problems with rows that do not fit: a channel name cut short, or a chip or badge
+# running into the row's buttons.
+ROW_FIT_JS = """() => {
+    const problems = [];
+    for (const row of document.querySelectorAll('#post-list .post-row')) {
+        const buttons = row.querySelector('.row-actions').getBoundingClientRect();
+        for (const chip of row.querySelectorAll('.channel-chip')) {
+            if (chip.scrollWidth > chip.clientWidth + 1) {
+                problems.push(`row ${row.dataset.id}: channel '${chip.textContent}' is cut to ${chip.clientWidth}px of ${chip.scrollWidth}px`);
+            }
+        }
+        for (const node of row.querySelectorAll('.channel-chip, .badge')) {
+            const right = node.getBoundingClientRect().right;
+            if (right > buttons.left + 0.5) {
+                problems.push(`row ${row.dataset.id}: '${node.textContent}' ends at ${right}px, the buttons start at ${buttons.left}px`);
+            }
+        }
+    }
+    return problems;
+}"""
+NO_COUNT = "–"  # shown in a tab until /api/me has answered
 
 
 class Smoke:
     """The browser, the signed-in context and the errors seen on every page."""
 
-    def __init__(self, browser, base: str):
+    def __init__(self, browser, base: str, shots: Path | None = None):
         self.browser = browser
         self.base = base
+        self.shots = shots
         self.context = None
         self.storage = None
         self.page_errors: list[str] = []
         self.console_errors: list[str] = []
+
+    def shot(self, page, name: str) -> None:
+        """Save a screenshot when SMOKE_SHOTS names a folder."""
+        if self.shots is None:
+            return
+        self.shots.mkdir(parents=True, exist_ok=True)
+        path = self.shots / f"{name}.png"
+        page.screenshot(path=str(path))
+        print(f"SHOT {path}", flush=True)
 
     def new_context(self, **options):
         context = self.browser.new_context(storage_state=self.storage, **options)
@@ -400,6 +431,63 @@ def check_error_banner_and_retry(smoke: Smoke):
         scroll_to_end(page, 2 * PAGE_SIZE)
 
 
+def check_me_failure_shows_banner(smoke: Smoke):
+    """A failed /api/me keeps the banner up (a list success does not hide it), counts read '–',
+    the list waits for the channel check, and Retry restores counts, channel filter and list."""
+    failures = {"me": 2}
+
+    def flaky_me(route):
+        if failures["me"] > 0:
+            failures["me"] -= 1
+            route.fulfill(status=500, json={"error": "internal", "message": "Something went wrong on the server."})
+        else:
+            route.continue_()
+
+    counts = smoke.api("/api/me")["counts"]
+    count = {tab: f'[data-tab="{tab}"] .count' for tab in TABS}
+    with smoke.page(None, expect_failed_requests=True) as page:
+        page.route(lambda url: urlsplit(url).path == "/api/me", flaky_me)
+        page.goto(f"{smoke.base}/#tab=scheduled&channel=-1002")
+        banner = page.locator("#banner")
+        expect(banner).to_be_visible()
+        for tab in TABS:
+            expect(page.locator(count[tab])).to_have_text(NO_COUNT)
+        page.wait_for_timeout(500)
+        expect(banner).to_be_visible()
+        expect(page.locator("#post-list .post-row")).to_have_count(0)
+        expect(page.locator("#channel-filter")).to_be_disabled()
+        expect(page.locator("#channel-filter")).to_have_value("")
+        # Asking for another tab tries /api/me again; while it still fails, no list loads
+        # (it would be filtered by a channel the select does not show).
+        with page.expect_response(lambda r: urlsplit(r.url).path == "/api/me"):
+            page.click('[data-tab="queued"]')
+        page.wait_for_timeout(500)
+        expect(banner).to_be_visible()
+        expect(page.locator("#post-list .post-row")).to_have_count(0)
+        banner.get_by_role("button", name="Retry").click()
+        expect(banner).to_be_hidden()
+        wait_for_list(page)
+        for tab in TABS:
+            expect(page.locator(count[tab])).to_have_text(str(counts[tab]))
+        expect(page.locator("#channel-filter")).to_be_enabled()
+        expect(page.locator("#channel-filter")).to_have_value("-1002")
+        chips = page.locator("#post-list .post-row .channel-chip").all_inner_texts()
+        assert chips and set(chips) == {"Beta"}, f"chips after Retry: {sorted(set(chips))}"
+        # On refresh the two requests run side by side: whichever finishes last, a
+        # failed /api/me keeps the banner up and the last counts stay.
+        failures["me"] = 1
+        with page.expect_response(lambda r: urlsplit(r.url).path == "/api/me"), page.expect_response(
+            lambda r: "/api/posts?" in r.url
+        ):
+            page.click("#refresh")
+        wait_for_list(page)
+        page.wait_for_timeout(300)
+        expect(banner).to_be_visible()
+        expect(page.locator(count["scheduled"])).to_have_text(str(counts["scheduled"]))
+        banner.get_by_role("button", name="Retry").click()
+        expect(banner).to_be_hidden()
+
+
 def check_refresh_keeps_place(smoke: Smoke):
     """#refresh and coming back to the browser tab refetch counts and rows, keeping the rows loaded."""
 
@@ -447,6 +535,38 @@ def check_list_fits_phone_width(smoke: Smoke):
                 for name in TABS:
                     box = page.locator(f'[data-tab="{name}"]').bounding_box()
                     assert box and box["x"] >= 0 and box["x"] + box["width"] <= 360, f"tab {name} sticks out: {box}"
+                problems = page.evaluate(ROW_FIT_JS)
+                assert not problems, f"{tab}: {problems[0]} ({len(problems)} problems)"
+    finally:
+        context.close()
+
+
+def check_failed_tab_readable_on_phone(smoke: Smoke):
+    """At 360 px a failed row keeps its channel name whole and its badges clear of the
+    buttons, even a failed recurring album on the longest seeded channel name."""
+
+    def worst_case(route):
+        response = route.fetch()
+        body = response.json()
+        if body["items"]:
+            body["items"][0].update(
+                channel_id="-1001", channel_name="Alpha", media_type="album", media_count=3,
+                is_recurring=True, recurring_interval_hours=24,
+            )
+        route.fulfill(response=response, json=body)
+
+    context = smoke.new_context(**PHONE)
+    try:
+        with smoke.page(None, context=context) as page:
+            page.route(lambda url: "/api/posts?" in url and "status=failed" in url, worst_case)
+            page.goto(f"{smoke.base}/#tab=failed")
+            wait_for_list(page)
+            first = page.locator("#post-list .post-row").first
+            for label in ("Failed", "Album ×3", "Recurring"):
+                expect(first.locator(".badge", has_text=label)).to_have_count(1)
+            problems = page.evaluate(ROW_FIT_JS)
+            assert not problems, f"{problems[0]} ({len(problems)} problems)"
+            smoke.shot(page, "failed-mobile-worst-case-light")
     finally:
         context.close()
 
@@ -484,9 +604,11 @@ CHECKS = [
     check_album_and_recurring_badges,
     check_read_only_statuses,
     check_error_banner_and_retry,
+    check_me_failure_shows_banner,
     check_refresh_keeps_place,
     check_unauthorized_shows_run_web,
     check_list_fits_phone_width,
+    check_failed_tab_readable_on_phone,
 ]
 # Sign-out ends the session, so it runs after everything else, before the error tally.
 FINAL_CHECKS = [check_signout_post_succeeds, check_no_js_errors]
@@ -500,21 +622,20 @@ SHOTS = (
     ("scheduled-mobile-light", PHONE, "light", "#tab=scheduled"),
     ("scheduled-mobile-dark", PHONE, "dark", "#tab=scheduled"),
     ("failed-desktop-light", DESKTOP, "light", "#tab=failed"),
+    ("failed-mobile-light", PHONE, "light", "#tab=failed"),
+    ("failed-mobile-dark", PHONE, "dark", "#tab=failed"),
     ("posted-mobile-dark", PHONE, "dark", "#tab=posted"),
     ("queued-desktop-dark", DESKTOP, "dark", "#tab=queued"),
 )
 
 
-def take_screenshots(smoke: Smoke, folder: Path) -> None:
-    folder.mkdir(parents=True, exist_ok=True)
+def take_screenshots(smoke: Smoke) -> None:
     for name, device, scheme, hash_ in SHOTS:
         context = smoke.new_context(color_scheme=scheme, **device)
         try:
             with smoke.page(hash_, context=context) as page:
                 page.wait_for_load_state("networkidle")
-                path = folder / f"{name}.png"
-                page.screenshot(path=str(path))
-                print(f"SHOT {path}", flush=True)
+                smoke.shot(page, name)
         finally:
             context.close()
 
@@ -560,12 +681,12 @@ def main() -> int:
         browser = playwright.chromium.launch(
             executable_path=os.environ.get("CHROMIUM_PATH") or None, args=["--no-sandbox"]
         )
-        smoke = Smoke(browser, base)
+        smoke = Smoke(browser, base, Path(shots) if shots else None)
         if not run("sign_in", lambda s: sign_in(s, login_url), smoke):
             return 1
         results = [run(check.__name__, check, smoke) for check in CHECKS]
         if shots:
-            take_screenshots(smoke, Path(shots))
+            take_screenshots(smoke)
         results += [run(check.__name__, check, smoke) for check in FINAL_CHECKS]
         browser.close()
     print(f"{sum(results)}/{len(results)} checks passed", flush=True)

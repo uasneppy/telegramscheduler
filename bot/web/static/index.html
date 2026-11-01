@@ -39,7 +39,7 @@
       </div>
       <div class="filters">
         <label class="visually-hidden" for="channel-filter">Channel</label>
-        <select id="channel-filter" class="field">
+        <select id="channel-filter" class="field" disabled>
           <option value="">All channels</option>
         </select>
         <div class="search-field">
@@ -62,10 +62,10 @@
 
   <nav class="tabs" aria-label="Post lists">
     <div class="tabs-inner" role="tablist">
-      <button id="tab-scheduled" class="tab" type="button" role="tab" data-tab="scheduled" aria-controls="post-list" aria-selected="true"><span class="tab-label">Scheduled</span> <span class="count">0</span></button>
-      <button id="tab-queued" class="tab" type="button" role="tab" data-tab="queued" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Queued</span> <span class="count">0</span></button>
-      <button id="tab-failed" class="tab" type="button" role="tab" data-tab="failed" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Failed</span> <span class="count">0</span></button>
-      <button id="tab-posted" class="tab" type="button" role="tab" data-tab="posted" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Posted</span> <span class="count">0</span></button>
+      <button id="tab-scheduled" class="tab" type="button" role="tab" data-tab="scheduled" aria-controls="post-list" aria-selected="true"><span class="tab-label">Scheduled</span> <span class="count">–</span></button>
+      <button id="tab-queued" class="tab" type="button" role="tab" data-tab="queued" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Queued</span> <span class="count">–</span></button>
+      <button id="tab-failed" class="tab" type="button" role="tab" data-tab="failed" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Failed</span> <span class="count">–</span></button>
+      <button id="tab-posted" class="tab" type="button" role="tab" data-tab="posted" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Posted</span> <span class="count">–</span></button>
     </div>
   </nav>
 

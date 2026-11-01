@@ -290,8 +290,13 @@ body > main:not(.board) button:hover {
   color: var(--text);
 }
 
-.field:hover {
+.field:hover:not(:disabled) {
   border-color: var(--text-3);
+}
+
+.field:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .field:focus-visible {
@@ -557,6 +562,11 @@ select.field {
   height: 18px;
   margin: 0;
   accent-color: var(--accent);
+}
+
+/* Desktop: the wrapper adds no box, so time and meta are grid items of the row. */
+.row-head {
+  display: contents;
 }
 
 .time {
@@ -856,27 +866,33 @@ select.field {
     display: none;
   }
 
-  /* Phone rows: time, channel and badges on top, the caption below them. Items
-     sit on the first line, so a row whose badges wrap still reads from the top. */
-  .post-row {
+  /* Phone rows: a head line (time, channel, badges) beside the buttons, the caption
+     below at full width. The head wraps: when channel and badges do not fit beside
+     the time (a Failed row's "01.11 14:00", an album), they move under it whole,
+     so a channel name is never cut down to fit. Items sit on the first line. */
+  .post-row,
+  #post-list[data-showing="queued"] .post-row {
     grid-template-areas:
-      "select media time meta actions"
-      "select media body body body";
-    grid-template-columns: 20px var(--media) auto minmax(0, 1fr) auto;
+      "select media head actions"
+      "select media body body";
+    grid-template-columns: 20px var(--media) minmax(0, 1fr) auto;
     align-items: start;
     column-gap: 10px;
     row-gap: 4px;
     padding: 10px 8px 10px 10px;
   }
 
-  #post-list[data-showing="queued"] .post-row {
-    grid-template-areas:
-      "select media meta actions"
-      "select media body body";
-    grid-template-columns: 20px var(--media) minmax(0, 1fr) auto;
+  .row-head {
+    display: flex;
+    flex-wrap: wrap;
+    grid-area: head;
+    align-items: center;
+    gap: 4px 8px;
+    min-width: 0;
   }
 
   .time {
+    flex: none;
     line-height: 22px;
   }
 
