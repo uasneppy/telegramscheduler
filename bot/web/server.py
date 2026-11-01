@@ -470,12 +470,13 @@ async def start_web(
 
     Arguments default to the `config` values (an explicit `port=0` or empty
     allowlist is honored, not replaced). No `base_url` means the board is
-    disabled and nothing is logged. An invalid configuration or a port that
+    disabled (one INFO line). An invalid configuration or a port that
     cannot be bound is logged and the bot carries on without the board; this
     function does not raise.
     """
     base_url = config.WEB_BASE_URL if base_url is None else base_url
     if not base_url:
+        logger.info("Web board disabled: WEB_BASE_URL is not set.")
         return None
     host = config.WEB_HOST if host is None else host
     port = config.WEB_PORT if port is None else port

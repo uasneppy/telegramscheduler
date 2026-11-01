@@ -155,8 +155,11 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    help_text = """
+
+    # /web is listed only when the board is running (main.post_init fills bot_data["web_runner"])
+    web_line = "• `/web` - Open the web board\n" if context.application.bot_data.get("web_runner") else ""
+
+    help_text = f"""
 ❓ *Help & Commands*
 
 *🎯 Quick Start:*
@@ -184,8 +187,7 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • `/edit_captions` - Edit captions for scheduled posts one by one
 • `/clearqueue` - Clear pending (unscheduled) posts
 • `/clearscheduled` - Clear scheduled posts
-• `/web` - Open the web board (if enabled on this server)
-• `/reset` - Clear all user data
+{web_line}• `/reset` - Clear all user data
 • `/cancel` - Cancel current operation
 • `/help` - This comprehensive help
 

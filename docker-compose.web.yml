@@ -1,0 +1,9 @@
+# Optional override: publishes the web board's port on the host's loopback only,
+# for a tunnel or reverse proxy running on the host. Not needed when the tunnel
+# runs as a container on the compose network (it can reach bot:<WEB_PORT>).
+# Enable it with COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml in .env,
+# or run: docker compose -f docker-compose.yml -f docker-compose.web.yml up -d
+services:
+  bot:
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:${WEB_PORT:-8080}"

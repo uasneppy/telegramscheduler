@@ -13,10 +13,9 @@ services:
       # Per-user media storage quota in MB (0 = unlimited)
       MAX_USER_STORAGE_MB: ${MAX_USER_STORAGE_MB:-2048}
       # Web board: leave WEB_BASE_URL empty to keep it off. Needs ALLOWED_USER_IDS.
+      # No host port is published here; to reach the board from a tunnel running on
+      # the host, add docker-compose.web.yml (see .env.example).
       WEB_BASE_URL: ${WEB_BASE_URL:-}
       WEB_PORT: ${WEB_PORT:-8080}
-    ports:
-      # Loopback only: put a tunnel or reverse proxy (HTTPS) in front of it
-      - "127.0.0.1:${WEB_PORT:-8080}:${WEB_PORT:-8080}"
     volumes:
       - ./data:/data

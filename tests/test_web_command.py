@@ -113,6 +113,29 @@ def test_command_when_disabled(board_url):
     assert _count("web_login_tokens") == 0
 
 
+# --- /help ------------------------------------------------------------------------------
+
+
+def _help_text(web_runner):
+    from bot.handlers.menu import help_handler
+
+    update, message = _update()
+    asyncio.run(help_handler(update, _context(runner=web_runner)))
+    assert len(message.replies) == 1
+    return message.replies[0][0]
+
+
+def test_help_lists_web_command_only_when_board_runs():
+    enabled = _help_text(web_runner=object())
+    disabled = _help_text(web_runner=None)
+
+    assert "• `/web` - Open the web board\n" in enabled
+    assert "/web" not in disabled
+    # The line sits in the Management Commands list and nothing else differs.
+    assert enabled.index("Management Commands") < enabled.index("/web") < enabled.index("/reset")
+    assert enabled.replace("• `/web` - Open the web board\n", "") == disabled
+
+
 # --- start_web / stop_web --------------------------------------------------------------
 
 
@@ -126,11 +149,14 @@ def test_start_web_disabled_or_invalid_returns_none(monkeypatch, caplog):
     monkeypatch.setattr(config, "WEB_BASE_URL", None)
     monkeypatch.setattr(config, "ALLOWED_USER_IDS", {5})
 
-    # Not configured: nothing started and nothing logged.
-    with caplog.at_level(logging.INFO):
-        assert _start() is None
-        assert _start(base_url="") is None
-    assert caplog.records == []
+    # Not configured: nothing started, exactly one INFO line says why, nothing at WARNING or above.
+    for kwargs in ({}, {"base_url": ""}):
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert _start(**kwargs) is None
+        assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+            (logging.INFO, "Web board disabled: WEB_BASE_URL is not set.")
+        ], kwargs
 
     invalid = [
         ({"base_url": BASE, "allowed_user_ids": set()}, "ALLOWED_USER_IDS"),
