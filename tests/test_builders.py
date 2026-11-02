@@ -1,13 +1,8 @@
 """Pure UI builders: menus, settings, retry, schedule options, pickers."""
 
-from datetime import datetime
-
-import pytz
-
 from bot import handlers
 from bot.database import Database, serialize_dt
-
-KYIV = pytz.timezone('Europe/Kiev')
+from web_helpers import future_noon
 
 
 def _kb_str(markup):
@@ -27,7 +22,7 @@ def test_main_menu_dashboard_with_data(user):
     c.execute("INSERT INTO posts (user_id, file_path, mode, status) VALUES (?, 'q', 1, 'pending')", (user.id,))
     c.execute("INSERT INTO posts (user_id, file_path, mode, status) VALUES (?, 'f', 1, 'failed')", (user.id,))
     c.execute("INSERT INTO posts (user_id, file_path, mode, status, channel_id, scheduled_time) VALUES (?, 's', 1, 'pending', '@c', ?)",
-              (user.id, serialize_dt(KYIV.localize(datetime(2030, 1, 1, 12, 0)))))
+              (user.id, serialize_dt(future_noon())))  # ahead of the real clock: the next post
     conn.commit()
     conn.close()
 

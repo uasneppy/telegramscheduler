@@ -1,13 +1,28 @@
-"""Shared helpers for the web board tests: a fake scheduler, row builders and HTTP clients."""
+"""Shared helpers for the web board tests: a fake scheduler, row builders, HTTP clients and a real-clock time."""
 
 from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta
 
+import pytz
 from aiohttp.test_utils import TestClient, TestServer
 
 from bot.database import Database, serialize_dt
 from bot.web import auth
 from bot.web.server import create_app
 from bot.web.settings import origin_of
+
+
+KYIV = pytz.timezone("Europe/Kiev")
+
+
+def future_noon(days: int = 30) -> datetime:
+    """Noon Kyiv time `days` days after the real today, so always ahead of the real clock.
+
+    For tests whose code compares against the real clock (a new time needs at
+    least 60 s of lead). Noon is never inside a DST gap or overlap.
+    """
+    day = datetime.now(KYIV).date() + timedelta(days=days)
+    return KYIV.localize(datetime.combine(day, time(12, 0)))
 
 
 class FakeScheduler:
