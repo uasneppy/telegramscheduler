@@ -1249,8 +1249,12 @@ body.panel-open .dock {
   line-height: 1;
 }
 
-.tool:hover {
+.tool:hover:not(:disabled) {
   background: var(--surface);
+}
+
+.tool:disabled {
+  opacity: 0.45;
 }
 
 .tool[aria-expanded="true"] {

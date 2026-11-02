@@ -61,6 +61,10 @@ _FLAG_MAX_BYTES = 16
 _FLAG_TRUE = ("1", "true", "on")
 _FLAG_FALSE = ("", "0", "false", "off")
 _MALFORMED_UPLOAD = "The upload is malformed."
+# Spec 6.6 step 4: said when a photo too big for Telegram was stored as a document.
+_DOWNGRADE_NOTICE = (
+    "This photo is larger than Telegram's photo limit, so it was stored as a file at its original quality."
+)
 
 
 # --- request parsing ------------------------------------------------------------------
@@ -268,6 +272,8 @@ async def _replace_media(request: web.Request) -> web.Response:
     # Nothing runs between the two calls, and replace_media removes stored.file_path
     # itself on any failure it raises, so the route has no file of its own to clean up.
     detail = await service.replace_media(user_id, post_id, stored)
+    if stored.downgraded:
+        detail["notice"] = _DOWNGRADE_NOTICE  # the key is there only when something needs saying
     return web.json_response(detail)
 
 

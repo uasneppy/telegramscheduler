@@ -663,6 +663,39 @@ def test_put_media_happy_path_and_as_file():
     assert _files_under(UPLOADS_DIR) == [row["file_path"]]
 
 
+def test_put_media_notice_when_photo_stored_as_file(monkeypatch):
+    """Spec 6.6 step 4: a photo over Telegram's photo limit is stored as a document, with a notice."""
+    monkeypatch.setattr(media, "PHOTO_MAX_BYTES", 1024)
+    pid = insert_post(scheduled=FUTURE, file_path=_upload_file("old.jpg"), media_type="photo")
+    small = _png_bytes(size=(4, 4))
+    buffer = io.BytesIO()
+    Image.frombytes("RGB", (64, 64), os.urandom(64 * 64 * 3)).save(buffer, "PNG")  # noise: no compression
+    large = buffer.getvalue()
+    assert len(small) <= 1024 < len(large)
+
+    async def scenario():
+        async with board_client() as client:
+            response = await client.put(f"/api/posts/{pid}/media", data=_form(large, "big.png"), headers=WRITE)
+            body = await _expect(response, 200)
+            assert body["media_type"] == "document"
+            assert "photo limit" in body["notice"] and "original quality" in body["notice"], body["notice"]
+            # Otherwise the answer is the plain post detail, without the key.
+            detail = await _expect(await client.get(f"/api/posts/{pid}"), 200)
+            assert {key: value for key, value in body.items() if key != "notice"} == detail
+
+            response = await client.put(f"/api/posts/{pid}/media", data=_form(small, "small.png"), headers=WRITE)
+            body = await _expect(response, 200)
+            assert body["media_type"] == "photo" and "notice" not in body
+            # A file the person chose to send as a file was not downgraded: no notice either.
+            response = await client.put(
+                f"/api/posts/{pid}/media", data=_form(large, "chosen.png", as_file="1"), headers=WRITE
+            )
+            body = await _expect(response, 200)
+            assert body["media_type"] == "document" and "notice" not in body
+
+    asyncio.run(scenario())
+
+
 async def _raw_put_with_unfinished_body(client, post_id) -> tuple[int, dict]:
     """PUT media announcing a 10 MB body but sending only part of its first boundary, then read the answer.
 

@@ -49,6 +49,7 @@ ALPHA_SIGNATURE = "Alpha News · @alpha_news"  # seeded by dev_web.py; Beta has 
 CAPTION_LIMIT = 1024
 DISCARD_PROMPT = "unsaved"  # the Esc confirmation names the unsaved changes
 POSTED_DELETE_PROMPT = "Removes this record only; the message stays in the channel"
+DOWNGRADE_NOTICE = "This photo is larger than Telegram's photo limit, so it was stored as a file at its original quality."
 
 # Every list row and day header, in document order.
 LIST_NODES_JS = """() => [...document.querySelectorAll('#post-list .day-header, #post-list .post-row')].map(
@@ -1107,10 +1108,25 @@ def check_replace_media_and_as_file(smoke: Smoke):
         open_panel(page, item["id"])
         expect(as_file).not_to_be_checked()
         choose_upload(page, "new-photo")
+
+        def with_notice(route):
+            # The server's notice for a photo it stored as a file (a real one needs a 10 MB photo).
+            if route.request.method != "PUT":
+                route.continue_()
+                return
+            response = route.fetch()
+            route.fulfill(response=response, json={**response.json(), "notice": DOWNGRADE_NOTICE})
+
+        def media_url(url):
+            return urlsplit(url).path == path
+
+        page.route(media_url, with_notice)
         with board_call(page, "PUT", path) as info:
             page.click("#save")
         assert_board_call(smoke, info.value)
         assert last_upload_as_file(page) == "0"
+        expect(page.locator("#toast")).to_contain_text(DOWNGRADE_NOTICE)
+        page.unroute(media_url, with_notice)
         saved = detail(smoke, item["id"])
         assert saved["media_type"] == "photo" and saved["media"][0]["exists"], saved["media"]
         # The row shows the new picture, not a cached copy of the old one.
@@ -1141,6 +1157,67 @@ def check_replace_media_on_post_with_missing_file(smoke: Smoke):
         assert saved["media"][0]["exists"] and saved["media_type"] == "photo", saved["media"]
         image = row(page, item["id"]).locator("img.thumb")
         image_loaded(page, image)
+
+
+def check_write_in_flight_keeps_panel(smoke: Smoke):
+    """While a save is in flight Esc, the scrim and Close do nothing; a failed save leaves the
+    panel on the same post with every input intact; the save sends what the form held when
+    Save was pressed, whatever happens to the form meanwhile."""
+    item = pick(smoke, caption="Fresh bread, every morning from 8.")
+    path = f"/api/posts/{item['id']}"
+    typed = "Fresh bread, every morning from 7."
+    held: list = []
+    prompts: list[str] = []
+
+    def hold_patch(route):
+        if route.request.method == "PATCH":
+            held.append(route)
+        else:
+            route.continue_()
+
+    with smoke.page(expect_failed_requests=True) as page:
+        page.evaluate(RECORD_UPLOADS_JS)
+        page.on("dialog", lambda dialog: (prompts.append(dialog.message), dialog.dismiss()))
+        open_panel(page, item["id"])
+        page.route(lambda url: urlsplit(url).path == path, hold_patch)
+        panel = page.locator("#edit-panel")
+        caption = page.locator("#caption-input")
+        caption.fill(typed)
+        page.check("#as-file")
+        choose_upload(page, "original")
+        page.click("#save")
+        page.wait_for_function("() => document.querySelector('#save').textContent === 'Saving…'")
+        page.wait_for_timeout(200)
+        assert len(held) == 1, "the PATCH was not held"
+        page.keyboard.press("Escape")
+        page.mouse.click(40, 400)  # the scrim beside the side panel
+        page.wait_for_timeout(200)
+        assert panel.is_visible(), "the panel closed while its save was in flight"
+        assert not prompts, f"closing during a save asked: {prompts}"
+        expect(page.locator("#panel-close")).to_be_disabled()
+        # The save fails: the message shows in the panel, which still holds this post and its input.
+        held.pop().fulfill(status=400, json={"error": "invalid_request",
+                                             "message": "Scheduled time must be at least 60 seconds in the future"})
+        expect(page.locator("#panel-error")).to_contain_text("at least 60 seconds")
+        expect(panel).to_have_attribute("data-post-id", str(item["id"]))
+        expect(caption).to_have_value(typed)
+        expect(page.locator("#as-file")).to_be_checked()
+        expect(page.locator("#panel-media")).to_contain_text("original.png")
+        expect(page.locator("#panel-close")).to_be_enabled()
+        expect(page.locator("#save")).to_be_enabled()
+        # Saved again; the form changes while the PATCH is out, the upload still sends what was chosen.
+        page.click("#save")
+        page.wait_for_timeout(200)
+        assert len(held) == 1, "the second PATCH was not held"
+        page.locator("#as-file").evaluate("box => { box.checked = false; }")
+        with board_call(page, "PUT", f"{path}/media") as info:
+            held.pop().continue_()
+        assert_board_call(smoke, info.value)
+        assert last_upload_as_file(page) == "1", "the upload read the form after the save had started"
+        expect(panel).to_be_hidden()
+    saved = detail(smoke, item["id"])
+    assert saved["caption_text"] == typed and saved["media_type"] == "document", saved
+    assert not prompts, f"prompts: {prompts}"
 
 
 def check_album_media_read_only(smoke: Smoke):
@@ -1341,6 +1418,7 @@ CHECKS = [
     check_conflict_reloads_panel,
     check_replace_media_and_as_file,
     check_replace_media_on_post_with_missing_file,
+    check_write_in_flight_keeps_panel,
     check_album_media_read_only,
     check_read_only_panel,
     check_escape_prompts_when_dirty,

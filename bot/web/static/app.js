@@ -49,7 +49,6 @@ const TAB_OF_STATUS = { queued: 'queued', scheduled: 'scheduled', sending: 'sche
 const SHORTCUTS = { b: 'b', i: 'i', u: 'u', k: 'link' };
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const LINK_SCHEMES = /^(https?|tg):\/\//i;
-const PHOTO_FILE = /\.(jpe?g|png|webp)$/i;
 const DISCARD_QUESTION = 'Discard your unsaved changes to this post?';
 const POSTED_DELETE_QUESTION = 'Delete this posted post from the board? '
   + 'Removes this record only; the message stays in the channel.';
@@ -773,7 +772,9 @@ function setBackgroundInert(inert) {
 // the post can still be edited.
 async function loadPanel(panel, { keepEdits = false } = {}) {
   const seq = ++panel.loadSeq;
-  const edits = keepEdits && panel.baseline ? { changes: changedFields(panel), file: panel.file } : null;
+  const edits = keepEdits && panel.baseline
+    ? { changes: changedFields(panel), file: panel.file, asFile: el.asFile.checked }
+    : null;
   panel.busy = 'load';
   el.panel.dataset.state = 'loading';
   renderControls();
@@ -833,7 +834,10 @@ function applyDetail(panel, detail, edits = null) {
     if ('caption' in changes) el.captionInput.value = changes.caption;
     if ('channel_id' in changes) el.channelSelect.value = changes.channel_id;
     if ('scheduled_time' in changes) el.timeInput.value = changes.scheduled_time || '';
-    if (can.media) panel.file = edits.file;
+    if (can.media) {
+      panel.file = edits.file;
+      el.asFile.checked = edits.asFile; // the file keeps the way it was to be sent
+    }
   }
   renderPanelHeader(detail);
   renderNotices(detail);
@@ -1259,6 +1263,11 @@ function isDirty(panel) {
   return panel.file !== null || Object.keys(changedFields(panel)).length > 0;
 }
 
+// A save, upload, post now, retry or delete is in flight (a detail load is not a write).
+function isWriting(panel) {
+  return panel.busy !== '' && panel.busy !== 'load';
+}
+
 // Why these changes cannot be saved as they are, or ''.
 function saveProblem(panel, changes) {
   if ('caption' in changes && panel.check && !panel.check.ok) return panel.check.error || 'Check the caption.';
@@ -1336,7 +1345,11 @@ function renderControls() {
   // Post now sets its own time, so a pending time change is not saved before it.
   const { scheduled_time: _ignored, ...beforePostNow } = changes;
   const savesFirst = panel.file !== null || Object.keys(beforePostNow).length > 0;
+  const writing = isWriting(panel);
 
+  // A write in flight holds the panel open and its form still, so a failure lands
+  // here with every input as it was sent.
+  el.panelClose.disabled = writing;
   el.save.hidden = !(can.edit || can.media);
   el.save.disabled = busy || !dirty || Boolean(problem);
   setText(el.save, panel.busy === 'save' ? 'Saving…' : 'Save');
@@ -1350,14 +1363,17 @@ function renderControls() {
   el.deleteButton.disabled = busy;
   setText(el.deleteButton, panel.busy === 'delete' ? 'Deleting…' : 'Delete');
 
-  el.captionInput.readOnly = !can.edit;
+  el.captionInput.readOnly = !can.edit || writing;
   el.toolbar.hidden = !can.edit;
-  if (!can.edit) closeLinkRow();
-  el.channelSelect.disabled = !can.edit;
-  el.timeInput.disabled = !can.edit;
+  for (const tool of el.tools) tool.disabled = writing;
+  if (!can.edit || writing) closeLinkRow();
+  el.channelSelect.disabled = !can.edit || writing;
+  el.timeInput.disabled = !can.edit || writing;
   el.unschedule.hidden = !can.edit;
-  el.unschedule.disabled = el.timeInput.value === '' && !timeIncomplete();
+  el.unschedule.disabled = writing || (el.timeInput.value === '' && !timeIncomplete());
   el.mediaReplace.hidden = !can.media;
+  el.mediaInput.disabled = writing;
+  el.mediaUnstage.disabled = writing;
   el.asFile.disabled = busy;
   if (detail) {
     renderCounter(panel);
@@ -1397,7 +1413,9 @@ function actionFailed(panel, error) {
   if (error.status === 404) {
     postGone(panel);
   } else if (state.panel !== panel) {
-    showToast(message); // closed while the action ran
+    // The panel cannot be closed during a write, so only signing out gets here:
+    // never show this answer in a panel that holds another post.
+    showToast(message);
   } else if (error.status === 409) {
     // The post changed under the panel (it was just published, say): say so and show it as it is now.
     showToast(message);
@@ -1429,31 +1447,32 @@ function actionDone(panel, before, detail, message) {
 }
 
 // Save what the person changed: one PATCH with only the changed fields (Post now
-// leaves the time out, it sets its own), then the chosen file. The baseline follows
-// each step, so a later failure never sends a saved change twice. Resolves to a
-// note for the toast ('' when there is none).
+// leaves the time out, it sets its own), then the chosen file. Everything it sends
+// is read from the form here, before the first await, and never again. The
+// baseline follows each step, so a later failure never sends a saved change twice.
+// Resolves to the server's notice about the upload ('' when there is none).
 async function saveChanges(panel, { withTime }) {
+  const postId = panel.id;
   const changes = changedFields(panel);
   if (!withTime) delete changes.scheduled_time;
+  const { file } = panel;
+  const asFile = el.asFile.checked;
   if (Object.keys(changes).length > 0) {
-    panel.detail = await sendJson(`/api/posts/${panel.id}`, 'PATCH', changes);
+    panel.detail = await sendJson(`/api/posts/${postId}`, 'PATCH', changes);
     if ('caption' in changes) panel.baseline.caption = changes.caption;
     if ('channel_id' in changes) panel.baseline.channel = changes.channel_id;
     if ('scheduled_time' in changes) panel.baseline.time = changes.scheduled_time || '';
   }
-  if (!panel.file) return '';
-  const { file } = panel;
-  const asFile = el.asFile.checked;
+  if (!file) return '';
   const form = new FormData();
   form.append('as_file', asFile ? '1' : '0'); // before the file: the server reads it only there
   form.append('file', file, file.name);
-  panel.detail = await apiJson(`/api/posts/${panel.id}/media`, { method: 'PUT', body: form }, 'complete');
-  panel.file = null;
-  mediaReplaced(panel.detail);
-  if (!asFile && PHOTO_FILE.test(file.name) && panel.detail.media_type === 'document') {
-    return 'The photo is over 10 MB, so it goes out as a file.';
-  }
-  return '';
+  const { notice, ...detail } = await apiJson(`/api/posts/${postId}/media`, { method: 'PUT', body: form }, 'complete');
+  panel.detail = detail;
+  if (panel.file === file) panel.file = null;
+  mediaReplaced(detail);
+  // Said when a photo too big for Telegram was stored as a file (spec 6.6).
+  return typeof notice === 'string' ? notice : '';
 }
 
 // "tomorrow at 10:00" or "Wed 04.11 at 10:00", from a Kyiv ISO string.
@@ -1526,13 +1545,17 @@ function postDeleted(_item) {
 
 // --- panel: closing
 
-// Close the panel, asking first when there are unsaved changes (unless forced, or
-// while an action is saving them). Returns whether it closed.
+// Close the panel (Esc, the scrim, Close), asking first when there are unsaved
+// changes. While a write is in flight it stays open, so a failure is shown here
+// with the input intact; `force` is for the panel's own closing after an action.
+// Returns whether it closed.
 function closePanel({ force = false } = {}) {
   const panel = state.panel;
   if (!panel) return true;
-  const saving = panel.busy !== '' && panel.busy !== 'load';
-  if (!force && !saving && isDirty(panel) && !window.confirm(DISCARD_QUESTION)) return false;
+  if (!force) {
+    if (isWriting(panel)) return false;
+    if (isDirty(panel) && !window.confirm(DISCARD_QUESTION)) return false;
+  }
   dropPanel();
   returnFocus(panel);
   return true;
@@ -1745,6 +1768,7 @@ async function start() {
     mediaFileName: document.getElementById('media-file-name'),
     mediaUnstage: document.getElementById('media-unstage'),
     toolbar: document.getElementById('caption-toolbar'),
+    tools: [...document.querySelectorAll('#caption-toolbar [data-fmt]')],
     linkButton: document.querySelector('[data-fmt="link"]'),
     linkRow: document.getElementById('link-row'),
     linkUrl: document.getElementById('link-url'),
