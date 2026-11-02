@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the web board locally on seeded demo data (development only).
 
-    python scripts/dev_web.py           # board with demo posts on http://localhost:8765
-    python scripts/dev_web.py --empty   # user 1 only: no channels, no posts
+    python scripts/dev_web.py                       # board with demo posts on http://localhost:8765
+    python scripts/dev_web.py --empty --port 8766   # user 1 only: no channels, no posts
 
 Everything lives in a fresh temporary DATA_DIR that is deleted on exit, so real
 data is never touched and every start begins from the same seed. The printed
@@ -53,8 +53,7 @@ from bot.web.server import create_app  # noqa: E402
 logger = logging.getLogger("dev_web")
 
 HOST = "localhost"
-PORT = 8765
-BASE_URL = f"http://{HOST}:{PORT}"
+PORT = 8765  # the default; --port picks another, e.g. for an --empty board beside this one
 USER_ID = 1
 ALPHA, BETA = "-1001", "-1002"
 CHANNELS = ((ALPHA, "Alpha"), (BETA, "Beta"))
@@ -292,17 +291,18 @@ def seed(empty: bool) -> str:
 # --- server -----------------------------------------------------------------------
 
 
-async def serve(summary: str) -> None:
-    app = create_app(LoggingScheduler(), BASE_URL, {USER_ID})
+async def serve(summary: str, port: int) -> None:
+    base_url = f"http://{HOST}:{port}"
+    app = create_app(LoggingScheduler(), base_url, {USER_ID})
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     try:
-        await web.TCPSite(runner, HOST, PORT).start()
+        await web.TCPSite(runner, HOST, port).start()
         token = await asyncio.to_thread(auth.create_login_token, USER_ID)
-        print(f"Web board dev server on {BASE_URL} ({summary})", flush=True)
+        print(f"Web board dev server on {base_url} ({summary})", flush=True)
         print(f"Data dir (deleted on exit): {DATA_DIR}", flush=True)
         print("Sign-in link (works once, expires in 5 minutes):", flush=True)
-        print(f"{BASE_URL}/login?t={token}", flush=True)
+        print(f"{base_url}/login?t={token}", flush=True)
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -315,12 +315,13 @@ async def serve(summary: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--empty", action="store_true", help="seed only the user: no channels, no posts")
+    parser.add_argument("--port", type=int, default=PORT, help=f"port on {HOST} (default {PORT})")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # Seeding adds rows one by one; their INFO lines would bury the sign-in link.
     logging.getLogger("bot.database").setLevel(logging.WARNING)
     try:
-        asyncio.run(serve(seed(args.empty)))
+        asyncio.run(serve(seed(args.empty), args.port))
     finally:
         shutil.rmtree(DATA_DIR, ignore_errors=True)
 

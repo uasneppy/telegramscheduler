@@ -6,6 +6,7 @@
 // then uploads a chosen replacement file. Post now and Retry save pending changes
 // the same way first, so an edit is never left behind. A finished action closes
 // the panel and refreshes the post's row and the tab counts.
+import { POSTED_DELETE_QUESTION, offerUndo } from './actions.js';
 import { ApiError, apiJson, getJson, sendJson } from './api.js';
 import {
   KNOWN_STATUSES, MEDIA_TYPES, ROW_THUMB_W, THUMB_TYPES, activeChannels, badge, channelTone, findRow,
@@ -25,8 +26,6 @@ const SHORTCUTS = { b: 'b', i: 'i', u: 'u', k: 'link' };
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const LINK_SCHEMES = /^(https?|tg):\/\//i;
 const DISCARD_QUESTION = 'Discard your unsaved changes to this post?';
-const POSTED_DELETE_QUESTION = 'Delete this posted post from the board? '
-  + 'Removes this record only; the message stays in the channel.';
 const READ_ONLY_NOTES = {
   posted: 'Already posted, so it can no longer be edited. Deleting it removes this record only; '
     + 'the message stays in the channel.',
@@ -850,13 +849,8 @@ function deleteFromPanel() {
     if (state.panel === panel) closePanel({ force: true });
     removeRow(panel.id);
     loadMe();
-    postDeleted(before);
+    offerUndo([before], 'Post deleted.'); // Undo puts it back (POST /api/posts/{id}/restore)
   });
-}
-
-// Task 15 hook: the Undo toast goes here (POST /api/posts/{id}/restore puts the post back).
-function postDeleted(_item) {
-  showToast('Post deleted.');
 }
 
 // --- panel: closing

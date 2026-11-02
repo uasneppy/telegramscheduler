@@ -1,6 +1,6 @@
 // The post list: tabs, filters and the view in the URL hash (e.g.
 // #tab=scheduled&channel=-1001&q=news), rows, loading and infinite scroll, the
-// counts and channels from /api/me, and the banner, toast and signed-out view.
+// counts and channels from /api/me, and the banner, toast, announcer and signed-out view.
 import { ApiError, getJson, request } from './api.js';
 import { state, el } from './state.js';
 import { dayKey, dayLabel, hasIsoDate, hhmm, relativeDay } from './time.js';
@@ -10,6 +10,8 @@ const TABS = ['scheduled', 'queued', 'failed', 'posted'];
 const DAY_FIELD = { scheduled: 'scheduled_time', posted: 'posted_at' };
 const SEARCH_DELAY_MS = 300;
 const TOAST_MS = 5000;
+const ACTION_TOAST_MS = 10000; // a toast with a button (Undo) stays longer
+const ANNOUNCE_DELAY_MS = 100;
 // Media types that have a thumbnail; every other type shows its icon.
 export const THUMB_TYPES = new Set(['photo', 'document_image']);
 export const MEDIA_TYPES = {
@@ -30,13 +32,18 @@ const DELETABLE = new Set(['queued', 'scheduled', 'failed', 'posted']);
 const CHANNEL_TONES = 6;
 export const ROW_THUMB_W = 160;
 // The tab a post lists under, by its board status (spec 6.1).
-const TAB_OF_STATUS = { queued: 'queued', scheduled: 'scheduled', sending: 'scheduled', failed: 'failed', posted: 'posted' };
+export const TAB_OF_STATUS = { queued: 'queued', scheduled: 'scheduled', sending: 'scheduled', failed: 'failed', posted: 'posted' };
 
 let sentinelObserver = null;
+// The list item each row was drawn from (see rowItem).
+const rowItems = new WeakMap();
+// Whether the pointer rests on the toast or focus is in it; its countdown waits meanwhile.
+const toastHold = { pointer: false, focus: false };
 
-// Registered by main.js. The panel module imports this one, so the list reaches it
-// through a hook instead of importing it back.
-export const hooks = { dropPanel: () => {} };
+// Registered by main.js. The panel and actions modules import this one, so the list
+// reaches them through hooks instead of importing them back. rowsChanged runs after
+// rows were drawn, added or taken out, so the selection can follow.
+export const hooks = { dropPanel: () => {}, rowsChanged: () => {} };
 
 function postsUrl(cursor) {
   // An empty limit is refused, so limit is never sent; empty filters are left out too.
@@ -121,7 +128,7 @@ function captionOf(item) {
 }
 
 // Accessible description of a row, used by its controls: "Mon 02.11 10:00, Alpha, Morning coffee…".
-function rowLabel(item) {
+export function rowLabel(item) {
   const iso = rowTime(item);
   const parts = [];
   if (hasIsoDate(iso)) parts.push(`${dayLabel(dayKey(iso))} ${hhmm(iso)}`);
@@ -241,6 +248,7 @@ function postRow(item) {
   const select = make('input', 'row-select');
   select.type = 'checkbox';
   select.disabled = readOnly;
+  select.checked = !readOnly && state.selected.has(item.id); // a selection outlives a redraw
   select.setAttribute('aria-label', `Select post, ${rowLabel(item)}`);
   // Time and meta share a wrapper: on desktop it is display:contents (both stay grid
   // columns), on phones it is one wrapping line, so the channel never squeezes into
@@ -248,7 +256,13 @@ function postRow(item) {
   const head = make('div', 'row-head');
   head.append(timeCell(item), metaCell(item));
   row.append(select, head, mediaCell(item), bodyCell(item), actionsCell(item));
+  rowItems.set(row, item);
   return row;
+}
+
+// The list item a row was drawn from, or null.
+export function rowItem(rowNode) {
+  return rowItems.get(rowNode) || null;
 }
 
 function dayHeader(key) {
@@ -286,6 +300,7 @@ function appendItems(items) {
     fragment.append(postRow(item));
   }
   el.list.append(fragment);
+  hooks.rowsChanged();
 }
 
 export function findRow(postId) {
@@ -333,6 +348,7 @@ export function removeRow(postId) {
   }
   updateListFooter();
   watchSentinel();
+  hooks.rowsChanged();
 }
 
 // Bring the list in line with a post the panel changed: drop the row when the post
@@ -355,6 +371,7 @@ export function refreshRow(before, item) {
   const focus = focusedRowControl();
   rowNode.replaceWith(postRow(item));
   restoreRowFocus(focus);
+  hooks.rowsChanged();
 }
 
 function updateListFooter() {
@@ -362,11 +379,21 @@ function updateListFooter() {
   el.list.setAttribute('aria-busy', String(busy));
   const empty = !busy && state.loaded && state.ids.size === 0 && state.cursor === null;
   el.empty.hidden = !empty;
-  if (empty) el.empty.textContent = state.channel || state.q ? 'No posts match these filters.' : 'Nothing here yet.';
+  if (empty) renderEmptyState();
   if (busy) el.status.textContent = 'Loading…';
   else if (state.loaded && state.ids.size > 0 && state.cursor === null) el.status.textContent = 'End of list';
   else el.status.textContent = '';
   el.refresh.classList.toggle('is-spinning', busy);
+}
+
+function renderEmptyState() {
+  if (state.channel || state.q) {
+    el.empty.textContent = 'No posts match these filters.';
+  } else if (activeChannels().length === 0) {
+    el.empty.replaceChildren('No channels yet. Add one in Telegram with ', make('code', '', '/start'), '.');
+  } else {
+    el.empty.textContent = 'Nothing here yet.';
+  }
 }
 
 // Runs one list request; a newer request supersedes (aborts) an older one.
@@ -398,6 +425,8 @@ function reloadList({ keepRows = false } = {}) {
   const wanted = keepRows ? state.ids.size : 0;
   if (!keepRows) {
     clearList();
+    state.selected.clear(); // another view starts with nothing selected
+    hooks.rowsChanged();
     window.scrollTo(0, 0);
   }
   return runListRequest(async (signal, isCurrent) => {
@@ -485,7 +514,7 @@ export async function loadMe() {
   }
 }
 
-// --- refresh, banner, toast, signed out ---------------------------------------------
+// --- refresh, banner, toast, announcer, signed out -----------------------------------
 
 // Refetch /api/me and the list (Refresh, Retry, coming back to the browser tab).
 export async function refreshAll() {
@@ -521,11 +550,69 @@ function renderBanner() {
   el.banner.hidden = !message;
 }
 
-export function showToast(text) {
-  el.toast.replaceChildren(make('span', 'toast-text', text));
+// Say what just happened. `action` ({label, className, run}) adds a button, such as
+// Undo, that works once, and keeps the toast for ACTION_TOAST_MS instead of TOAST_MS.
+// A newer toast replaces the one shown. Screen readers hear it through #announcer.
+export function showToast(text, action = null) {
+  const parts = [make('span', 'toast-text', text)];
+  if (action) {
+    const button = make('button', `toast-action ${action.className || ''}`.trim(), action.label);
+    button.type = 'button';
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      action.run();
+    });
+    parts.push(button);
+  }
+  el.toast.replaceChildren(...parts);
   el.toast.hidden = false;
+  toastHold.focus = el.toast.contains(document.activeElement); // a replaced button took its focus along
+  state.toastMs = action ? ACTION_TOAST_MS : TOAST_MS;
+  restartToastTimer();
+  announce(action ? `${text} ${action.label} is available for ${ACTION_TOAST_MS / 1000} seconds.` : text);
+}
+
+function restartToastTimer() {
   clearTimeout(state.toastTimer);
-  state.toastTimer = setTimeout(() => { el.toast.hidden = true; }, TOAST_MS);
+  if (el.toast.hidden || toastHold.pointer || toastHold.focus) return;
+  state.toastTimer = setTimeout(() => {
+    el.toast.hidden = true;
+    el.toast.replaceChildren();
+  }, state.toastMs);
+}
+
+// The countdown waits while a mouse rests on the toast or focus is in it (a touch only
+// passes), so its Undo does not vanish while someone is reaching for it.
+function bindToastHold() {
+  el.toast.addEventListener('pointerenter', (event) => {
+    if (event.pointerType !== 'mouse') return;
+    toastHold.pointer = true;
+    clearTimeout(state.toastTimer);
+  });
+  el.toast.addEventListener('pointerleave', (event) => {
+    if (event.pointerType !== 'mouse') return;
+    toastHold.pointer = false;
+    restartToastTimer();
+  });
+  el.toast.addEventListener('focusin', () => {
+    toastHold.focus = true;
+    clearTimeout(state.toastTimer);
+  });
+  el.toast.addEventListener('focusout', (event) => {
+    if (el.toast.contains(event.relatedTarget)) return;
+    toastHold.focus = false;
+    restartToastTimer();
+  });
+}
+
+// Read `text` to screen readers. #announcer is a live region that is always in the page
+// (a region shown together with its text may go unread); it is emptied first and filled a
+// moment later, so the same text twice in a row is read twice.
+export function announce(text) {
+  clearTimeout(state.announceTimer);
+  el.announcer.textContent = '';
+  state.announceTimer = setTimeout(() => { el.announcer.textContent = text; }, ANNOUNCE_DELAY_MS);
 }
 
 export function showSignedOut() {
@@ -622,6 +709,7 @@ export function bindControls() {
   el.refresh.addEventListener('click', refreshAll);
   el.bannerRetry.addEventListener('click', refreshAll);
   el.signout.addEventListener('click', signOut);
+  bindToastHold();
   window.addEventListener('hashchange', () => {
     readHash();
     dropUnknownChannel();

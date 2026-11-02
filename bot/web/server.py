@@ -64,6 +64,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # type other than JavaScript is refused by the browser.
 _JS = "text/javascript; charset=utf-8"
 _STATIC_FILES = {
+    "actions.js": _JS,
     "api.js": _JS,
     "list.js": _JS,
     "main.js": _JS,

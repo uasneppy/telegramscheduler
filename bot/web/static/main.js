@@ -1,4 +1,4 @@
-// Post board: tabs, filters, the post list and the edit panel.
+// Post board: tabs, filters, the post list, the edit panel and the bulk bar.
 //
 // Plain browser JavaScript, no framework and no build step. Text from the API is
 // only ever written with textContent or setAttribute; the one exception is the
@@ -9,12 +9,14 @@
 // #tab=scheduled&channel=-1001&q=news.
 //
 // The code is ES modules, loaded from this file (no bundler):
-//   state.js  the shared `state` and `el` objects
-//   api.js    fetch with the board's rules, the JSON helpers, ApiError
-//   time.js   Kyiv ISO strings -> the times and days shown
-//   list.js   tabs, filters, hash, rows, loading, counts, banner, toast
-//   panel.js  the edit panel
-//   main.js   this file: wires the modules together and starts the board
+//   state.js    the shared `state` and `el` objects
+//   api.js      fetch with the board's rules, the JSON helpers, ApiError
+//   time.js     Kyiv ISO strings -> the times and days shown
+//   list.js     tabs, filters, hash, rows, loading, counts, banner, toast
+//   panel.js    the edit panel
+//   actions.js  selection and the bulk bar, deletes with Undo, the skipped-posts summary
+//   main.js     this file: wires the modules together and starts the board
+import { bindActions, syncSelection } from './actions.js';
 import { setSignedOutHandler } from './api.js';
 import { bindControls, hooks, readHash, refreshAll, showSignedOut, syncControls, writeHash } from './list.js';
 import { bindPanel, dropPanel } from './panel.js';
@@ -22,6 +24,7 @@ import { el } from './state.js';
 
 setSignedOutHandler(showSignedOut);
 hooks.dropPanel = dropPanel;
+hooks.rowsChanged = syncSelection;
 
 async function start() {
   Object.assign(el, {
@@ -39,6 +42,7 @@ async function start() {
     bannerText: document.getElementById('banner-text'),
     bannerRetry: document.getElementById('banner-retry'),
     toast: document.getElementById('toast'),
+    announcer: document.getElementById('announcer'),
     tabs: [...document.querySelectorAll('.tab[data-tab]')],
     // Made inert while the panel is open; the dock with the banner and toast is not.
     background: [...document.querySelectorAll('#app > .topbar, #app > .tabs, #app > .board')],
@@ -78,11 +82,30 @@ async function start() {
     postNow: document.getElementById('post-now'),
     retry: document.getElementById('retry'),
     deleteButton: document.getElementById('delete'),
+    bulkBar: document.getElementById('bulk-bar'),
+    bulkCount: document.getElementById('bulk-count'),
+    bulkClear: document.getElementById('bulk-clear'),
+    bulkSelectAll: document.getElementById('bulk-select-all'),
+    bulkDelete: document.getElementById('bulk-delete'),
+    bulkDeleteLabel: document.getElementById('bulk-delete-label'),
+    bulkMoveGroup: document.getElementById('bulk-move-group'),
+    bulkMove: document.getElementById('bulk-move'),
+    bulkMoveApply: document.getElementById('bulk-move-apply'),
+    bulkShiftGroup: document.getElementById('bulk-shift-group'),
+    bulkShiftAmount: document.getElementById('bulk-shift-amount'),
+    bulkShiftUnit: document.getElementById('bulk-shift-unit'),
+    bulkShiftApply: document.getElementById('bulk-shift-apply'),
+    bulkShiftNote: document.getElementById('bulk-shift-note'),
+    bulkSummary: document.getElementById('bulk-summary'),
+    bulkSummaryTitle: document.getElementById('bulk-summary-title'),
+    bulkSummaryClose: document.getElementById('bulk-summary-close'),
+    bulkSkipped: document.getElementById('bulk-skipped'),
   });
   readHash();
   syncControls();
   bindControls();
   bindPanel();
+  bindActions();
   writeHash();
   // /api/me first: its channel list decides whether the hash's channel is valid.
   await refreshAll();

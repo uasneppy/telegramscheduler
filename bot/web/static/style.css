@@ -30,9 +30,12 @@
   --warn-border: #efd09a;
   --inverse: #1f242b;
   --on-inverse: #f3f5f7;
+  --inverse-action: #9cc0ff;
+  --inverse-hover: rgb(255 255 255 / 12%);
   --focus: #2160d8;
   --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 1px 3px rgb(16 24 40 / 8%);
   --shadow-raised: 0 8px 24px rgb(16 24 40 / 18%);
+  --shadow-up: 0 -4px 16px rgb(16 24 40 / 10%);
   --scrim: rgb(16 22 30 / 36%);
   /* Channel dots; the chip's text names the channel, the colour only helps scanning. */
   --tone-0: #2f7bf5;
@@ -52,6 +55,11 @@
   --media: 48px;
   --meta-w: 13.5rem;
   --panel-w: 480px;
+  /* The bulk bar: rows of 36 px controls; --bulk-h is its height plus the gap below it,
+     where toasts start while it is shown. The narrower layouts redefine both. */
+  --bulk-row: 36px;
+  --bulk-gap: 12px;
+  --bulk-h: calc(var(--bulk-row) + 22px + var(--bulk-gap));
 }
 
 @media (prefers-color-scheme: dark) {
@@ -78,9 +86,12 @@
     --warn-border: #5e4519;
     --inverse: #e6eaee;
     --on-inverse: #16191d;
+    --inverse-action: #1b4fb4;
+    --inverse-hover: rgb(0 0 0 / 8%);
     --focus: #8db6ff;
     --shadow: 0 1px 2px rgb(0 0 0 / 40%);
     --shadow-raised: 0 8px 28px rgb(0 0 0 / 55%);
+    --shadow-up: 0 -4px 18px rgb(0 0 0 / 45%);
     --scrim: rgb(0 0 0 / 55%);
     --tone-0: #5b9bff;
     --tone-1: #3fc274;
@@ -363,6 +374,18 @@ select.field {
   text-overflow: ellipsis;
 }
 
+/* --- page ------------------------------------------------------------------ */
+
+/* The board fills the screen below the header and tabs, however short the list, so the
+   bulk bar at its end sits at the bottom of the screen. Fixed parts (panel, dock) are out
+   of this flow. */
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
 /* --- header ------------------------------------------------------------------ */
 
 .topbar {
@@ -525,6 +548,8 @@ select.field {
 /* --- list -------------------------------------------------------------------- */
 
 .board {
+  flex: 1 0 auto;
+  width: 100%;
   max-width: var(--content-w);
   margin: 0 auto;
   padding: 4px var(--gutter) 112px;
@@ -597,6 +622,11 @@ select.field {
   .post-row:hover {
     background: var(--surface-hover);
   }
+}
+
+/* A selected row is tinted as well as checked. */
+.post-row:has(.row-select:checked) {
+  background: var(--accent-soft);
 }
 
 /* Rows take focus (Enter opens the panel); the ring sits inside the row's border. */
@@ -829,6 +859,114 @@ select.field {
   height: 1px;
 }
 
+/* --- bulk bar ------------------------------------------------------------------ */
+
+/* While posts are selected the bar ends the board: it follows the list in the page's
+   flow and sticks to the bottom of the screen while the list scrolls, so at the end of
+   the list it sits below the last row, never over it. Toasts move up above it. */
+body.has-selection .board {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+
+body.has-selection .board > * {
+  min-width: 0;
+}
+
+body.has-selection:not(.panel-open) .dock {
+  bottom: var(--bulk-h);
+  padding-bottom: 12px;
+}
+
+.bulk-bar {
+  position: sticky;
+  bottom: var(--bulk-gap);
+  z-index: 4;
+  display: grid;
+  grid-template-areas: "head actions";
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 20px;
+  min-height: calc(var(--bulk-h) - var(--bulk-gap));
+  margin: auto 0 var(--bulk-gap); /* auto: the bottom of a short board */
+  padding: 10px 12px 10px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: var(--shadow-raised);
+}
+
+.bulk-head {
+  display: flex;
+  grid-area: head;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bulk-count {
+  margin-right: 4px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.bulk-head .button-quiet {
+  color: var(--accent-text);
+}
+
+/* The layouts below are sized to fit on their lines; wrapping is only a safety net (a
+   larger font, say), which makes the bar taller than --bulk-h. */
+.bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  grid-area: actions;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px 16px;
+  min-width: 0;
+}
+
+.bulk-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bulk-delete .icon {
+  width: 16px;
+  height: 16px;
+}
+
+.bulk-label {
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Shift is for the Scheduled tab only; elsewhere its controls are disabled (spec 6.7). */
+.shift-group:has(#bulk-shift-amount:disabled) .bulk-label {
+  opacity: 0.55;
+}
+
+#bulk-move {
+  flex: none;
+  width: 150px;
+}
+
+#bulk-shift-amount {
+  flex: none;
+  width: 72px;
+}
+
+#bulk-shift-unit {
+  flex: none;
+  width: 92px;
+}
+
 /* --- banner and toast --------------------------------------------------------- */
 
 .dock {
@@ -871,12 +1009,114 @@ select.field {
 }
 
 .toast {
+  display: flex;
+  align-items: center;
+  gap: 4px 14px;
   max-width: min(100%, 560px);
   padding: 10px 16px;
   border-radius: var(--radius);
   background: var(--inverse);
   box-shadow: var(--shadow-raised);
   color: var(--on-inverse);
+}
+
+.toast-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Undo and the like: a text button in the toast's own colours. */
+.toast-action {
+  flex: none;
+  height: 30px;
+  margin: -5px -8px -5px 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--inverse-action);
+  font-weight: 700;
+}
+
+.toast-action:hover:not(:disabled) {
+  background: var(--inverse-hover);
+}
+
+.toast-action:focus-visible {
+  outline-color: var(--inverse-action);
+}
+
+.toast-action:disabled {
+  opacity: 0.6;
+}
+
+/* What a bulk action skipped: one entry per post, with the server's reason. */
+.bulk-summary {
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 560px);
+  max-height: min(50vh, 380px);
+  border: 1px solid var(--warn-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-raised);
+}
+
+.bulk-summary-head {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 4px 4px 4px 14px;
+  border-bottom: 1px solid var(--warn-border);
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--warn-soft);
+}
+
+.bulk-summary-head > .icon {
+  margin-top: 9px;
+  color: var(--warn-text);
+}
+
+.bulk-summary-title {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 0;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.bulk-skipped {
+  min-height: 0;
+  margin: 0;
+  padding: 2px 14px 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+}
+
+.skipped-post {
+  padding: 7px 0;
+  border-top: 1px solid var(--border);
+}
+
+.skipped-post:first-child {
+  border-top: 0;
+}
+
+.skipped-label {
+  display: block;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.skipped-reason {
+  display: block;
+  margin-top: 1px;
+  color: var(--text-2);
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 /* --- edit panel --------------------------------------------------------------- */
@@ -1468,6 +1708,70 @@ body.panel-open .dock {
 @media (max-width: 1000px) {
   :root {
     --meta-w: 10rem;
+  }
+}
+
+/* The bulk bar on two lines: the selection above, the actions below. */
+@media (max-width: 999.98px) {
+  :root {
+    --bulk-h: calc(2 * var(--bulk-row) + 8px + 22px + var(--bulk-gap));
+  }
+
+  .bulk-bar {
+    grid-template-areas:
+      "head"
+      "actions";
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .bulk-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* On three lines and edge to edge at the bottom: Delete and Move, then Shift. */
+@media (max-width: 699.98px) {
+  :root {
+    --bulk-gap: 0px;
+    --bulk-h: calc(3 * var(--bulk-row) + 2 * 8px + 21px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .bulk-bar {
+    margin-inline: calc(-1 * var(--gutter));
+    padding: 10px var(--gutter) calc(10px + env(safe-area-inset-bottom, 0px));
+    border-width: 1px 0 0;
+    border-radius: 0;
+    box-shadow: var(--shadow-up);
+  }
+
+  #bulk-clear {
+    margin-left: -6px; /* the icon lines up with the buttons below */
+  }
+
+  .bulk-actions {
+    display: grid;
+    grid-template-areas:
+      "delete move"
+      "shift shift";
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .bulk-delete {
+    grid-area: delete;
+  }
+
+  .move-group {
+    grid-area: move;
+  }
+
+  .shift-group {
+    grid-area: shift;
+  }
+
+  #bulk-move {
+    flex: 1 1 auto;
+    width: auto;
   }
 }
 

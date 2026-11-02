@@ -1,7 +1,7 @@
 // The board's shared state: two objects every module imports. `state` is the view
-// (tab, filters), the list and the open edit panel; `el` holds the page's elements and
-// is filled in by main.js once the page is ready. They are objects, not re-assigned
-// `let`s, because a module cannot assign to a binding it imported.
+// (tab, filters), the list, the selection and the open edit panel; `el` holds the
+// page's elements and is filled in by main.js once the page is ready. They are
+// objects, not re-assigned `let`s, because a module cannot assign to a binding it imported.
 
 export const state = {
   me: null,          // the last /api/me answer
@@ -19,6 +19,12 @@ export const state = {
   signedOut: false,
   searchTimer: 0,
   toastTimer: 0,
+  toastMs: 0,        // how long the toast shown now stays
+  announceTimer: 0,
+  // The selected posts: id -> the list item as its row last showed it, in the order they
+  // were selected. A refresh keeps it; another tab, channel or search clears it.
+  selected: new Map(),
+  bulkBusy: '',      // the bulk action in flight ('delete', 'move_channel', 'shift'), else ''
   panel: null,       // the open edit panel (see openPanel); null while it is closed
   // Post id -> a counter bumped each time the board replaces the post's media. It
   // goes into thumbnail URLs: a thumbnail is cached for an hour under the post's
