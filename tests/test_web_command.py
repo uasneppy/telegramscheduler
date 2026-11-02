@@ -491,6 +491,30 @@ def test_malformed_request_line_never_logs_the_token(caplog):
     assert "SECRET" not in caplog.text
 
 
+def test_sign_in_link_token_never_reaches_any_log(caplog):
+    """A well-formed GET /login?t=... is served without the token in any log record (no access log)."""
+
+    async def scenario():
+        runner = await start_web(
+            FakeBot(), FakeScheduler(),
+            base_url="http://localhost:8080", host="127.0.0.1", port=0, allowed_user_ids={1},
+        )
+        port = runner.addresses[0][1]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/login?t=SECRETTOKEN123") as response:
+                    assert response.status == 200
+                    await response.read()
+        finally:
+            await stop_web(runner)
+
+    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger="aiohttp.access"):
+        asyncio.run(scenario())
+    assert caplog.records  # logging was captured (the board logs its start and stop)
+    assert not [r for r in caplog.records if "SECRETTOKEN123" in r.getMessage()]
+    assert "SECRETTOKEN123" not in caplog.text
+
+
 # --- housekeeping -----------------------------------------------------------------------
 
 
