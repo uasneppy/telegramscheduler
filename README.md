@@ -17,7 +17,7 @@
 
 ---
 
-You send media to the bot in a private chat. It stores the files, lines them up in a queue and publishes them to your channels on a schedule you control: inside a daily posting window, from a custom start date, or as recurring posts. Everything happens through a button-driven menu in Telegram. There is no web panel and no external service beyond the Telegram Bot API.
+You send media to the bot in a private chat. It stores the files, lines them up in a queue and publishes them to your channels on a schedule you control: inside a daily posting window, from a custom start date, or as recurring posts. Everything happens through a button-driven menu in Telegram. There is no external service beyond the Telegram Bot API. An optional [web board](#-web-board), off by default, adds a page where you can see and edit the whole schedule.
 
 It's built for channel admins and small content teams who prepare posts in batches, run several channels, and want to keep the bot and its data on their own server. One deployment can serve several people: each allowed user gets their own channels, queue, settings and backups.
 
@@ -29,6 +29,7 @@ It's built for channel admins and small content teams who prepare posts in batch
 - [Getting started](#-getting-started)
 - [Configuration](#%EF%B8%8F-configuration)
 - [Usage](#-usage)
+- [Web board](#-web-board)
 - [Data & security model](#-data--security-model)
 - [Project structure](#-project-structure)
 - [Development](#-development)
@@ -69,6 +70,9 @@ It's built for channel admins and small content teams who prepare posts in batch
 - **Calendar** (month, week and day views), **post previews**, **statistics** and **`/status`** health info.
 - **Named backups** of your pending posts, with replace/add restore.
 - Optional **error reports to an admin chat**.
+
+**Web board (optional, off by default)**
+- A browser page for your whole schedule: posts by status and day, caption, time, channel and media edits, retry, post now, delete with Undo, and bulk delete, move or time shift. See [Web board](#-web-board).
 
 ## 🧭 How it works
 
@@ -164,12 +168,13 @@ stateDiagram-v2
 | Telegram | [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) 20.8 (async, long polling, HTTPX with 50-connection pool and 5-minute read/write timeouts) |
 | Scheduling | [APScheduler](https://github.com/agronholm/apscheduler) 3.11 `AsyncIOScheduler`, timezone `Europe/Kiev` |
 | Storage | SQLite (stdlib `sqlite3`, WAL mode, foreign keys on) and media files on local disk |
+| Web board | Optional. [aiohttp](https://github.com/aio-libs/aiohttp) 3.x server inside the bot process, [Pillow](https://github.com/python-pillow/Pillow) for thumbnails, plain JavaScript and CSS with no build step |
 | Timezones | `pytz` (+ `tzdata` in the Docker image) |
 | Tests / CI | pytest, GitHub Actions (compile check, tests, Docker build) |
 | Deployment | Docker and Docker Compose, or plain `python main.py` |
 
 > [!NOTE]
-> The Docker image, CI and `uv.lock` all use **python-telegram-bot 20.8**. `requirements.txt` currently pins `python-telegram-bot==22.3` (plus `Pillow` and `aiofiles`, which the code never imports). The commands below install the 20.8 stack that CI tests.
+> The Docker image, CI and `uv.lock` all use **python-telegram-bot 20.8**. `requirements.txt` currently pins `python-telegram-bot==22.3` (plus `aiofiles`, which the code never imports). The commands below install the 20.8 stack that CI tests.
 
 ## 🚀 Getting started
 
@@ -207,7 +212,8 @@ The database and uploaded media persist in `./data` on the host, which is mounte
 git clone https://github.com/uasneppy/telegramscheduler.git
 cd telegramscheduler
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "tzdata>=2025.2"
+pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "tzdata>=2025.2" \
+            "pillow>=11.3.0" "aiohttp>=3.10,<4"
 
 export BOT_TOKEN="123456789:AA...your-token..."
 export ALLOWED_USER_IDS="123456789"
@@ -217,6 +223,9 @@ python main.py
 
 > [!TIP]
 > The bot does **not** read `.env` by itself. That file is only for Docker Compose. To reuse it for a native run, load it into your shell first: `set -a; source .env; set +a`.
+
+> [!NOTE]
+> `aiohttp` and `pillow` are used only by the optional [web board](#-web-board): `aiohttp` for its web server and `pillow` for its thumbnails. A bot that leaves `WEB_BASE_URL` unset never imports them and starts without them. Install them before you turn the board on. The Docker image already contains both.
 
 ### 4. Connect your first channel
 
@@ -238,8 +247,11 @@ All configuration comes from environment variables, which are read in [`config.p
 | `DATA_DIR` | no | `/data` | Directory for `bot_data.db` and `uploads/`. The Dockerfile sets it to `/data`. Set it to a writable path when running natively. |
 | `MAX_USER_STORAGE_MB` | no | `2048` | Per-user quota for stored media, in MB. `0` = unlimited. A non-integer value falls back to `2048`. |
 | `TELEGRAM_CHANNEL_ID` | no | *(unset)* | Legacy. `config.py` still reads it, but nothing uses it: channels are managed per user via `/channels`. |
+| `WEB_BASE_URL` | no | *(unset)* | Public address of the [web board](#-web-board), e.g. `https://board.example.com`. **Setting it turns the board on**; unset means no web server at all. It must be `https://` with no path (a trailing `/` is ignored); `http://localhost` and `http://127.0.0.1` are accepted for local use. The board needs a non-empty `ALLOWED_USER_IDS`. |
+| `WEB_PORT` | no | `8080` | Port the board listens on (inside the container). A non-integer value falls back to `8080`. |
+| `WEB_HOST` | no | `0.0.0.0` | Address the board binds to. `docker-compose.yml` does not pass it into the container, so it only matters for a native run, e.g. `127.0.0.1` to listen on loopback only. |
 
-`docker-compose.yml` passes `BOT_TOKEN`, `ALLOWED_USER_IDS`, `ADMIN_CHAT_ID` and `MAX_USER_STORAGE_MB` from `.env` into the container.
+`docker-compose.yml` passes `BOT_TOKEN`, `ALLOWED_USER_IDS`, `ADMIN_CHAT_ID`, `MAX_USER_STORAGE_MB`, `WEB_BASE_URL` and `WEB_PORT` from `.env` into the container.
 
 <details>
 <summary><b>Built-in constants (edit the code to change)</b></summary>
@@ -253,12 +265,19 @@ All configuration comes from environment variables, which are read in [`config.p
 | Published-media retention | 7 days | `bot/utils.py` (`cleanup_old_media_files`) |
 | Job times | cleanup 03:00, digest 09:00, reminders hourly, monitor every 5 min | `PostScheduler.start()` |
 | Caption signature limit | 300 characters | `bot/handlers/channels.py` |
+| Web sign-in link lifetime | 300 s (single use) | `bot/web/auth.py` (`TOKEN_TTL_SECONDS`) |
+| Web session lifetime | 7 days | `bot/web/auth.py` (`SESSION_TTL_SECONDS`) |
+| Failed web sign-ins before a block | 20 within 300 s, all clients together | `bot/web/auth.py` (`FAIL_LIMIT`, `FAIL_WINDOW_SECONDS`) |
+| Largest file accepted when replacing media on the board | 50 MB | `bot/web/media.py` (`MAX_UPLOAD_BYTES`) |
+| Photo size above which the board stores it as a file | 10 MB | `bot/web/media.py` (`PHOTO_MAX_BYTES`) |
+| Most posts one bulk action changes | 500 | `bot/web/service.py` (`BULK_MAX`) |
+| Cached thumbnail retention | 14 days | `bot/web/media.py` (`purge_old_thumbnails`) |
 
 </details>
 
 ## 💬 Usage
 
-Almost everything is reachable from the **`/start` dashboard**. Commands exist for power users. Telegram's command menu (the `/` button) lists eight everyday commands, marked ★ below.
+Almost everything is reachable from the **`/start` dashboard**. Commands exist for power users. Telegram's command menu (the `/` button) lists eight everyday commands, marked ★ below. `/web` is added to the menu as a ninth while the [web board](#-web-board) is running.
 
 ### Main menu
 
@@ -322,6 +341,7 @@ These open from **Schedule now**, `/schedule`, or the end of guided captioning.
 | `/backup` | Create, list or delete named backups of your pending posts. |
 | `/restore` | Restore a backup, replacing or adding to the current posts. |
 | `/status` | Uptime, scheduler job count, database size, free disk, your storage usage and post counts. |
+| `/web` | Sends a single-use sign-in link for the [web board](#-web-board) (private chat only). Replies "The web board is not enabled on this server." when the board is off. Listed in `/help` and the command menu only while the board is running. |
 | `/reset` | Delete all your posts, channels, scheduling settings and session state (asks for confirmation). |
 | `/recurring` | Registered, but currently fails when typed (see [Known limitations](#known-limitations)). Use **🔄 Recurring posts** in `/start` instead. |
 
@@ -396,6 +416,71 @@ These open from **Schedule now**, `/schedule`, or the end of guided captioning.
 
 **Failure alerts are sent in every mode.** Most carry **🔄 Retry now · ✏️ Manage posts · 🏠 Menu** buttons. Separately, the **low-queue reminder** (checked hourly, at most once a day) tells you when your unscheduled queue drops to the threshold or below.
 
+## 🌐 Web board
+
+An optional page for working with your whole schedule in a browser instead of Telegram buttons. It runs inside the bot process and talks to the live scheduler, so what you change on the board is what the bot publishes, with no restart: moving or deleting a post moves or cancels its scheduled job.
+
+**It is off by default.** Until you set `WEB_BASE_URL` the bot opens no port, and `/web` only answers that the board is not enabled. With the board off the bot behaves as before and does not import aiohttp or Pillow. The only differences are two small tables and one extra column on `posts` in its database, and a `/web` command that replies that the board is not enabled.
+
+### What it does
+
+- **See everything.** Four tabs, **Scheduled · Queued · Failed · Posted**, with a count on each. Scheduled and Posted posts are grouped by day (Kyiv time). Each row shows thumbnail, caption, channel and time, plus badges for recurring posts, albums, overdue and sending posts. Filter by channel, search captions, and keep scrolling to load more.
+- **Edit a post** in a side panel (a bottom sheet on phones):
+  - the caption, with its formatting kept. You edit it as Telegram-style tags (`<b>`, `<i>`, `<u>`, `<a href="…">` and so on, with toolbar buttons for bold, italic, underline and link), next to a live preview and a 1024-character counter, with a warning when the channel's caption signature would no longer fit;
+  - the channel and the publish time (Kyiv time), or **Unschedule** to clear the time (a scheduled post goes back to the queue);
+  - the media: **Replace media**, optionally *sent as a file* to keep the original quality.
+- **Act on a post.** **Post now** (goes out in about a minute), **Retry** for a failed post, or **Delete**, which shows an **Undo** toast. Deleting an already-posted post removes the record only; the message stays in the channel.
+- **Bulk actions.** Tick rows, then delete them, move them to another channel, or shift their times by a number of hours or days (up to 500 posts at a time; shifting applies to Scheduled posts). Posts that cannot be changed, for example one that is being sent right now, are listed with the reason and never block the rest.
+
+Two limits to know about: album posts are view-only for media (caption, time, channel and delete still work), and the board does not live-update. It reloads when you press the refresh button or return to the tab, and Telegram menus that are already open are not updated when you change something on the board.
+
+### Enable it
+
+Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)). The lines below work in both places: Docker Compose reads `export` lines in `.env` too.
+
+```bash
+export WEB_BASE_URL=https://board.example.com   # your public https address, no path
+export WEB_PORT=8080                            # optional, 8080 is the default
+```
+
+```bash
+docker compose up -d --build   # the image contains aiohttp and Pillow; rebuild after updating
+docker compose logs bot        # "Web board listening on …", or the reason it did not start
+```
+
+The board refuses to start, and the bot carries on without it, if `ALLOWED_USER_IDS` is empty (otherwise anyone who can message the bot could get a session), if the URL is not `https://` (only `http://localhost` and `http://127.0.0.1` are accepted), or if the URL has a path, query, fragment or user name. A port that is already in use does the same. Native runs can also set `WEB_HOST` (default `0.0.0.0`); `127.0.0.1` keeps the board on loopback.
+
+### Sign in
+
+1. Send `/web` to the bot **in a private chat** (it refuses in groups). Only users in `ALLOWED_USER_IDS` can reach the bot at all.
+2. Open the link it sends and press **Continue**. The link is **single-use and valid for 5 minutes**. Opening it only shows the Continue page, so a link preview or scanner cannot use it up; pressing Continue does. Send `/web` again for a new one.
+3. The browser keeps a session cookie for **7 days**; **Sign out** ends it earlier. When it expires the board tells you to send `/web` again.
+
+### Running it behind a private tunnel
+
+The board speaks plain HTTP and is meant to sit behind a private tunnel or reverse proxy on your own domain, which terminates HTTPS. Set `WEB_BASE_URL` to that public address: the sign-in links are built from it, and edits are accepted only from pages opened at exactly that address. There are two ways to reach the container:
+
+- **Tunnel as a container on the compose network.** Run the tunnel as another service of the same Compose project (or attach it to the project's network) and point it at `http://bot:8080` (use your `WEB_PORT`). No port is published on the host, and nothing else is needed.
+- **Tunnel or proxy on the host.** Publish the port on the host's loopback only, using the override file [`docker-compose.web.yml`](docker-compose.web.yml). Add this line to `.env`, then `docker compose up -d`:
+
+  ```bash
+  COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml   # use ";" instead of ":" on Windows
+  ```
+
+  It maps `127.0.0.1:${WEB_PORT:-8080}:${WEB_PORT:-8080}`, so point the tunnel at `http://127.0.0.1:8080`. Without `COMPOSE_FILE`, run `docker compose -f docker-compose.yml -f docker-compose.web.yml up -d`.
+
+The port mapping lives in a separate file so that a deployment that does not use the board publishes nothing.
+
+### Security notes
+
+- **Sign-in tokens and session ids** are random 256-bit values. Only their SHA-256 hashes are stored. A login token is single-use and consumed only by the Continue button (a POST). The session cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` when `WEB_BASE_URL` is `https://`.
+- **The allowlist is checked again on every request.** A user who is no longer in `ALLOWED_USER_IDS` (after a restart) gets `403` everywhere, even with a valid session.
+- **Per-user isolation.** Each user sees and changes only their own channels and posts. Someone else's post looks exactly like a post that does not exist (`404`), and a post can only be moved to a channel you own.
+- **CSRF.** Every state-changing request must carry an `Origin` header equal to the board's origin, and API calls also need an `X-Board: 1` header. Pages are served with a strict Content-Security-Policy (no inline scripts), and caption previews are sanitized on the server.
+- **Brute force.** Failed sign-in attempts are limited to 20 per 5 minutes across all clients; after that the sign-in answers `429`.
+- **No tokens in logs.** The web access log is off, and the web server's own log lines have login tokens and session ids redacted.
+- **Media is served sandboxed.** Files are served by post id only, and only from inside the uploads folder. Only common image, video and audio types are displayed; anything else is a download, and every media response carries `Content-Security-Policy: sandbox`, so an uploaded HTML or SVG file cannot run script on the board's origin.
+
 ## 🔐 Data & security model
 
 ### Where data lives
@@ -403,13 +488,14 @@ These open from **Schedule now**, `/schedule`, or the end of guided captioning.
 ```text
 $DATA_DIR/                     # /data in Docker (./data on the host via compose)
 ├── bot_data.db                # SQLite database, WAL mode (+ bot_data.db-wal / -shm)
-└── uploads/
-    └── YYYY-MM/DD/<user_id>/<media_type>/<uuid>.<ext>
+├── uploads/
+│   └── YYYY-MM/DD/<user_id>/<media_type>/<uuid>.<ext>
+└── thumbs/                    # web board thumbnail cache (WebP), created on first use
 ```
 
 - All timestamps are stored as **Kyiv-time ISO-8601 strings** (`2026-11-02T10:00:00+02:00`). At startup a one-time migration converts rows written in older formats.
 - The schema is created and migrated in place on every start (`CREATE TABLE IF NOT EXISTS` plus additive `ALTER TABLE`), so upgrades need no manual steps.
-- **Media cleanup:** the 03:00 job deletes the media file of posts published more than 7 days ago, and hard-deletes soft-deleted posts with their files. Clearing your queue or scheduled posts deletes their files immediately.
+- **Media cleanup:** the 03:00 job deletes the media file of posts published more than 7 days ago, and hard-deletes soft-deleted posts with their files. Clearing your queue or scheduled posts deletes their files immediately. The same job removes used or expired web sign-in tokens, expired web sessions and web thumbnails older than 14 days.
 - To back up the server, stop the bot and copy the whole `DATA_DIR`, including the `-wal`/`-shm` files.
 
 <details>
@@ -417,13 +503,15 @@ $DATA_DIR/                     # /data in Docker (./data on the host via compose
 
 | Table | Contents |
 |---|---|
-| `posts` | Every post: owner, channel, file path or album bundle (JSON), caption and formatting entities, status, scheduled time, recurring settings, retry info, failure reason, batch, shuffle order |
+| `posts` | Every post: owner, channel, file path or album bundle (JSON), caption and formatting entities, status, scheduled time, recurring settings, retry info, failure reason, batch, shuffle order. The column `deleted_from_status` holds the status a post had when the web board deleted it, so Undo can restore exactly that status. |
 | `user_channels` | Each user's channels: ID, display name, active flag, caption signature |
 | `scheduling_config` | Per-user daily window and interval, reminder settings, notification mode |
 | `user_sessions` | Current conversation step and scratch data per user |
 | `post_batches` | Named per-channel batches |
 | `post_backups` | Named backups (JSON snapshot of pending posts) |
 | `schema_meta` | Markers for one-time data migrations |
+| `web_login_tokens` | Web board sign-in links: SHA-256 hash of the token, user, expiry, time used |
+| `web_sessions` | Web board browser sessions: SHA-256 hash of the session id, user, creation and expiry time |
 
 </details>
 
@@ -455,22 +543,43 @@ telegramscheduler/
 │   ├── scheduler.py          # PostScheduler: jobs, publishing, retries, monitor, digest, reminders, cleanup
 │   ├── utils.py              # Kyiv-time helpers, schedule maths, media storage and quota, formatting
 │   ├── caption_recovery.py   # /recover_captions and /recover_interactive
-│   └── handlers/
-│       ├── __init__.py       # Merges all handler modules into one shared namespace
-│       ├── common.py         # Shared imports and constants
-│       ├── dispatch.py       # Router for every inline-button callback
-│       ├── menu.py           # /start dashboard, /help, /stats, /status
-│       ├── uploads.py        # /mode1, /mode2, guided-captioning uploads, albums, /finish
-│       ├── scheduling.py     # /schedule, hour picker, custom dates, calendar, /bulkedit, /overdue, shuffle
-│       ├── recurring.py      # Recurring post setup and management
-│       ├── batches.py        # /multibatch
-│       ├── channels.py       # /channels, verification and test post, signatures, per-channel views
-│       ├── editing.py        # /editposts, /edit_captions, /preview, guided-captioning steps
-│       └── misc.py           # Text-input router, /cancel, /clearqueue, /reset, /retry, /backup, /restore, /settings
-├── tests/                    # pytest suite: database, datetime, schedule maths, quota, UI builders
+│   ├── handlers/
+│   │   ├── __init__.py       # Merges all handler modules into one shared namespace
+│   │   ├── common.py         # Shared imports and constants
+│   │   ├── dispatch.py       # Router for every inline-button callback
+│   │   ├── menu.py           # /start dashboard, /help, /stats, /status
+│   │   ├── uploads.py        # /mode1, /mode2, guided-captioning uploads, albums, /finish
+│   │   ├── scheduling.py     # /schedule, hour picker, custom dates, calendar, /bulkedit, /overdue, shuffle
+│   │   ├── recurring.py      # Recurring post setup and management
+│   │   ├── batches.py        # /multibatch
+│   │   ├── channels.py       # /channels, verification and test post, signatures, per-channel views
+│   │   ├── editing.py        # /editposts, /edit_captions, /preview, guided-captioning steps
+│   │   └── misc.py           # Text-input router, /cancel, /clearqueue, /reset, /retry, /backup, /restore, /settings
+│   └── web/                  # Optional web board (see "Web board")
+│       ├── server.py         # aiohttp app, security middlewares, sign-in pages, start/stop (called from main.py)
+│       ├── api.py            # JSON routes under /api
+│       ├── service.py        # Every post change: status rules, conditional SQL, scheduler sync, bulk actions
+│       ├── queries.py        # Read queries: lists, post details, counts (always scoped to the user)
+│       ├── rules.py          # Board status of a post and what each status allows
+│       ├── auth.py           # Login tokens, sessions, failed-login limiter
+│       ├── captions.py       # Telegram entities <-> editable tagged text, sanitized preview HTML
+│       ├── media.py          # Safe media paths, thumbnails, uploads
+│       ├── timeutil.py       # Kyiv wall-clock parsing, minimum lead time, shifting
+│       ├── settings.py       # WEB_BASE_URL validation and URL helpers
+│       ├── command.py        # The /web command
+│       ├── housekeeping.py   # Web part of the 03:00 cleanup
+│       ├── errors.py         # Typed errors, turned into JSON error responses
+│       └── static/           # No build step
+│           ├── index.html, signed_out.html, style.css
+│           └── api.js, state.js, time.js, keys.js, list.js, panel.js, actions.js, main.js   # ES modules; main.js loads the rest
+├── scripts/
+│   ├── dev_web.py            # Web board on seeded demo data (development only)
+│   └── smoke_web.py          # Playwright browser smoke test (manual, not in CI)
+├── tests/                    # pytest suite: database, datetime, schedule maths, quota, UI builders, web board
 ├── .github/workflows/ci.yml  # Compile check, pytest and Docker build
 ├── Dockerfile                # python:3.11-slim, DATA_DIR=/data volume
 ├── docker-compose.yml        # Single "bot" service, ./data mounted at /data
+├── docker-compose.web.yml    # Optional override: publishes the web board's port on 127.0.0.1 only
 ├── .env.example              # Template for docker compose
 ├── pyproject.toml, uv.lock   # Project metadata and locked dependencies (python-telegram-bot 20.8)
 ├── requirements.txt          # Alternative pin list (see the note under Tech stack)
@@ -483,14 +592,26 @@ Run the same steps as CI:
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" pytest
+pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "pillow>=11.3.0" "aiohttp>=3.10,<4" pytest
 
 python -m compileall -q main.py config.py bot/   # compile check
-pytest tests/ -q                                 # 42 tests, no network needed
+pytest tests/ -q                                 # 411 tests, no network needed
 docker build -t telegram-scheduler:dev .         # image build
 ```
 
 - `tests/conftest.py` points `DATA_DIR` at a temporary directory and creates a fresh database for every test, so tests never touch real data or Telegram.
+- **Web board dev server.** `python scripts/dev_web.py` runs the board on demo data at `http://localhost:8765` without a bot token or Telegram. It uses a fresh temporary `DATA_DIR` that is deleted on exit, seeds user `1` with two channels (Alpha, Beta) and demo posts (130 scheduled, 8 queued, 3 failed, 12 posted, including an album, a recurring post and formatted captions), logs scheduler calls instead of creating jobs, and prints a one-time sign-in link (it works once and expires after 5 minutes, so restart the script for a new one). `--port N` picks another port; `--empty` starts with no channels and no posts, to see the empty states.
+- **Browser smoke test (manual, not in CI).** `python scripts/smoke_web.py` drives the board in Chromium with Playwright: list and filters, the edit panel, media replacement, delete and Undo, bulk actions, keyboard use, phone layout and empty states. It prints `PASS name` or `FAIL name: reason` per check and exits 1 if any check fails. Install Playwright once with `pip install playwright`, then start a **fresh** dev server for every run, because the sign-in links work once and the checks change posts and expect the original seed. The empty-states check also needs an `--empty` server beside it:
+
+  ```bash
+  python scripts/dev_web.py &                       # prints a sign-in link for port 8765
+  python scripts/dev_web.py --empty --port 8766 &   # prints a sign-in link for port 8766
+  SMOKE_URL='http://localhost:8765/login?t=…' \
+  SMOKE_EMPTY_URL='http://localhost:8766/login?t=…' \
+  CHROMIUM_PATH=/path/to/chromium python scripts/smoke_web.py
+  ```
+
+  `SMOKE_URL` is the first server's sign-in link and `SMOKE_EMPTY_URL` the second one's. `CHROMIUM_PATH` names a Chromium binary; without it Playwright's own browser is used (`playwright install chromium`). `SMOKE_SHOTS=<folder>` also saves screenshots.
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the compile check and tests on Python 3.11 and builds the Docker image. It triggers on every push to `main` and on every pull request.
 - No linter or formatter is configured. The compile check is the only static gate.
 - **Adding a feature.** Register a command in `main.py` and implement it in the matching `bot/handlers/*` module. For a new button, add its `callback_data` prefix to `bot/handlers/dispatch.py`. Handler modules share one namespace (see `bot/handlers/__init__.py`), so they can call each other without imports. New code should still prefer explicit imports.
@@ -559,6 +680,8 @@ Yes. Each allowed user registers the channel separately (both must be channel ad
 - Album media files are not removed by the 7-day cleanup.
 - `/reset` leaves your uploaded media files on disk, and your backups and batches in the database.
 - Backups don't include album bundles or caption formatting entities.
+- **Web board:** changing or clearing a post's time on the board within about one second after its scheduled job has fired can still publish the post at the old time. The job waits one second and then claims the post by id, without re-checking the stored time. Deleting the post in that window is safe.
+- **Web board:** the UI has only been tested in Chromium.
 
 ## 🤝 Contributing
 

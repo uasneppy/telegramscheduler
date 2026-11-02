@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- The server sends Referrer-Policy: no-referrer, under which a browser may send
+     "Origin: null" on POST/PATCH/DELETE; the board's Origin check refuses that. -->
+<meta name="referrer" content="same-origin">
+<meta name="color-scheme" content="light dark">
+<title>Post board</title>
+<link rel="stylesheet" href="/static/style.css">
+<script type="module" src="/static/main.js"></script>
+</head>
+<body>
+<svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+  <symbol id="i-board" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18M8 14h3M8 17h6"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 1-15.5 6.2L3 15.7"/><path d="M3 12a9 9 0 0 1 15.5-6.2L21 8.3"/><path d="M21 3v5.3h-5.3M3 21v-5.3h5.3"/></symbol>
+  <symbol id="i-signout" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></symbol>
+  <symbol id="i-view" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-delete" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-5-5L5 21"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><path d="m22 8-6 4 6 4Z"/><rect x="2" y="6" width="14" height="12" rx="2"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="m10 8 6 4-6 4Z"/></symbol>
+  <symbol id="i-audio" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></symbol>
+  <symbol id="i-album" viewBox="0 0 24 24"><rect x="7" y="7" width="14" height="14" rx="2"/><path d="M3 15V5a2 2 0 0 1 2-2h10"/><path d="m21 17-3.5-3.5L11 20"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+</svg>
+
+<div id="app">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <svg class="icon brand-icon" aria-hidden="true" focusable="false"><use href="#i-board"/></svg>
+        <h1 class="brand-name">Post board</h1>
+        <span class="tz-note">Kyiv time</span>
+      </div>
+      <div class="filters">
+        <label class="visually-hidden" for="channel-filter">Channel</label>
+        <select id="channel-filter" class="field" disabled>
+          <option value="">All channels</option>
+        </select>
+        <div class="search-field">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-search"/></svg>
+          <label class="visually-hidden" for="search">Search captions</label>
+          <input id="search" class="field" type="search" placeholder="Search captions" maxlength="200" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="refresh" class="icon-button" type="button" aria-label="Refresh" title="Refresh">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-refresh"/></svg>
+        </button>
+        <button id="signout" class="button button-quiet" type="button" aria-label="Sign out">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-signout"/></svg>
+          <span class="button-label">Sign out</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs" aria-label="Post lists">
+    <div class="tabs-inner" role="tablist">
+      <button id="tab-scheduled" class="tab" type="button" role="tab" data-tab="scheduled" aria-controls="post-list" aria-selected="true"><span class="tab-label">Scheduled</span> <span class="count">–</span></button>
+      <button id="tab-queued" class="tab" type="button" role="tab" data-tab="queued" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Queued</span> <span class="count">–</span></button>
+      <button id="tab-failed" class="tab" type="button" role="tab" data-tab="failed" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Failed</span> <span class="count">–</span></button>
+      <button id="tab-posted" class="tab" type="button" role="tab" data-tab="posted" aria-controls="post-list" aria-selected="false" tabindex="-1"><span class="tab-label">Posted</span> <span class="count">–</span></button>
+    </div>
+  </nav>
+
+  <main class="board">
+    <!-- Shown while rows are selected. First in the page's order, so it is the first Tab stop
+         after the tabs, but drawn after the list (style.css: order), sticking to the bottom
+         of the screen while the list scrolls, so it never covers the last rows. -->
+    <div id="bulk-bar" class="bulk-bar" role="region" aria-label="Selected posts" hidden>
+      <div class="bulk-head">
+        <button id="bulk-clear" class="icon-button" type="button" aria-label="Clear selection" title="Clear selection">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-close"/></svg>
+        </button>
+        <p id="bulk-count" class="bulk-count">0 selected</p>
+        <button id="bulk-select-all" class="button button-quiet button-small" type="button">Select all shown</button>
+      </div>
+      <div class="bulk-actions">
+        <button id="bulk-delete" class="button button-danger bulk-delete" type="button">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-delete"/></svg>
+          <span id="bulk-delete-label">Delete</span>
+        </button>
+        <div id="bulk-move-group" class="bulk-group move-group">
+          <label class="visually-hidden" for="bulk-move">Move to channel</label>
+          <select id="bulk-move" class="field">
+            <option value="">Move to…</option>
+          </select>
+          <button id="bulk-move-apply" class="button" type="button">Move</button>
+        </div>
+        <div id="bulk-shift-group" class="bulk-group shift-group">
+          <label class="bulk-label" for="bulk-shift-amount">Shift by</label>
+          <input id="bulk-shift-amount" class="field" type="number" step="1" value="1" aria-describedby="bulk-shift-note">
+          <label class="visually-hidden" for="bulk-shift-unit">Shift unit</label>
+          <select id="bulk-shift-unit" class="field">
+            <option value="hours">hours</option>
+            <option value="days" selected>days</option>
+          </select>
+          <button id="bulk-shift-apply" class="button" type="button">Shift</button>
+          <span id="bulk-shift-note" class="visually-hidden"></span>
+        </div>
+      </div>
+    </div>
+
+    <div id="post-list" role="tabpanel" aria-labelledby="tab-scheduled" aria-busy="true"></div>
+    <p id="empty-state" hidden>Nothing here yet.</p>
+    <p id="list-status" aria-live="polite"></p>
+    <div id="list-sentinel" aria-hidden="true"></div>
+  </main>
+
+  <!-- The edit panel: a side panel from 900 px wide, a bottom sheet below. While it is
+       open the header, tabs, list and bulk bar are inert; the dock (bulk summary, banner,
+       toast and announcer) stays live. -->
+  <div id="panel-scrim" class="panel-scrim" hidden></div>
+  <section id="edit-panel" class="panel" role="dialog" aria-labelledby="panel-title" tabindex="-1" data-state="closed" hidden>
+    <header class="panel-head">
+      <div class="panel-heading">
+        <h2 id="panel-title" class="panel-title">Edit post</h2>
+        <div id="panel-meta" class="panel-meta"></div>
+      </div>
+      <button id="panel-close" class="icon-button" type="button" aria-label="Close" title="Close">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-close"/></svg>
+      </button>
+    </header>
+
+    <div class="panel-body">
+      <p id="panel-loading" class="panel-loading" role="status">Loading…</p>
+      <div id="panel-notices" class="panel-notices"></div>
+
+      <div id="panel-fields" class="panel-fields" hidden>
+        <section class="panel-section" aria-labelledby="media-heading">
+          <h3 id="media-heading" class="section-label">Media</h3>
+          <div id="panel-media" class="panel-media">
+            <div id="media-view" class="media-view"></div>
+            <p id="media-caption" class="media-caption"></p>
+            <div id="media-replace" class="media-replace">
+              <div class="media-replace-row">
+                <input id="replace-media-input" class="visually-hidden" type="file" aria-describedby="media-staged">
+                <label for="replace-media-input" class="button file-button">
+                  <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-upload"/></svg>
+                  <span>Replace media…</span>
+                </label>
+                <label class="check">
+                  <input id="as-file" type="checkbox">
+                  <span>Send as a file <span class="check-note">(original quality)</span></span>
+                </label>
+              </div>
+              <div id="media-staged" class="media-staged" hidden>
+                <span id="media-file-name" class="media-file-name"></span>
+                <button id="media-unstage" class="button button-quiet button-small" type="button">Keep current media</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel-section" aria-labelledby="caption-label">
+          <div class="caption-head">
+            <label id="caption-label" class="section-label" for="caption-input">Caption</label>
+            <div id="caption-toolbar" class="toolbar" role="toolbar" aria-label="Formatting" aria-controls="caption-input">
+              <button class="tool" type="button" data-fmt="b" aria-label="Bold" title="Bold (Ctrl+B)"><b>B</b></button>
+              <button class="tool" type="button" data-fmt="i" aria-label="Italic" title="Italic (Ctrl+I)"><i>I</i></button>
+              <button class="tool" type="button" data-fmt="u" aria-label="Underline" title="Underline (Ctrl+U)"><u>U</u></button>
+              <button class="tool" type="button" data-fmt="link" aria-label="Link" title="Link (Ctrl+K)" aria-expanded="false" aria-controls="link-row">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-link"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="link-row" class="link-row" hidden>
+            <label class="visually-hidden" for="link-url">Link address</label>
+            <input id="link-url" class="field" type="url" inputmode="url" placeholder="https://example.com" autocomplete="off" spellcheck="false">
+            <button id="link-apply" class="button" type="button">Add link</button>
+          </div>
+          <textarea id="caption-input" class="field caption-input" rows="6" spellcheck="true" aria-describedby="caption-counter signature-note"></textarea>
+          <div class="caption-meta">
+            <p id="signature-note" class="signature-note" hidden></p>
+            <p id="caption-counter" class="caption-counter">– / 1024</p>
+          </div>
+          <h3 class="section-label">Preview</h3>
+          <div class="preview-card">
+            <div id="caption-preview" class="caption-preview" aria-busy="false"></div>
+            <p id="preview-signature" class="preview-signature" hidden></p>
+          </div>
+        </section>
+
+        <section class="panel-section panel-where" aria-label="Channel and time">
+          <div class="where-field">
+            <label class="section-label" for="channel-select">Channel</label>
+            <select id="channel-select" class="field"></select>
+          </div>
+          <div class="where-field">
+            <label class="section-label" for="time-input">Publish at <span class="label-note">(Kyiv time)</span></label>
+            <div class="time-row">
+              <input id="time-input" class="field" type="datetime-local" step="60" aria-describedby="time-hint">
+              <button id="unschedule" class="button" type="button">Unschedule</button>
+            </div>
+            <p id="time-hint" class="field-hint"></p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <footer class="panel-foot">
+      <p id="panel-error" class="panel-error" role="alert" hidden></p>
+      <div class="panel-actions">
+        <button id="delete" class="button button-danger" type="button">Delete</button>
+        <button id="post-now" class="button" type="button">Post now</button>
+        <button id="retry" class="button" type="button">Retry</button>
+        <button id="save" class="button button-primary" type="button">Save</button>
+      </div>
+    </footer>
+  </section>
+
+  <div class="dock">
+    <!-- What a bulk action skipped, and why; stays until dismissed. -->
+    <section id="bulk-summary" class="bulk-summary" aria-labelledby="bulk-summary-title" tabindex="-1" hidden>
+      <div class="bulk-summary-head">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-alert"/></svg>
+        <h2 id="bulk-summary-title" class="bulk-summary-title"></h2>
+        <button id="bulk-summary-close" class="icon-button" type="button" aria-label="Dismiss the summary" title="Dismiss">
+          <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-close"/></svg>
+        </button>
+      </div>
+      <ul id="bulk-skipped" class="bulk-skipped"></ul>
+    </section>
+    <div id="banner" class="banner" role="alert" hidden>
+      <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-alert"/></svg>
+      <span id="banner-text" class="banner-text"></span>
+      <button id="banner-retry" class="button" type="button">Retry</button>
+    </div>
+    <div id="toast" class="toast" hidden></div>
+    <!-- Toasts and other short news are read from here: a live region that is always in
+         the page (one that appears together with its text may go unread). -->
+    <div id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+  </div>
+</div>
+
+<section id="signed-out" class="message-card" hidden>
+  <h1>You are not signed in</h1>
+  <p>To open the post board, send <code>/web</code> to the bot in Telegram and open the link it replies with.</p>
+  <p>The link works once and expires after 5 minutes.</p>
+</section>
+</body>
+</html>

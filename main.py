@@ -26,6 +26,8 @@ from bot.handlers import (
 )
 from bot.database import init_database
 from bot.scheduler import PostScheduler
+from bot.web.command import web_command
+import config
 from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR, ALLOWED_USER_IDS, ADMIN_CHAT_ID
 
 # Configure logging
@@ -64,9 +66,29 @@ async def post_init(application):
     # Store scheduler in application context
     application.bot_data['scheduler'] = scheduler
 
+    # Web board (opt-in via WEB_BASE_URL). The web server module, and with it aiohttp,
+    # is imported only when the board is switched on, so a deployment without the board
+    # needs neither aiohttp nor Pillow. Starting the board never stops the bot (spec 3.2):
+    # a board that cannot start, for whatever reason, is logged and the bot carries on
+    # without it (runner is None). An exception out of post_init would make
+    # python-telegram-bot exit, and the container would restart in a loop.
+    runner = None
+    if config.WEB_BASE_URL:
+        try:
+            from bot.web.server import start_web
+            runner = await start_web(application.bot, scheduler)
+        except ImportError as e:
+            logger.error(f"Web board not started: a required package is missing ({e}). Install aiohttp.")
+        except Exception:
+            logger.exception("Web board not started: it failed while starting; the bot carries on without it")
+    else:
+        logger.info("Web board disabled: WEB_BASE_URL is not set.")
+    application.bot_data['web_runner'] = runner
+
     # Register the command menu Telegram shows when the user types "/".
     # Only the everyday commands are listed - everything else is reachable
     # from the /start menu.
+    web_commands = [BotCommand("web", "Open the web board")] if runner is not None else []
     try:
         await application.bot.set_my_commands([
             BotCommand("start", "Main menu & dashboard"),
@@ -75,6 +97,7 @@ async def post_init(application):
             BotCommand("schedule", "Schedule queued posts"),
             BotCommand("stats", "Your posting statistics"),
             BotCommand("settings", "Reminders & notifications"),
+            *web_commands,
             BotCommand("cancel", "Cancel current operation"),
             BotCommand("help", "All commands & help"),
         ])
@@ -83,7 +106,12 @@ async def post_init(application):
         logger.warning(f"Could not register command menu: {e}")
 
 async def post_shutdown(application):
-    """Shut the scheduler down cleanly when the application stops"""
+    """Shut the web board and the scheduler down cleanly when the application stops"""
+    runner = application.bot_data.get('web_runner')
+    if runner is not None:
+        # A runner exists only if post_init imported the web server module.
+        from bot.web.server import stop_web
+        await stop_web(runner)
     scheduler = application.bot_data.get('scheduler')
     if scheduler:
         scheduler.stop()
@@ -166,6 +194,8 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_handler))
     application.add_handler(CommandHandler("status", status_handler))
     application.add_handler(CommandHandler("help", help_handler))
+    # Always registered: it tells the user when the board is switched off
+    application.add_handler(CommandHandler("web", web_command))
 
     # Forward unexpected errors to the log (and admin chat if configured)
     application.add_error_handler(error_handler)
