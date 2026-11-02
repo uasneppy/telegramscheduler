@@ -1,7 +1,7 @@
-"""The 5-minute post monitor: it re-arms overdue posts without undoing a delete or unschedule.
+"""The 5-minute post monitor: it re-arms overdue posts without undoing a board change.
 
-The web board writes from worker threads, so its delete or unschedule can
-commit at any moment of a monitor pass, including while the monitor awaits a
+The web board writes from worker threads, so its delete, unschedule or new time
+can commit at any moment of a monitor pass, including while the monitor awaits a
 Telegram message for an earlier post. Whatever the board stored must survive.
 """
 
@@ -12,11 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from bot import database
 from bot.database import Database
 from bot.scheduler import PostScheduler
 from bot.utils import get_current_kyiv_time
 from bot.web import service
-from web_helpers import insert_post
+from web_helpers import future_noon, insert_post
 
 MONITOR_ERRORS = ("Error during post monitoring", "Error fetching overdue posts", "Error rescheduling post")
 
@@ -81,7 +82,15 @@ def _board_unschedule(post_id):
     service._store_edit(1, post_id, {"scheduled_time": None})
 
 
-BOARD_WRITES = {"deleted": _board_delete, "unscheduled": _board_unschedule}
+# A new time set on the board: the post is no longer overdue.
+RETIMED = future_noon()
+
+
+def _board_retime(post_id):
+    service._store_edit(1, post_id, {"scheduled_time": RETIMED})
+
+
+BOARD_WRITES = {"deleted": _board_delete, "unscheduled": _board_unschedule, "re-timed": _board_retime}
 
 
 def _after(monkeypatch, name, action):
@@ -96,13 +105,32 @@ def _after(monkeypatch, name, action):
     monkeypatch.setattr(Database, name, staticmethod(wrapped))
 
 
+def _before(monkeypatch, name, action):
+    """Run `action` right before Database.<name> runs, as a board write landing at that moment."""
+    original = getattr(Database, name)
+
+    def wrapped(*args, **kwargs):
+        action()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(Database, name, staticmethod(wrapped))
+
+
 def _assert_left_as_board_stored(monitor, post_id, before, board_write):
     row = Database.get_post_by_id(post_id)
     if board_write == "deleted":
         assert (row["status"], row["scheduled_time"]) == ("deleted", before["scheduled_time"])
-    else:
+    elif board_write == "unscheduled":
         assert (row["status"], row["scheduled_time"]) == ("pending", None)
-    assert monitor.scheduler.get_job(f"post_{post_id}") is None
+    else:
+        assert (row["status"], row["scheduled_time"]) == ("pending", RETIMED)
+    job = monitor.scheduler.get_job(f"post_{post_id}")
+    if board_write == "re-timed" and job is not None:
+        # The monitor's missing-job pass may arm the board's own new time (the board arms
+        # the same job itself); a job at any other time would publish at the wrong moment.
+        assert job.run_date == RETIMED
+    else:
+        assert job is None
     assert not [text for _, text in monitor.bot.sent if f"#{post_id} " in text]
 
 
@@ -168,6 +196,19 @@ def test_board_write_after_the_overdue_list_was_read_is_kept(monkeypatch, caplog
 
 
 @pytest.mark.parametrize("board_write", BOARD_WRITES)
+def test_board_write_just_before_the_retry_count_is_raised_is_kept(monkeypatch, caplog, board_write):
+    post_id = _overdue_post()
+    before = Database.get_post_by_id(post_id)
+    _before(monkeypatch, "increment_retry_count", lambda: BOARD_WRITES[board_write](post_id))
+    monitor = _monitor()
+
+    _run(monitor, caplog)
+
+    _assert_left_as_board_stored(monitor, post_id, before, board_write)
+    assert Database.get_post_by_id(post_id)["retry_count"] == 0
+
+
+@pytest.mark.parametrize("board_write", BOARD_WRITES)
 def test_board_write_after_the_retry_count_was_raised_is_kept(monkeypatch, caplog, board_write):
     post_id = _overdue_post()
     before = Database.get_post_by_id(post_id)
@@ -221,3 +262,33 @@ def test_post_claimed_by_its_job_after_the_list_was_read_is_not_sent_again(monke
     assert Database.get_post_by_id(post_id)["status"] == "sending"
     assert monitor.scheduler.get_job(f"post_{post_id}") is None
     assert monitor.bot.sent == []
+
+
+# --- "still overdue" is decided on instants, not on the stored strings -----------------
+#
+# 2030-10-27: Kyiv clocks go back from 04:00 EEST (+03:00) to 03:00 EET (+02:00), so
+# 03:30 happens twice. "03:30+03:00" is 00:30 UTC and "03:30+02:00" is 01:30 UTC, but as
+# strings "+03:00" sorts after "+02:00", so a string comparison gets both cases wrong.
+FIRST_0330 = "2030-10-27T03:30:00+03:00"
+SECOND_0330 = "2030-10-27T03:30:00+02:00"
+
+
+def test_post_overdue_by_an_hour_across_the_autumn_overlap_is_still_overdue(monkeypatch):
+    monkeypatch.setattr(database, "kyiv_now_iso", lambda: SECOND_0330)
+    counted, rescheduled, failed = (insert_post(scheduled_time=FIRST_0330) for _ in range(3))
+
+    assert Database.increment_retry_count(counted) == 1
+    assert Database.reschedule_overdue_post(rescheduled, RETIMED) is True
+    assert Database.fail_overdue_post(failed, "gave up") is True
+
+
+def test_post_due_in_an_hour_across_the_autumn_overlap_is_not_overdue(monkeypatch):
+    monkeypatch.setattr(database, "kyiv_now_iso", lambda: FIRST_0330)
+    post_id = insert_post(scheduled_time=SECOND_0330)
+
+    assert Database.increment_retry_count(post_id) == 0
+    assert Database.reschedule_overdue_post(post_id, RETIMED) is False
+    assert Database.fail_overdue_post(post_id, "gave up") is False
+    row = Database.get_post_by_id(post_id)
+    assert (row["status"], row["retry_count"], row["failure_reason"]) == ("pending", 0, None)
+    assert row["scheduled_time"].isoformat() == SECOND_0330

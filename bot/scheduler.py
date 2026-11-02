@@ -614,9 +614,9 @@ class PostScheduler:
                         # Check how many times this post has already been rescheduled.
                         # The list above may be stale: the web board (which writes from
                         # other threads) or the post's own job can have deleted,
-                        # unscheduled or claimed the post since. Every write below is
-                        # conditional on the post still being pending with a time, and
-                        # 0 here means it no longer is - leave it as it is.
+                        # unscheduled, re-timed or claimed the post since. Every write
+                        # below is conditional on the post still being pending and
+                        # overdue, and 0 here means it no longer is - leave it as it is.
                         current_retry = Database.increment_retry_count(post_id)
                         max_monitor_reschedules = 5
 
@@ -657,8 +657,8 @@ class PostScheduler:
 
                             # Schedule immediately with a small delay. The time is
                             # stored first and the job armed only if that write
-                            # applied; a board delete or unschedule committing after
-                            # it cancels the job itself once its write is done.
+                            # applied; a board change committing after it cancels or
+                            # moves the job itself once its write is done.
                             new_time = get_current_kyiv_time() + timedelta(seconds=10)
                             if not Database.reschedule_overdue_post(post_id, new_time):
                                 logger.info(f"Post {post_id} changed since the overdue check - not rescheduled")
