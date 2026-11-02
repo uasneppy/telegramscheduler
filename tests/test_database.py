@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pytz
 
 from bot.database import Database, serialize_dt
+from web_helpers import future_noon
 
 KYIV = pytz.timezone('Europe/Kiev')
 AWARE = KYIV.localize(datetime(2030, 9, 1, 12, 0))
@@ -188,7 +189,7 @@ def test_reminder_settings_roundtrip():
 def test_dashboard_stats():
     Database.add_user_channel(3, '@c', 'C')
     _insert_post(user_id=3)
-    _insert_post(user_id=3, scheduled=AWARE, channel_id='@c')
+    _insert_post(user_id=3, scheduled=future_noon(), channel_id='@c')  # ahead of the real clock
     _insert_post(user_id=3, status='failed')
     _insert_post(user_id=3, scheduled=KYIV.localize(datetime(2020, 1, 1)))
     s = Database.get_dashboard_stats(3)

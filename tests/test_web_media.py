@@ -7,8 +7,10 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from PIL import Image
@@ -375,6 +377,62 @@ def test_thumbnail_decompression_bomb(monkeypatch):
     monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10000)
     assert get_thumbnail(warn_band, 160) is not None
     assert warnings.filters == filters_before
+
+
+def test_thumbnail_decoding_runs_at_most_two_at_once(monkeypatch):
+    sources = [_make_image(_upload_path(f"p{i}.png"), size=(64, 64)) for i in range(6)]
+    lock = threading.Lock()
+    running, peak = [0], [0]
+    write = media._write_thumbnail
+
+    def slow_write(real_path, width, temp):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        try:
+            time.sleep(0.05)  # long enough for every thread to be waiting at once
+            write(real_path, width, temp)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    monkeypatch.setattr(media, "_write_thumbnail", slow_write)
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        thumbs = list(pool.map(get_thumbnail, sources))
+
+    assert all(thumbs)
+    assert 1 <= peak[0] <= 2, f"{peak[0]} decodes ran at once"
+    assert media.THUMB_DECODE_LIMIT == 2
+
+
+class _CountingSlot:
+    """Stands in for the decode semaphore and counts the slots taken."""
+
+    def __init__(self):
+        self.taken = 0
+
+    def __enter__(self):
+        self.taken += 1
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_cache_hits_path_checks_and_missing_pillow_take_no_decode_slot(monkeypatch, tmp_path):
+    source = _make_image(_upload_path("pic.png"), size=(300, 300))
+    outside = _make_image(str(tmp_path / "outside.png"), size=(50, 50))
+    not_cached = _make_image(_upload_path("new.png"), size=(60, 60))
+    slot = _CountingSlot()
+    monkeypatch.setattr(media, "_decode_slots", slot)
+    cached = get_thumbnail(source, 160)
+    assert cached is not None and slot.taken == 1  # a real decode takes one
+
+    assert get_thumbnail(source, 160) == cached
+    assert get_thumbnail(_upload_path("missing.png")) is None
+    assert get_thumbnail(outside) is None
+    _block_pillow(monkeypatch)
+    assert get_thumbnail(not_cached) is None
+    assert slot.taken == 1
 
 
 def test_thumbnail_refuses_non_photo_formats():

@@ -45,6 +45,10 @@ _BARE_AMP = re.compile(r"&(?!(?:lt|gt|amp|quot|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}
 _BARE_LT = re.compile(r"<(?!/?[a-zA-Z])")
 _LANGUAGE_PREFIX = "language-"
 _SAFE_HREF = re.compile(r"(?:https?|tg)://", re.IGNORECASE)
+# Link schemes that run script or embed content; Telegram refuses them at publish
+# time. Browsers ignore ASCII whitespace and control characters in a scheme.
+_BLOCKED_SCHEMES = ("javascript", "data", "vbscript")
+_URL_IGNORED = re.compile(r"[\x00-\x20\x7f]")
 
 
 class CaptionError(WebError):
@@ -232,6 +236,20 @@ def _check_attributes(tag: str, attributes: dict, required: str | None = None, o
         raise CaptionError(f'<{tag}> needs a non-empty {required}="..." attribute.')
 
 
+def _check_link(url: str) -> None:
+    """Refuse a javascript:, data: or vbscript: link (whitespace and control characters ignored)."""
+    compact = _URL_IGNORED.sub("", url).lower()
+    for scheme in _BLOCKED_SCHEMES:
+        if compact.startswith(f"{scheme}:"):
+            raise CaptionError(f"Links to {scheme}: addresses are not allowed.")
+
+
+def _check_emoji_id(emoji_id: str) -> None:
+    """Refuse a custom emoji id that is not all ASCII digits (Telegram ids are numbers)."""
+    if not (emoji_id.isascii() and emoji_id.isdigit()):
+        raise CaptionError('A custom emoji id is a number: write <tg-emoji emoji-id="DIGITS">.')
+
+
 def _entity_for(tag: str, attributes: dict) -> dict:
     """The entity (without offset and length) that a start tag opens."""
     if tag == "blockquote":
@@ -245,10 +263,14 @@ def _entity_for(tag: str, attributes: dict) -> dict:
         return {"type": "pre"}
     if tag == "a":
         _check_attributes(tag, attributes, required="href")
-        return {"type": "text_link", "url": attributes["href"].strip()}
+        url = attributes["href"].strip()
+        _check_link(url)
+        return {"type": "text_link", "url": url}
     if tag == "tg-emoji":
         _check_attributes(tag, attributes, required="emoji-id")
-        return {"type": "custom_emoji", "custom_emoji_id": attributes["emoji-id"].strip()}
+        emoji_id = attributes["emoji-id"].strip()
+        _check_emoji_id(emoji_id)
+        return {"type": "custom_emoji", "custom_emoji_id": emoji_id}
     raise CaptionError(f"<{tag}> is not a supported tag.")
 
 

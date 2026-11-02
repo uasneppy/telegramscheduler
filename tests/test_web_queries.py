@@ -15,7 +15,7 @@ from bot.database import serialize_dt
 from bot.web.errors import WebError
 from bot.web.queries import get_me, get_owned_post, get_post_detail, list_posts
 from bot.web.rules import TABS, board_status, can_flags
-from web_helpers import add_channel, insert_post
+from web_helpers import add_channel, future_noon, insert_post
 
 KYIV = pytz.timezone("Europe/Kiev")
 NOW = KYIV.localize(datetime(2030, 6, 1, 12, 0))
@@ -326,8 +326,9 @@ def test_overdue_flag():
 
     # without an explicit now the real clock is used
     old = insert_post(scheduled=KYIV.localize(datetime(2020, 1, 1, 10, 0)))
+    ahead = insert_post(scheduled=future_noon())
     assert get_post_detail(1, old)["overdue"] is True
-    assert get_post_detail(1, future)["overdue"] is False
+    assert get_post_detail(1, ahead)["overdue"] is False
 
 
 # --- detail ---------------------------------------------------------------------------

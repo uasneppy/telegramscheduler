@@ -61,6 +61,12 @@ _THUMB_FORMATS = ("JPEG", "PNG", "WEBP")
 # thread safe, and thumbnails are generated on worker threads.
 _OPEN_LOCK = threading.Lock()
 
+# Decoding a large image can take hundreds of MB, and each decode holds a worker
+# thread of the pool the board's database calls share: at most this many decode
+# at once. Cache hits, path checks and a missing Pillow never wait for a slot.
+THUMB_DECODE_LIMIT = 2
+_decode_slots = threading.BoundedSemaphore(THUMB_DECODE_LIMIT)
+
 # Written to disk in blocks this big: aiohttp hands out small chunks and every
 # disk write costs a thread hop.
 _FLUSH_BYTES = 256 * 1024
@@ -183,6 +189,22 @@ def _open_image(real_path: str):
         return Image.open(real_path, formats=_THUMB_FORMATS)
 
 
+def _write_thumbnail(real_path: str, width: int, temp: str) -> None:
+    """Decode an image, shrink it to fit `width` x `width` and save it to `temp` as WebP."""
+    from PIL import Image  # here, not at module level: see the module docstring
+
+    source = _open_image(real_path)
+    try:
+        source.thumbnail((width, width), Image.Resampling.LANCZOS)
+        thumb = source
+        if source.mode not in ("RGB", "RGBA"):
+            has_alpha = source.mode in ("LA", "PA") or "transparency" in source.info
+            thumb = source.convert("RGBA" if has_alpha else "RGB")
+        thumb.save(temp, "WEBP", quality=80)
+    finally:
+        source.close()
+
+
 def get_thumbnail(file_path: str, width: int = 160) -> str | None:
     """Path of a cached WebP thumbnail for a stored image, or None.
 
@@ -208,18 +230,12 @@ def get_thumbnail(file_path: str, width: int = 160) -> str | None:
     os.makedirs(THUMBS_DIR, exist_ok=True)
     temp = os.path.join(THUMBS_DIR, f"{key}.{uuid.uuid4().hex}.tmp")
     try:
-        from PIL import Image  # inside the try: without Pillow there is simply no thumbnail
+        # Inside the try: without Pillow there is simply no thumbnail. Imported
+        # before a decode slot is taken, so a missing Pillow never waits for one.
+        from PIL import Image  # noqa: F401
 
-        source = _open_image(real)
-        try:
-            source.thumbnail((width, width), Image.Resampling.LANCZOS)
-            thumb = source
-            if source.mode not in ("RGB", "RGBA"):
-                has_alpha = source.mode in ("LA", "PA") or "transparency" in source.info
-                thumb = source.convert("RGBA" if has_alpha else "RGB")
-            thumb.save(temp, "WEBP", quality=80)
-        finally:
-            source.close()
+        with _decode_slots:
+            _write_thumbnail(real, width, temp)
         os.replace(temp, cached)
     except ImportError:  # Pillow is missing (or not usable): not a problem with this one file
         _remove_quietly(temp)

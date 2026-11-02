@@ -7,11 +7,10 @@ import logging
 import os
 import re
 import shutil
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import aiohttp
 import pytest
-import pytz
 from PIL import Image
 
 from bot.database import Database, parse_dt
@@ -20,12 +19,12 @@ from bot.web import media
 from bot.web.queries import get_owned_post
 from bot.web.server import SESSION_COOKIE
 from config import THUMBS_DIR, UPLOADS_DIR
-from web_helpers import FakeScheduler, add_channel, board_client, insert_post
+from web_helpers import FakeScheduler, add_channel, board_client, future_noon, insert_post
 
 BASE = "http://localhost:8080"
 WRITE = {"Origin": BASE, "X-Board": "1"}
-KYIV = pytz.timezone("Europe/Kiev")
-FUTURE = KYIV.localize(datetime(2030, 9, 1, 12, 0))
+# The board compares new times against the real clock, so FUTURE must stay ahead of it.
+FUTURE = future_noon()
 SANDBOX = "sandbox"
 BOTH_USERS = frozenset({1, 2})
 
@@ -216,7 +215,7 @@ def test_patch_post_happy_path():
         async with board_client(scheduler=scheduler) as client:
             response = await client.patch(
                 f"/api/posts/{pid}",
-                json={"caption": "<b>New</b> caption", "scheduled_time": "2030-09-01T12:00"},
+                json={"caption": "<b>New</b> caption", "scheduled_time": FUTURE.strftime("%Y-%m-%dT%H:%M")},
                 headers=WRITE,
             )
             body = await _expect(response, 200)

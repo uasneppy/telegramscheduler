@@ -58,6 +58,27 @@ def test_origin_of_matches_browser_origin():
     assert origin_of("https://[2001:db8::1]:8443") == "https://[2001:db8::1]:8443"
 
 
+def test_origin_of_unicode_host_is_punycode():
+    # Browsers send the IDNA (punycode) form of a Unicode host in the Origin header.
+    assert origin_of("https://пример.укр") == "https://xn--e1afmkfd.xn--j1amh"
+    assert origin_of("https://Board.ПРИМЕР.Укр") == "https://board.xn--e1afmkfd.xn--j1amh"
+    assert origin_of("https://пример.укр:443") == "https://xn--e1afmkfd.xn--j1amh"
+    assert origin_of("https://пример.укр:8443") == "https://xn--e1afmkfd.xn--j1amh:8443"
+    assert origin_of("https://xn--e1afmkfd.xn--j1amh") == "https://xn--e1afmkfd.xn--j1amh"
+
+
+def test_validate_accepts_unicode_host():
+    assert validate_web_config("https://пример.укр", {1}) is None
+    assert validate_web_config("https://board.пример.укр:8443", {1}) is None
+
+
+def test_validate_rejects_unicode_host_without_an_ascii_form():
+    for url in ("https://пример..укр", f"https://{'я' * 64}.укр"):
+        error = validate_web_config(url, {1})
+        assert error is not None, url
+        assert "punycode" in error and "1 to 63 characters" in error
+
+
 def test_origin_of_never_includes_userinfo():
     assert origin_of("https://user:pw@b.example.com:8443") == "https://b.example.com:8443"
     assert origin_of("https://user@b.example.com") == "https://b.example.com"

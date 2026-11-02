@@ -5,10 +5,8 @@ import json
 import os
 import shutil
 import sqlite3
-from datetime import datetime
 
 import pytest
-import pytz
 
 from bot.database import Database
 from bot.web import service
@@ -16,11 +14,10 @@ from bot.web.errors import WebError
 from bot.web.media import StoredUpload
 from bot.web.queries import get_owned_post
 from config import DATA_DIR, UPLOADS_DIR
-from web_helpers import insert_post
+from web_helpers import future_noon, insert_post
 
 USER_ID = 1
-KYIV = pytz.timezone("Europe/Kiev")
-FUTURE = KYIV.localize(datetime(2030, 9, 1, 12, 0))
+FUTURE = future_noon()  # ahead of the real clock the replace path reads
 
 
 @pytest.fixture(autouse=True)

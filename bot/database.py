@@ -63,6 +63,17 @@ def kyiv_now_iso() -> str:
     """Current time as canonical Kyiv ISO string."""
     return datetime.now(get_kyiv_timezone()).isoformat()
 
+
+# WHERE condition of the monitor's writes to an overdue post (bound parameter: the
+# current Kyiv time): the post is still pending and its stored time is still in the
+# past. A post the web board deleted, unscheduled or moved to a new time since the
+# monitor read it is left alone. Times are compared as instants: stored strings carry
+# +02:00 or +03:00, so comparing them as text is wrong around the DST changes.
+_STILL_OVERDUE = (
+    "status = 'pending' AND scheduled_time IS NOT NULL "
+    "AND CAST(strftime('%s', scheduled_time) AS INTEGER) < CAST(strftime('%s', ?) AS INTEGER)"
+)
+
 def init_database():
     """Initialize the SQLite database with required tables"""
     conn = sqlite3.connect(DATABASE_PATH)
@@ -703,29 +714,88 @@ class Database:
     
     @staticmethod
     def increment_retry_count(post_id: int) -> int:
-        """Increment retry count for a post and return new count"""
+        """Increment the monitor's retry count for a post and return the new count.
+
+        Only a post that is still pending and still overdue is counted. A post
+        deleted, unscheduled, moved to a new time or claimed for sending since the
+        monitor read it (the web board writes from other threads) is left
+        untouched and 0 is returned.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute('''
+
+        now = kyiv_now_iso()
+        cursor.execute(f'''
             UPDATE posts
             SET retry_count = retry_count + 1,
-                last_retry_at = ?,
-                status = 'pending'
-            WHERE id = ?
-        ''', (kyiv_now_iso(), post_id))
-        
+                last_retry_at = ?
+            WHERE id = ? AND {_STILL_OVERDUE}
+        ''', (now, post_id, now))
+        changed = cursor.rowcount > 0
+
         # Get the new retry count
         cursor.execute('SELECT retry_count FROM posts WHERE id = ?', (post_id,))
         result = cursor.fetchone()
-        retry_count = result[0] if result else 0
-        
+        retry_count = result[0] if changed and result else 0
+
         conn.commit()
         conn.close()
-        
-        logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
+
+        if changed:
+            logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
+        else:
+            logger.info(f"Post {post_id} is no longer pending and overdue - retry count left as is")
         return retry_count
-    
+
+    @staticmethod
+    def reschedule_overdue_post(post_id: int, scheduled_time: datetime) -> bool:
+        """Set a new time for an overdue post while it is still pending and overdue.
+
+        The monitor's reschedule write: unlike update_post_schedule it never undoes
+        a delete, an unschedule, a new time or a send claim that committed after
+        the monitor read the post. Returns whether the row changed.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(f'''
+            UPDATE posts
+            SET scheduled_time = ?
+            WHERE id = ? AND {_STILL_OVERDUE}
+        ''', (serialize_dt(scheduled_time), post_id, kyiv_now_iso()))
+
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+
+        if changed:
+            logger.info(f"Updated scheduled time for post {post_id} to {scheduled_time}")
+        return changed
+
+    @staticmethod
+    def fail_overdue_post(post_id: int, failure_reason: str) -> bool:
+        """Mark an overdue post failed while it is still pending and overdue.
+
+        The monitor's give-up write, conditional for the same reason as
+        reschedule_overdue_post. Returns whether the row changed.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(f'''
+            UPDATE posts
+            SET status = 'failed', failure_reason = ?
+            WHERE id = ? AND {_STILL_OVERDUE}
+        ''', (failure_reason, post_id, kyiv_now_iso()))
+
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+
+        if changed:
+            logger.warning(f"Marked post {post_id} as failed: {failure_reason}")
+        return changed
+
     @staticmethod
     def reschedule_all_posts_from_today(user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: Optional[str] = None) -> int:
         """Reschedule all pending posts starting from today with custom hours, interleaving channels"""
