@@ -1739,6 +1739,7 @@ def check_bulk_delete_and_undo(smoke: Smoke):
         expect(page.locator('[data-tab="queued"] .count')).to_have_text(str(before - 3))
         toast = page.locator("#toast")
         expect(toast).to_contain_text("Deleted 3 posts")
+        expect(toast.locator(".undo")).to_be_focused()  # the bar went away; Undo is one key away
         smoke.shot(page, "undo-toast-bulk-desktop-light")
         with bulk_call(page) as info:
             toast.locator(".undo").click()
@@ -2000,6 +2001,237 @@ def check_unauthorized_with_panel_open(smoke: Smoke):
         assert not page.evaluate("() => document.body.classList.contains('panel-open')"), "the page stays locked"
         assert page.evaluate("() => document.querySelector('#edit-panel').dataset.state") == "closed"
 
+def check_bulk_bar_first_in_tab_order(smoke: Smoke):
+    """With posts selected, the bar's controls are the first Tab stops after the tabs, though
+    the bar is drawn at the bottom of the screen; the rows come after it."""
+    with smoke.page() as page:
+        select_rows(page, row_ids(page)[3:5])
+        page.locator('[data-tab="scheduled"]').focus()
+        stops = []
+        for _ in range(8):
+            page.keyboard.press("Tab")
+            stops.append(page.evaluate(
+                "() => { const a = document.activeElement;"
+                " return a.closest('#post-list .post-row') ? 'row' : (a.id || a.tagName); }"
+            ))
+            if len(stops) == 1:
+                smoke.shot(page, "bulk-bar-keyboard-desktop-light")
+        bar = ["bulk-clear", "bulk-select-all", "bulk-delete", "bulk-move",
+               "bulk-shift-amount", "bulk-shift-unit", "bulk-shift-apply"]  # Move waits for a channel
+        assert stops == [*bar, "row"], f"Tab stops after the tabs: {stops}"
+        box = page.locator("#bulk-bar").bounding_box()
+        assert abs(box["y"] + box["height"] - (720 - 12)) < 1, f"the bar at {box} is not at the bottom"
+        page.click("#bulk-clear")
+
+
+def check_bulk_undo_more_than_a_page(smoke: Smoke):
+    """Undo of a bulk delete bigger than a page brings every row back and never says posts went
+    to another tab when they are simply further down the list. The list and bulk calls are
+    answered in the page by a small fake board with keyset paging."""
+    fake = [fake_item(9_100_000 + n, f"Queued row {n + 1}") for n in range(3 * PAGE_SIZE)]
+    deleted: set[int] = set()
+
+    def fake_list(route):
+        query = parse_qs(urlsplit(route.request.url).query)
+        after = int(query["cursor"][0]) if "cursor" in query else 0
+        live = [item for item in fake if item["id"] not in deleted and item["id"] > after]
+        items = live[:PAGE_SIZE]
+        more = len(live) > PAGE_SIZE
+        route.fulfill(json={"items": items, "next_cursor": str(items[-1]["id"]) if more else None})
+
+    def fake_bulk(route):
+        body = route.request.post_data_json
+        if body["action"] == "delete":
+            deleted.update(body["ids"])
+        else:
+            deleted.difference_update(body["ids"])
+        route.fulfill(json={"results": [{"id": post_id, "ok": True, "error": None} for post_id in body["ids"]]})
+
+    with smoke.page(None) as page:
+        page.route(lambda url: "/api/posts?" in url and "status=queued" in url, fake_list)
+        page.route(lambda url: urlsplit(url).path == "/api/posts/bulk", fake_bulk)
+        page.goto(f"{smoke.base}/#tab=queued")
+        wait_for_list(page)
+        scroll_to_end(page, 2 * PAGE_SIZE)
+        select_rows(page, [fake[0]["id"]])
+        page.click("#bulk-select-all")
+        chosen = page.locator("#post-list .row-select:checked").count()
+        assert chosen >= 2 * PAGE_SIZE, f"only {chosen} rows were selected"
+        with bulk_call(page):
+            page.click("#bulk-delete")
+        wait_for_list(page)
+        expect(page.locator("#post-list .post-row")).to_have_count(len(fake) - chosen)
+        with bulk_call(page):
+            page.locator("#toast .undo").click()
+        expect(page.locator("#toast")).to_have_text(f"Restored {chosen} posts.")
+        expect(page.locator("#post-list .post-row")).to_have_count(len(fake))
+        assert row_ids(page) == [item["id"] for item in fake], "the rows did not come back in order"
+
+
+def check_undo_shortcut(smoke: Smoke):
+    """Ctrl+Z undoes the last delete while its toast is up, except while typing, where it is the
+    editor's own undo; the announcement says so."""
+    upcoming = [item for item in first_page(smoke) if not item["overdue"]]
+    item, other = upcoming[30], upcoming[31]
+    restores: list[str] = []
+    with smoke.page() as page:
+        page.on("request", lambda r: r.method == "POST" and r.url.endswith("/restore") and restores.append(r.url))
+        row(page, item["id"]).locator(".row-delete").click()
+        expect(row(page, item["id"])).to_have_count(0)
+        expect(page.locator("#announcer")).to_contain_text("Ctrl+Z")
+        undo = page.locator("#toast .undo")
+        expect(undo).to_have_attribute("aria-keyshortcuts", re.compile("Control\\+Z"))
+        open_panel(page, other["id"])
+        caption = page.locator("#caption-input")
+        caption.press("End")
+        caption.press_sequentially(" draft")
+        caption.press("Control+z")
+        page.wait_for_timeout(500)
+        assert not restores, f"Ctrl+Z in the caption editor restored the post: {restores}"
+        expect(undo).to_be_visible()
+        discard_and_close(page)
+        with board_call(page, "POST", f"/api/posts/{item['id']}/restore") as info:
+            page.keyboard.press("Control+z")
+        assert_board_call(smoke, info.value)
+        expect(row(page, item["id"])).to_have_count(1)
+        assert len(restores) == 1, restores
+
+
+def check_keyboard_row_delete_focus(smoke: Smoke):
+    """A row deleted from the keyboard hands focus to the next row (the previous one at the end
+    of the list), a failed delete hands it back to the Delete button, and the panel's Delete
+    hands it to the next row as well."""
+    with smoke.page("#tab=queued", expect_failed_requests=True) as page:  # one delete is answered 500
+        ids = row_ids(page)
+        row(page, ids[1]).locator(".row-delete").focus()
+        with board_call(page, "DELETE", f"/api/posts/{ids[1]}"):
+            page.keyboard.press("Enter")
+        expect(row(page, ids[1])).to_have_count(0)
+        expect(row(page, ids[2])).to_be_focused()
+        with board_call(page, "POST", f"/api/posts/{ids[1]}/restore"):
+            page.keyboard.press("Control+z")
+        expect(row(page, ids[1])).to_have_count(1)
+        # The last row: focus goes to the row before it.
+        ids = row_ids(page)
+        row(page, ids[-1]).locator(".row-delete").focus()
+        with board_call(page, "DELETE", f"/api/posts/{ids[-1]}"):
+            page.keyboard.press("Enter")
+        expect(row(page, ids[-2])).to_be_focused()
+        with board_call(page, "POST", f"/api/posts/{ids[-1]}/restore"):
+            page.keyboard.press("Control+z")
+        expect(row(page, ids[-1])).to_have_count(1)
+        # A delete that fails: focus is back on the Delete button, which works again.
+        failing = ids[3]
+        page.route(
+            lambda url: urlsplit(url).path == f"/api/posts/{failing}",
+            lambda route: route.fulfill(status=500, json={"error": "internal", "message": "Internal error"})
+            if route.request.method == "DELETE" else route.continue_(),
+        )
+        button = row(page, failing).locator(".row-delete")
+        button.focus()
+        page.keyboard.press("Enter")
+        expect(page.locator("#toast")).to_contain_text("error 500")
+        expect(button).to_be_enabled()
+        expect(button).to_be_focused()
+        expect(row(page, failing)).to_have_count(1)
+    with smoke.page("#tab=queued") as page:
+        ids = row_ids(page)
+        row(page, ids[4]).focus()
+        page.keyboard.press("Enter")
+        wait_for_panel(page, ids[4])
+        page.locator("#delete").focus()
+        with board_call(page, "DELETE", f"/api/posts/{ids[4]}"):
+            page.keyboard.press("Enter")
+        expect(page.locator("#edit-panel")).to_be_hidden()
+        expect(row(page, ids[5])).to_be_focused()
+        with board_call(page, "POST", f"/api/posts/{ids[4]}/restore"):
+            page.keyboard.press("Control+z")
+        expect(row(page, ids[4])).to_have_count(1)
+
+
+def check_bulk_unknown_outcome_reloads(smoke: Smoke):
+    """A bulk call that gets a server error or no answer may have changed posts already (the server
+    commits post by post): the page reloads the list, says to check it before trying again, sends
+    nothing again by itself and keeps the selection that is still shown. Each call below is
+    applied by the server and its answer replaced, as when a connection drops."""
+    upcoming = [item for item in first_page(smoke) if not item["overdue"]]
+    sent: list[dict] = []
+
+    def lost_answer(action: str, outcome: str):
+        def handler(route):
+            body = route.request.post_data_json
+            if body["action"] != action:
+                route.continue_()
+                return
+            sent.append(body)
+            route.fetch()  # the server applies it...
+            if outcome == "500":  # ...and the page gets an error instead of the results
+                route.fulfill(status=500, json={"error": "internal", "message": "Internal error"})
+            else:
+                route.abort()
+        return handler
+
+    def bulk_url(url):
+        return urlsplit(url).path == "/api/posts/bulk"
+
+    # Shift + 500: the rows show the posts moved once, and nothing is sent again.
+    chosen = upcoming[20:22]
+    with smoke.page(expect_failed_requests=True) as page:
+        page.route(bulk_url, lost_answer("shift", "500"))
+        select_rows(page, [item["id"] for item in chosen])
+        page.fill("#bulk-shift-amount", "1")
+        page.select_option("#bulk-shift-unit", "hours")
+        page.click("#bulk-shift-apply")
+        toast = page.locator("#toast")
+        expect(toast).to_contain_text("error 500")
+        expect(toast).to_contain_text("reloaded")
+        for item in chosen:
+            saved = kyiv(detail(smoke, item["id"])["scheduled_time"])
+            assert saved == kyiv(item["scheduled_time"]) + timedelta(hours=1), f"post {item['id']} is at {saved}"
+            expect(row(page, item["id"]).locator(".time")).to_have_text(saved.strftime("%H:%M"))
+            expect(row(page, item["id"]).locator(".row-select")).to_be_checked()
+        expect(page.locator("#bulk-count")).to_have_text("2 selected")
+        expect(page.locator("#bulk-shift-apply")).to_be_focused()  # back on the button pressed
+        page.wait_for_timeout(300)
+        assert len(sent) == 1, f"{len(sent)} shift requests were sent"
+        smoke.shot(page, "bulk-unknown-outcome-desktop-light")
+        page.click("#bulk-clear")
+
+    # Delete + no answer: the deleted rows go after the reload.
+    chosen = upcoming[23:25]
+    with smoke.page(expect_failed_requests=True) as page:
+        page.route(bulk_url, lost_answer("delete", "abort"))
+        before = tab_count(page, "scheduled")
+        select_rows(page, [item["id"] for item in chosen])
+        page.click("#bulk-delete")
+        expect(page.locator("#toast")).to_contain_text("could not be reached")
+        expect(page.locator("#toast")).to_contain_text("reloaded")
+        for item in chosen:
+            expect(row(page, item["id"])).to_have_count(0)
+        expect(page.locator('[data-tab="scheduled"] .count')).to_have_text(str(before - 2))
+        expect(page.locator("#bulk-bar")).to_be_hidden()
+        assert len(sent) == 2, f"{len(sent)} requests so far"
+    for item in chosen:  # put them back for the checks after this one
+        board_post(smoke, f"/api/posts/{item['id']}/restore")
+
+    # Undo (bulk restore) + 500: the restored rows show after the reload.
+    chosen = upcoming[26:28]
+    with smoke.page(expect_failed_requests=True) as page:
+        page.route(bulk_url, lost_answer("restore", "500"))
+        select_rows(page, [item["id"] for item in chosen])
+        with bulk_call(page):
+            page.click("#bulk-delete")
+        for item in chosen:
+            expect(row(page, item["id"])).to_have_count(0)
+        page.locator("#toast .undo").click()
+        expect(page.locator("#toast")).to_contain_text("error 500")
+        expect(page.locator("#toast")).to_contain_text("reloaded")
+        for item in chosen:
+            expect(row(page, item["id"])).to_have_count(1)
+            assert detail(smoke, item["id"])["status"] == "scheduled"
+        page.wait_for_timeout(300)
+        assert len(sent) == 3 and sent[-1]["action"] == "restore", f"requests: {[b['action'] for b in sent]}"
+
 
 def check_signout_post_succeeds(smoke: Smoke):
     """Sign-out is a fetch POST from the page; the server's Origin check must accept it."""
@@ -2065,16 +2297,21 @@ CHECKS = [
     # they only look (selections are cleared, writes are answered in the page); from
     # the shift check on they change posts, each picking posts no earlier check needs.
     check_bulk_select_shows_bar,
+    check_bulk_bar_first_in_tab_order,
     check_keyboard_open_and_focus_return,
     check_mobile_layout,
     check_bulk_selection_capped_at_500,
+    check_bulk_undo_more_than_a_page,
     check_empty_states,
     check_unauthorized_with_panel_open,
     check_bulk_shift_moves_selected,
     check_bulk_partial_failure_summary,
     check_bulk_move_to_channel,
     check_single_delete_and_undo,
+    check_undo_shortcut,
+    check_keyboard_row_delete_focus,
     check_bulk_delete_and_undo,
+    check_bulk_unknown_outcome_reloads,
 ]
 # Sign-out ends the session, so it runs after everything else, before the error tally.
 FINAL_CHECKS = [check_signout_post_succeeds, check_no_js_errors]
@@ -2122,6 +2359,7 @@ BULK_SHOTS = (
     ("bulk-bar-mobile-light", PHONE, "light", "scheduled", "bar"),
     ("bulk-bar-mobile-dark", PHONE, "dark", "scheduled", "bar"),
     ("bulk-bar-mobile-end-light", PHONE, "light", "queued", "end"),
+    ("bulk-bar-keyboard-mobile-light", PHONE, "light", "scheduled", "keyboard"),
     ("bulk-summary-desktop-dark", DESKTOP, "dark", "scheduled", "summary"),
     ("bulk-summary-mobile-light", PHONE, "light", "scheduled", "summary"),
     ("undo-toast-desktop-light", DESKTOP, "light", "scheduled", "undo"),
@@ -2158,7 +2396,10 @@ def show_bulk_state(smoke: Smoke, page, state: str) -> None:
         ".map((r) => Number(r.dataset.id))"
     )
     select_rows(page, ids[2:5] if state == "summary" else (in_view or ids)[1:3])
-    if state == "summary":
+    if state == "keyboard":  # the first Tab after the tabs lands in the bar
+        page.locator(".tab[aria-selected='true']").focus()
+        page.keyboard.press("Tab")
+    elif state == "summary":
         def answer(route):
             wanted = route.request.post_data_json["ids"]
             results = [{"id": post_id, "ok": n == 0, "error": None if n == 0 else SKIP_REASONS[(n - 1) % 2]}

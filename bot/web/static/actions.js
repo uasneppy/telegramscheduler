@@ -27,8 +27,12 @@ const SHIFT_SCHEDULED_ONLY = 'Only scheduled posts can be shifted. Open the Sche
 const MOVE_POSTED = 'A posted post stays in the channel it was posted to.';
 const UNIT_WORDS = { hours: ['hour', 'hours'], days: ['day', 'days'] };
 const DONE_WORDS = { delete: 'deleted', restore: 'restored', move_channel: 'moved', shift: 'shifted' };
+const UNDO_HINT = 'Press Ctrl+Z (Cmd+Z on a Mac) or the Undo button to undo it within'; // "… 10 seconds."
+// Inputs that take no typing: Ctrl+Z on them is the board's Undo, not the field's own.
+const NON_TEXT_INPUTS = new Set(['button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit']);
 
 let moveChoicesKey = '';
+let undoButton = null; // the Undo of the toast shown last; Ctrl+Z presses it while it is up
 
 function posts(count) {
   return `${count} ${count === 1 ? 'post' : 'posts'}`;
@@ -41,6 +45,28 @@ function errorMessage(error) {
 
 function quietFailure(error) {
   return error.name === 'AbortError' || error.status === 401; // 401: the signed-out view says it all
+}
+
+// No answer, or a server error: the server commits post by post, so some posts may
+// have changed before it failed, and the page cannot tell which.
+function outcomeUnknown(error) {
+  return error instanceof ApiError && (error.status === 0 || error.status >= 500);
+}
+
+// After a bulk call with an unknown outcome: show what is stored now instead of the
+// rows as they were, and say so, so the person checks before trying again. Nothing is
+// sent again; the selection keeps the rows still shown.
+async function reloadAfterUnknown(error, action, count, atLeast = 0) {
+  const reason = error.status === 0
+    ? 'The board could not be reached'
+    : `The board ran into an error (error ${error.status})`;
+  const done = DONE_WORDS[action];
+  const maybe = count === 1 ? `the post may or may not have been ${done}` : `some posts may have been ${done} and some not`;
+  const fresh = await refreshAll({ atLeast });
+  const check = fresh
+    ? 'The list was reloaded: check it before trying again.'
+    : 'Refresh the list and check it before trying again.';
+  showToast(`${reason}, so ${maybe}. ${check}`);
 }
 
 function setText(node, text) {
@@ -86,7 +112,7 @@ function onSelectChange(event) {
   const first = state.selected.size === 0;
   setSelected(box.closest('.post-row'), box.checked);
   renderBar();
-  if (first && box.checked) announce('1 selected. The actions for the selection follow the list.');
+  if (first && box.checked) announce('1 selected. The actions for the selection come right after the tabs.');
 }
 
 function selectAllShown() {
@@ -180,20 +206,23 @@ function renderBar() {
   setText(el.bulkShiftNote, shiftable ? SHIFT_NOTE : SHIFT_SCHEDULED_ONLY);
 }
 
-// When the bar went away with focus in it, focus moves to the summary when it is up,
-// else to the tab.
-function focusAfterBar() {
+// When the bar went away with focus in it, focus moves to `preferred` (a delete's Undo),
+// else to the summary when it is up, else to the tab.
+function focusAfterBar(preferred = null) {
   if (state.panel || !focusLost(el.bulkBar)) return;
-  (el.bulkSummary.hidden ? selectedTab() : el.bulkSummary).focus();
+  (preferred && preferred.isConnected ? preferred : el.bulkSummary.hidden ? selectedTab() : el.bulkSummary).focus();
 }
 
 // Run one bulk action on the selection. `after(doneIds)` brings the list up to date and
 // returns what to say about the posts that changed ('' for none). Posts the server
 // skipped are listed in the summary with its reasons; the rest of the batch stands.
+// A 400 changed nothing, so the selection stays for another try; after no answer or a
+// server error the list is reloaded first (see reloadAfterUnknown).
 async function runBulk(action, extra, after) {
   if (state.bulkBusy || state.selected.size === 0 || state.signedOut) return;
   const items = new Map(state.selected);
   const ids = [...items.keys()];
+  const pressed = document.activeElement; // disabled while the call is out, which drops its focus
   hideSummary(); // it was about the previous action
   state.bulkBusy = action;
   renderBar();
@@ -202,8 +231,13 @@ async function runBulk(action, extra, after) {
     ({ results } = await sendJson('/api/posts/bulk', 'POST', { action, ids, ...extra }));
   } catch (error) {
     state.bulkBusy = '';
-    renderBar(); // the selection stays, so the action can be tried again
-    if (!quietFailure(error)) showToast(errorMessage(error));
+    renderBar();
+    if (quietFailure(error)) return;
+    if (outcomeUnknown(error)) await reloadAfterUnknown(error, action, ids.length);
+    else showToast(errorMessage(error));
+    // Focus goes back to the button pressed while the bar is still up.
+    if (!el.bulkBar.hidden && el.bulkBar.contains(pressed) && !pressed.disabled && focusLost()) pressed.focus();
+    else focusAfterBar();
     return;
   }
   state.bulkBusy = '';
@@ -219,7 +253,8 @@ async function runBulk(action, extra, after) {
   const said = await after(done, items);
   if (skipped.length > 0) showSummary(said || `No posts were ${DONE_WORDS[action]}.`, skipped, items);
   else if (said && action !== 'delete') showToast(said); // a delete's toast carries Undo, see offerUndo
-  focusAfterBar();
+  // After a delete, focus goes to Undo (its countdown waits while it has focus).
+  focusAfterBar(action === 'delete' && done.length > 0 ? undoButton : null);
 }
 
 function postedBulkQuestion(count) {
@@ -302,12 +337,34 @@ function hideSummary() {
 
 // The toast after a delete: Undo restores the posts of `items` (list items or details),
 // one post with its own restore, a bulk delete's posts with bulk restore (spec 6.7).
+// Ctrl+Z (Cmd+Z) presses it too, outside text fields (see onUndoShortcut).
 export function offerUndo(items, said, { bulk = false } = {}) {
-  showToast(said, { label: 'Undo', className: 'undo', run: () => restorePosts(items, bulk) });
+  undoButton = showToast(said, {
+    label: 'Undo', className: 'undo', hint: UNDO_HINT, run: () => restorePosts(items, bulk),
+  });
+  undoButton.title = 'Undo (Ctrl+Z)';
+  undoButton.setAttribute('aria-keyshortcuts', 'Control+Z Meta+Z');
+}
+
+function typingIn(node) {
+  if (!(node instanceof Element)) return false;
+  if (node instanceof HTMLInputElement) return !NON_TEXT_INPUTS.has(node.type);
+  return node.isContentEditable || node.closest('textarea, select, [contenteditable]') !== null;
+}
+
+// Ctrl+Z / Cmd+Z while an Undo toast is up, unless focus is in a field that has its own
+// undo (the caption editor, say) or takes typing.
+function onUndoShortcut(event) {
+  if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || event.key.toLowerCase() !== 'z') return;
+  if (!undoButton || !undoButton.isConnected || undoButton.disabled || el.toast.hidden) return;
+  if (typingIn(document.activeElement)) return;
+  event.preventDefault();
+  undoButton.click();
 }
 
 async function restorePosts(items, bulk) {
   const ids = items.map((item) => item.id);
+  const shown = state.ids.size;
   let said = '';
   let restored = ids;
   try {
@@ -326,12 +383,20 @@ async function restorePosts(items, bulk) {
     }
   } catch (error) {
     if (quietFailure(error)) return;
+    if (outcomeUnknown(error)) {
+      await reloadAfterUnknown(error, 'restore', ids.length, shown + ids.length);
+      return;
+    }
     showToast(errorMessage(error));
     if (error.status === 404 || error.status === 409) refreshAll(); // show the posts as they are now
     return;
   }
-  await refreshAll(); // a restored post may belong to another tab now
-  const away = bulk ? restored.filter((id) => !findRow(id)).length : 0;
+  // A restored post may belong to another tab now. The reload takes in as many more rows
+  // as were restored, so a restored post still missing from this list really left it; a
+  // post merely further down is never counted. When the reload did not finish (an
+  // error, or another load took over), nothing is claimed.
+  const fresh = await refreshAll({ atLeast: shown + restored.length });
+  const away = bulk && fresh ? restored.filter((id) => !findRow(id)).length : 0;
   if (!said) said = 'No posts were restored.';
   else if (away > 0) said += ` ${away === 1 ? '1 of them is' : `${away} of them are`} on another tab now.`;
   showToast(said); // replaces the toast whose Undo was used
@@ -340,35 +405,47 @@ async function restorePosts(items, bulk) {
   (first || (el.bulkSummary.hidden ? selectedTab() : el.bulkSummary)).focus();
 }
 
-// The row's delete button: no question unless the post was already posted.
+// The row's delete button: no question unless the post was already posted. Disabling the
+// button while the request is out drops its focus, so where focus was is noted first:
+// it goes on to the next row after the delete, and back to the button if it fails.
 async function deleteFromRow(button) {
   const rowNode = button.closest('.post-row');
   const item = rowNode ? rowItem(rowNode) : null;
   if (!item || button.disabled || state.signedOut) return;
   if (item.status === 'posted' && !window.confirm(POSTED_DELETE_QUESTION)) return;
+  const hadFocus = rowNode.contains(document.activeElement);
   button.disabled = true;
   try {
     await sendJson(`/api/posts/${item.id}`, 'DELETE');
   } catch (error) {
     if (button.isConnected) button.disabled = false;
-    rowDeleteFailed(item, error);
+    rowDeleteFailed(item, error, hadFocus);
     return;
   }
-  removeRow(item.id);
+  removeRow(item.id, { moveFocus: hadFocus });
   loadMe();
   offerUndo([item], 'Post deleted.');
 }
 
-function rowDeleteFailed(item, error) {
+// The row's delete button as it is now (the row may have been drawn again meanwhile).
+function deleteButtonOf(postId) {
+  const rowNode = findRow(postId);
+  return rowNode ? rowNode.querySelector('.row-delete') : null;
+}
+
+async function rowDeleteFailed(item, error, hadFocus) {
   if (quietFailure(error)) return;
   if (error.status === 404) {
-    removeRow(item.id);
+    removeRow(item.id, { moveFocus: hadFocus });
     loadMe();
     showToast(GONE_MESSAGE);
     return;
   }
   showToast(errorMessage(error));
-  if (error.status === 409) refreshAll(); // the post changed (it is being sent, say): show it as it is now
+  // The post changed (it is being sent, say): show it as it is now.
+  if (error.status === 409) await refreshAll();
+  const button = deleteButtonOf(item.id);
+  if (hadFocus && button && !button.disabled && focusLost()) button.focus();
 }
 
 export function bindActions() {
@@ -397,4 +474,5 @@ export function bindActions() {
     event.stopPropagation(); // Esc here closes the summary, not an open edit panel
     hideSummary();
   });
+  document.addEventListener('keydown', onUndoShortcut);
 }

@@ -861,9 +861,10 @@ select.field {
 
 /* --- bulk bar ------------------------------------------------------------------ */
 
-/* While posts are selected the bar ends the board: it follows the list in the page's
-   flow and sticks to the bottom of the screen while the list scrolls, so at the end of
-   the list it sits below the last row, never over it. Toasts move up above it. */
+/* While posts are selected the bar ends the board: drawn after the list (it comes first
+   in the page's order, for the keyboard) and sticking to the bottom of the screen while
+   the list scrolls, so at the end of the list it sits below the last row, never over
+   it. Toasts move up above it. */
 body.has-selection .board {
   display: flex;
   flex-direction: column;
@@ -883,6 +884,7 @@ body.has-selection:not(.panel-open) .dock {
   position: sticky;
   bottom: var(--bulk-gap);
   z-index: 4;
+  order: 1; /* after the list, which keeps the default order 0 */
   display: grid;
   grid-template-areas: "head actions";
   grid-template-columns: auto minmax(0, 1fr);

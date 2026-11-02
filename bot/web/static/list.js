@@ -323,11 +323,24 @@ function restoreRowFocus(focus) {
   (target || selectedTab()).focus({ preventScroll: true }); // the rows kept their place
 }
 
+// The nearest row before or after a row (`step` is 'previousElementSibling' or
+// 'nextElementSibling'), past day headers; null when there is none.
+function siblingRow(rowNode, step) {
+  let node = rowNode[step];
+  while (node && !node.classList.contains('post-row')) node = node[step];
+  return node;
+}
+
 // Take a post's row out of the list, with its day header when that day is now empty.
-export function removeRow(postId) {
+// When focus was in the row, it moves on to the next row, else the previous one, else
+// the tab. `moveFocus` says focus was there even if it has left meanwhile (a button
+// disabled during a request drops its focus).
+export function removeRow(postId, { moveFocus = false } = {}) {
   const rowNode = findRow(postId);
   if (!rowNode) return;
-  const focus = focusedRowControl();
+  const focus = moveFocus || focusedRowControl() !== null;
+  const nextRow = siblingRow(rowNode, 'nextElementSibling');
+  const previousRow = siblingRow(rowNode, 'previousElementSibling');
   state.ids.delete(Number(postId));
   const before = rowNode.previousElementSibling;
   const after = rowNode.nextElementSibling;
@@ -340,12 +353,7 @@ export function removeRow(postId) {
       state.lastDay = headers.length ? headers[headers.length - 1].dataset.day : null;
     }
   }
-  if (focus) {
-    // Focus moves on to the next row (past a day header), else to the tab.
-    let next = after;
-    while (next && !next.classList.contains('post-row')) next = next.nextElementSibling;
-    (next || selectedTab()).focus();
-  }
+  if (focus) (nextRow || previousRow || selectedTab()).focus();
   updateListFooter();
   watchSentinel();
   hooks.rowsChanged();
@@ -396,15 +404,20 @@ function renderEmptyState() {
   }
 }
 
-// Runs one list request; a newer request supersedes (aborts) an older one.
+// Runs one list request; a newer request supersedes (aborts) an older one. Resolves to
+// whether this request finished and its rows are the ones shown.
 async function runListRequest(work) {
   if (state.request) state.request.abort();
   const controller = new AbortController();
   state.request = controller;
   updateListFooter();
+  let finished = false;
   try {
     await work(controller.signal, () => state.request === controller);
-    if (state.request === controller) reportSuccess('list');
+    if (state.request === controller) {
+      reportSuccess('list');
+      finished = true;
+    }
   } catch (error) {
     if (state.request === controller) reportFailure('list', error);
   } finally {
@@ -414,15 +427,17 @@ async function runListRequest(work) {
       watchSentinel();
     }
   }
+  return finished;
 }
 
 // Load the current tab from its start. keepRows refetches at least as many rows
-// as are shown and swaps them in at once, so a refresh keeps the reader's place.
-function reloadList({ keepRows = false } = {}) {
+// as are shown (and at least `atLeast`) and swaps them in at once, so a refresh
+// keeps the reader's place. Resolves to whether the rows shown are the fresh ones.
+function reloadList({ keepRows = false, atLeast = 0 } = {}) {
   // The hash's channel can only be checked against /api/me's channels, so until
   // /api/me has answered once the list waits, and asking for it retries /api/me.
   if (!state.me) return refreshAll();
-  const wanted = keepRows ? state.ids.size : 0;
+  const wanted = keepRows ? Math.max(state.ids.size, atLeast) : 0;
   if (!keepRows) {
     clearList();
     state.selected.clear(); // another view starts with nothing selected
@@ -516,19 +531,23 @@ export async function loadMe() {
 
 // --- refresh, banner, toast, announcer, signed out -----------------------------------
 
-// Refetch /api/me and the list (Refresh, Retry, coming back to the browser tab).
-export async function refreshAll() {
-  if (state.signedOut) return;
+// Refetch /api/me and the list (Refresh, Retry, coming back to the browser tab),
+// keeping at least the rows shown, or `atLeast` rows when that is more (posts just
+// restored come back among them). Resolves to whether the rows shown are fresh.
+export async function refreshAll({ atLeast = 0 } = {}) {
+  if (state.signedOut) return false;
   if (!state.me) {
     // Never answered yet: the list waits for the channel check.
     await loadMe();
-    if (state.me) await reloadList();
-    else updateListFooter();
-    return;
+    if (state.me) return reloadList();
+    updateListFooter();
+    return false;
   }
   const channelBefore = state.channel;
-  await Promise.all([loadMe(), reloadList({ keepRows: true })]);
-  if (state.channel !== channelBefore) reloadList();
+  const [, fresh] = await Promise.all([loadMe(), reloadList({ keepRows: true, atLeast })]);
+  if (state.channel === channelBefore) return fresh;
+  reloadList();
+  return false;
 }
 
 function reportFailure(source, error) {
@@ -550,13 +569,15 @@ function renderBanner() {
   el.banner.hidden = !message;
 }
 
-// Say what just happened. `action` ({label, className, run}) adds a button, such as
-// Undo, that works once, and keeps the toast for ACTION_TOAST_MS instead of TOAST_MS.
-// A newer toast replaces the one shown. Screen readers hear it through #announcer.
+// Say what just happened. `action` ({label, className, run, hint}) adds a button, such
+// as Undo, that works once, and keeps the toast for ACTION_TOAST_MS instead of TOAST_MS.
+// A newer toast replaces the one shown. Screen readers hear it through #announcer, with
+// the action's hint when it has one. Returns the action's button, or null.
 export function showToast(text, action = null) {
+  let button = null;
   const parts = [make('span', 'toast-text', text)];
   if (action) {
-    const button = make('button', `toast-action ${action.className || ''}`.trim(), action.label);
+    button = make('button', `toast-action ${action.className || ''}`.trim(), action.label);
     button.type = 'button';
     button.addEventListener('click', () => {
       if (button.disabled) return;
@@ -570,7 +591,9 @@ export function showToast(text, action = null) {
   toastHold.focus = el.toast.contains(document.activeElement); // a replaced button took its focus along
   state.toastMs = action ? ACTION_TOAST_MS : TOAST_MS;
   restartToastTimer();
-  announce(action ? `${text} ${action.label} is available for ${ACTION_TOAST_MS / 1000} seconds.` : text);
+  const seconds = ACTION_TOAST_MS / 1000;
+  announce(action ? `${text} ${action.hint || `${action.label} is available for`} ${seconds} seconds.` : text);
+  return button;
 }
 
 function restartToastTimer() {
@@ -706,8 +729,8 @@ export function bindControls() {
   el.search.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') applySearch();
   });
-  el.refresh.addEventListener('click', refreshAll);
-  el.bannerRetry.addEventListener('click', refreshAll);
+  el.refresh.addEventListener('click', () => refreshAll());
+  el.bannerRetry.addEventListener('click', () => refreshAll());
   el.signout.addEventListener('click', signOut);
   bindToastHold();
   window.addEventListener('hashchange', () => {

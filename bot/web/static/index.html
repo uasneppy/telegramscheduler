@@ -74,13 +74,9 @@
   </nav>
 
   <main class="board">
-    <div id="post-list" role="tabpanel" aria-labelledby="tab-scheduled" aria-busy="true"></div>
-    <p id="empty-state" hidden>Nothing here yet.</p>
-    <p id="list-status" aria-live="polite"></p>
-    <div id="list-sentinel" aria-hidden="true"></div>
-
-    <!-- Shown while rows are selected. It follows the list in the page's order and sticks
-         to the bottom of the screen while the list scrolls, so it never covers the last rows. -->
+    <!-- Shown while rows are selected. First in the page's order, so it is the first Tab stop
+         after the tabs, but drawn after the list (style.css: order), sticking to the bottom
+         of the screen while the list scrolls, so it never covers the last rows. -->
     <div id="bulk-bar" class="bulk-bar" role="region" aria-label="Selected posts" hidden>
       <div class="bulk-head">
         <button id="bulk-clear" class="icon-button" type="button" aria-label="Clear selection" title="Clear selection">
@@ -114,6 +110,11 @@
         </div>
       </div>
     </div>
+
+    <div id="post-list" role="tabpanel" aria-labelledby="tab-scheduled" aria-busy="true"></div>
+    <p id="empty-state" hidden>Nothing here yet.</p>
+    <p id="list-status" aria-live="polite"></p>
+    <div id="list-sentinel" aria-hidden="true"></div>
   </main>
 
   <!-- The edit panel: a side panel from 900 px wide, a bottom sheet below. While it is
