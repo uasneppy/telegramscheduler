@@ -436,11 +436,11 @@ Two limits to know about: album posts are view-only for media (caption, time, ch
 
 ### Enable it
 
-Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)):
+Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)). The lines below work in both places: Docker Compose reads `export` lines in `.env` too.
 
 ```bash
-WEB_BASE_URL=https://board.example.com   # your public https address, no path
-WEB_PORT=8080                            # optional, 8080 is the default
+export WEB_BASE_URL=https://board.example.com   # your public https address, no path
+export WEB_PORT=8080                            # optional, 8080 is the default
 ```
 
 ```bash
@@ -571,7 +571,7 @@ telegramscheduler/
 │       ├── errors.py         # Typed errors, turned into JSON error responses
 │       └── static/           # No build step
 │           ├── index.html, signed_out.html, style.css
-│           └── api.js, state.js, time.js, list.js, panel.js, actions.js, main.js   # ES modules; main.js loads the rest
+│           └── api.js, state.js, time.js, keys.js, list.js, panel.js, actions.js, main.js   # ES modules; main.js loads the rest
 ├── scripts/
 │   ├── dev_web.py            # Web board on seeded demo data (development only)
 │   └── smoke_web.py          # Playwright browser smoke test (manual, not in CI)
@@ -595,7 +595,7 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "pillow>=11.3.0" "aiohttp>=3.10,<4" pytest
 
 python -m compileall -q main.py config.py bot/   # compile check
-pytest tests/ -q                                 # 407 tests, no network needed
+pytest tests/ -q                                 # 411 tests, no network needed
 docker build -t telegram-scheduler:dev .         # image build
 ```
 

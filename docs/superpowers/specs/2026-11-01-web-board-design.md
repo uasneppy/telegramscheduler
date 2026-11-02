@@ -58,13 +58,13 @@ bot/web/
     ├── index.html        # the board, served at / for a signed-in user
     ├── signed_out.html   # served at / without a session (4.1 step 6)
     ├── style.css
-    └── api.js, state.js, time.js, list.js, panel.js, actions.js, main.js
+    └── api.js, state.js, time.js, keys.js, list.js, panel.js, actions.js, main.js
                           # vanilla ES modules, no build step; main.js loads the rest
 ```
 
 - `api.py` holds no business rules. `service.py` is the single write path (see 6), so rules are testable without HTTP.
 - Only `server.py` and `api.py` import aiohttp; every other module (`captions.py`, `service.py`, `auth.py`, ...) is unit-testable in isolation.
-- The server serves `index.html` (or `signed_out.html`) at `/` and, under `/static/<name>`, an explicit allowlist of names: `style.css` and the seven modules above. Any other name is `404`, so nothing else in the folder is reachable.
+- The server serves `index.html` (or `signed_out.html`) at `/` and, under `/static/<name>`, an explicit allowlist of names: `style.css` and the eight modules above. Any other name is `404`, so nothing else in the folder is reachable.
 
 ### 3.2 Wiring
 
