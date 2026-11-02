@@ -29,6 +29,9 @@ EXPECTED_CSP = (
     "style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
 INLINE_SCRIPT = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>", re.IGNORECASE)
+# The board's front-end ES modules, served under /static/.
+STATIC_MODULES = ("api.js", "list.js", "main.js", "panel.js", "state.js", "time.js")
+IMPORT_FROM = re.compile(r"""\bfrom\s+['"]\./([\w.-]+)['"]""")
 
 
 def _app(allowed=frozenset({1}), base_url=BASE, on_error=None):
@@ -686,18 +689,22 @@ def test_index_signed_in_vs_out():
 
 
 def test_static_allowlist_and_traversal(tmp_path, monkeypatch):
-    (tmp_path / "app.js").write_text("console.log(1);\n", encoding="utf-8")
+    for name in (*STATIC_MODULES, "app.js", "other.js"):
+        (tmp_path / name).write_text(f"console.log({name!r});\n", encoding="utf-8")
     (tmp_path / "index.html").write_text("<p>index</p>", encoding="utf-8")
     (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")
     monkeypatch.setattr(server, "STATIC_DIR", tmp_path)
 
     async def scenario():
         async with app_client(_app()) as client:
-            js = await client.get("/static/app.js")
-            assert js.status == 200
-            assert js.content_type == "text/javascript"
-            assert await js.text() == "console.log(1);\n"
-            _assert_security_headers(js)
+            # Every module is served with a JavaScript type (a module script with any other type is refused).
+            for name in STATIC_MODULES:
+                js = await client.get(f"/static/{name}")
+                assert js.status == 200, name
+                assert js.content_type == "text/javascript", name
+                assert js.charset == "utf-8", name
+                assert await js.text() == f"console.log({name!r});\n"
+                _assert_security_headers(js)
 
             # Allowlisted but not on disk (yet): the usual JSON 404, not 500.
             missing = await client.get("/static/style.css")
@@ -711,6 +718,8 @@ def test_static_allowlist_and_traversal(tmp_path, monkeypatch):
             # Raw paths, sent without client-side normalisation.
             root = str(client.make_url("/"))
             for raw in (
+                "static/app.js",  # the retired single script: on disk here, still not served
+                "static/other.js",
                 "static/index.html",
                 "static/signed_out.html",
                 "static/secret.txt",
@@ -718,8 +727,8 @@ def test_static_allowlist_and_traversal(tmp_path, monkeypatch):
                 "static/..%2Fconfig.py",
                 "static/%2e%2e/config.py",
                 "static/%2e%2e%2fconfig.py",
-                "static/APP.JS",
-                "static/app.js%00",
+                "static/MAIN.JS",
+                "static/main.js%00",
                 "static/",
             ):
                 async with client.session.get(URL(root + raw, encoded=True)) as response:
@@ -728,6 +737,20 @@ def test_static_allowlist_and_traversal(tmp_path, monkeypatch):
                     assert b"secret" not in body and b"BOT_TOKEN" not in body, raw
 
     asyncio.run(scenario())
+
+
+def test_static_allowlist_covers_the_board_modules():
+    """Every module on disk is allowlisted, every import resolves, and the page loads main.js."""
+    on_disk = {path.name for path in server.STATIC_DIR.glob("*.js")}
+    assert on_disk == set(STATIC_MODULES)
+    assert on_disk == {name for name in server._STATIC_FILES if name.endswith(".js")}
+    for name in sorted(on_disk):
+        source = (server.STATIC_DIR / name).read_text(encoding="utf-8")
+        for imported in IMPORT_FROM.findall(source):
+            assert imported in on_disk, f"{name} imports ./{imported}"
+    index = (server.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert index.count("<script") == 1
+    assert '<script type="module" src="/static/main.js"></script>' in index
 
 
 # --- /api/me ----------------------------------------------------------------------

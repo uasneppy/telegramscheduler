@@ -59,9 +59,17 @@ CSP = (
     "style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 )
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-# The only files served under /static/, with their content types.
+# The only files served under /static/, with their content types. The board's script
+# is a set of ES modules (main.js imports the rest); a module script with any content
+# type other than JavaScript is refused by the browser.
+_JS = "text/javascript; charset=utf-8"
 _STATIC_FILES = {
-    "app.js": "text/javascript; charset=utf-8",
+    "api.js": _JS,
+    "list.js": _JS,
+    "main.js": _JS,
+    "panel.js": _JS,
+    "state.js": _JS,
+    "time.js": _JS,
     "style.css": "text/css; charset=utf-8",
 }
 _HTML = "text/html; charset=utf-8"
