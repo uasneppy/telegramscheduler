@@ -2,6 +2,7 @@
 """Browser smoke test for the web board (manual; not part of the pytest suite).
 
 Setup, once per virtualenv:  pip install playwright
+(Pillow, which draws the upload test images, comes with the project's requirements.)
 Start the seeded dev server, then run the checks against the link it prints:
 
     python scripts/dev_web.py &
@@ -9,21 +10,28 @@ Start the seeded dev server, then run the checks against the link it prints:
 
 CHROMIUM_PATH names a Chromium binary (default: Playwright's own browser from
 `playwright install chromium`). SMOKE_SHOTS=<folder> also saves screenshots of
-the board: desktop 1280x800 and phone 360x740, light and dark.
+the board and the edit panel: desktop 1280x800 and phone 360x740, light and dark.
 
 The sign-in link works once, so restart dev_web.py before every run; that also
-gives each run the same fresh seed (some checks expect it). Prints `PASS name`
-or `FAIL name: reason` for each check and exits 1 when any check fails.
+gives each run the same fresh seed (the checks expect it, and the edit panel
+checks change posts, so they run in order after the read-only list checks).
+Every browser context runs in a time zone far from Kyiv (Pacific/Kiritimati,
+UTC+14, unless a check picks another), so a time read from the browser's own
+clock instead of the server's Kyiv strings shows up as a wrong hour or day.
+Prints `PASS name` or `FAIL name: reason` for each check and exits 1 when any
+check fails.
 """
 
+import io
 import os
 import re
 import sys
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from PIL import Image, ImageDraw
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import expect, sync_playwright
 
@@ -34,6 +42,13 @@ PAGE_SIZE = 50  # the API's default page, which the board uses
 TIMEOUT_MS = 10_000
 DESKTOP = {"viewport": {"width": 1280, "height": 800}}
 PHONE = {"viewport": {"width": 360, "height": 740}, "device_scale_factor": 2, "is_mobile": True, "has_touch": True}
+# UTC+14: a time taken from the browser's zone instead of Kyiv's is off by 12 hours or a day.
+DEFAULT_TIMEZONE = "Pacific/Kiritimati"
+ALPHA, BETA = "-1001", "-1002"
+ALPHA_SIGNATURE = "Alpha News · @alpha_news"  # seeded by dev_web.py; Beta has none
+CAPTION_LIMIT = 1024
+DISCARD_PROMPT = "unsaved"  # the Esc confirmation names the unsaved changes
+POSTED_DELETE_PROMPT = "Removes this record only; the message stays in the channel"
 
 # Every list row and day header, in document order.
 LIST_NODES_JS = """() => [...document.querySelectorAll('#post-list .day-header, #post-list .post-row')].map(
@@ -94,6 +109,7 @@ class Smoke:
         print(f"SHOT {path}", flush=True)
 
     def new_context(self, **options):
+        options.setdefault("timezone_id", DEFAULT_TIMEZONE)
         context = self.browser.new_context(storage_state=self.storage, **options)
         context.set_default_timeout(TIMEOUT_MS)
         return context
@@ -362,7 +378,8 @@ def check_album_and_recurring_badges(smoke: Smoke):
 
 
 def check_read_only_statuses(smoke: Smoke):
-    """Rows the board cannot change (sending, unknown) render read-only; overdue gets its badge."""
+    """Rows the board cannot change (sending, unknown) render read-only but can still be
+    opened (the panel then shows them read-only); overdue gets its badge."""
     changed: dict[str, int] = {}
 
     def relabel(route):
@@ -381,8 +398,11 @@ def check_read_only_statuses(smoke: Smoke):
         for status, label in (("unknown", "Unknown status"), ("sending", "Sending")):
             target = row(page, changed[status])
             expect(target.locator(".badge", has_text=label)).to_have_count(1)
-            for control in (".row-select", ".row-edit", ".row-delete"):
+            for control in (".row-select", ".row-delete"):
                 expect(target.locator(control)).to_be_disabled()
+            opener = target.locator(".row-edit")
+            expect(opener).to_be_enabled()
+            expect(opener).to_have_attribute("aria-label", re.compile(r"^Open post, "))
         target = row(page, changed["overdue"])
         expect(target.locator(".badge", has_text="Overdue")).to_have_count(1)
         for control in (".row-select", ".row-edit", ".row-delete"):
@@ -571,6 +591,701 @@ def check_failed_tab_readable_on_phone(smoke: Smoke):
         context.close()
 
 
+# --- edit panel helpers -----------------------------------------------------------------
+
+# The panel shows post `id`, its detail has loaded and no caption preview is in flight.
+PANEL_READY_JS = """(id) => {
+    const panel = document.querySelector('#edit-panel');
+    const preview = document.querySelector('#caption-preview');
+    return panel !== null && !panel.hidden && panel.dataset.state === 'ready'
+        && panel.dataset.postId === String(id)
+        && preview !== null && preview.getAttribute('aria-busy') === 'false';
+}"""
+# Problems with an open panel that does not fit the viewport: the page scrolls sideways,
+# or a visible panel control reaches past the left or right edge.
+PANEL_FIT_JS = """() => {
+    const problems = [];
+    const root = document.documentElement;
+    if (root.scrollWidth > root.clientWidth) problems.push(`the page is ${root.scrollWidth}px wide`);
+    const controls = '#edit-panel button, #edit-panel input, #edit-panel select, #edit-panel textarea, #edit-panel label';
+    for (const node of document.querySelectorAll(controls)) {
+        const box = node.getBoundingClientRect();
+        if (box.width === 0 || node.classList.contains('visually-hidden')) continue;
+        if (box.left < -0.5 || box.right > root.clientWidth + 0.5) {
+            problems.push(`${node.id || node.tagName} spans ${Math.round(box.left)}..${Math.round(box.right)}px`);
+        }
+    }
+    return problems;
+}"""
+
+
+def detail(smoke: Smoke, post_id: int) -> dict:
+    return smoke.api(f"/api/posts/{post_id}")
+
+
+def kyiv(iso: str) -> datetime:
+    return datetime.fromisoformat(iso)
+
+
+def pick(smoke: Smoke, status="scheduled", caption=None, startswith=None, media_type=None, channel=None) -> dict:
+    """The first item on the first page of a tab that has all the given properties."""
+    for item in first_page(smoke, status):
+        if caption is not None and item["caption_text"] != caption:
+            continue
+        if startswith is not None and not item["caption_text"].startswith(startswith):
+            continue
+        if media_type is not None and item["media_type"] != media_type:
+            continue
+        if channel is not None and item["channel_id"] != channel:
+            continue
+        return item
+    wanted = {"caption": caption, "startswith": startswith, "media_type": media_type, "channel": channel}
+    raise AssertionError(f"no {status} post on the first page has {wanted}; the seed changed")
+
+
+def wait_for_panel(page, post_id: int) -> None:
+    page.wait_for_function(PANEL_READY_JS, arg=post_id)
+    # Let the opening animation finish, so boxes and screenshots show the panel in place.
+    page.locator("#edit-panel").evaluate("node => Promise.all(node.getAnimations().map((a) => a.finished))")
+
+
+def open_panel(page, post_id: int) -> None:
+    row(page, post_id).locator(".row-edit").click()
+    wait_for_panel(page, post_id)
+
+
+def board_call(page, method: str, path: str):
+    """Waits for the page's `method` request to `path` (use with `with ... as info`)."""
+    return page.expect_response(lambda r: r.request.method == method and urlsplit(r.url).path == path)
+
+
+def assert_board_call(smoke: Smoke, response, expected: int = 200) -> None:
+    """The page's call got `expected` and carried the board's Origin and X-Board headers."""
+    request = response.request
+    headers = request.all_headers()
+    where = f"{request.method} {urlsplit(response.url).path}"
+    assert response.status == expected, f"{where} answered {response.status}: {response.text()[:200]}"
+    assert headers.get("origin") == smoke.base, f"{where} sent Origin {headers.get('origin')!r}"
+    assert headers.get("x-board") == "1", f"{where} did not send X-Board: 1"
+
+
+def board_post(smoke: Smoke, path: str) -> dict:
+    """A change made outside the page (another tab, say), with the headers the board requires."""
+    response = smoke.context.request.post(smoke.base + path, headers={"Origin": smoke.base, "X-Board": "1"})
+    assert response.ok, f"POST {path} answered {response.status}"
+    return response.json()
+
+
+def select_caption_text(page, text: str) -> None:
+    """Select the first `text` in the caption editor, as a person dragging over it would."""
+    caption = page.locator("#caption-input")
+    start = caption.input_value().index(text)
+    caption.evaluate(
+        "(node, [start, end]) => { node.focus(); node.setSelectionRange(start, end); }", [start, start + len(text)]
+    )
+
+
+def png_bytes(label: str) -> bytes:
+    image = Image.new("RGB", (480, 320), "#2f6f4f")
+    ImageDraw.Draw(image).text((24, 24), label, fill="white")
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def choose_upload(page, label: str) -> None:
+    page.set_input_files(
+        "#replace-media-input", files=[{"name": f"{label}.png", "mimeType": "image/png", "buffer": png_bytes(label)}]
+    )
+
+
+# Records the fields of every FormData the page sends, in order. Chromium does not hand
+# Playwright a multipart body that holds a file, so the order is read in the page.
+RECORD_UPLOADS_JS = """() => {
+    window.__uploads = [];
+    const send = window.fetch;
+    window.fetch = (input, init = {}) => {
+        if (init.body instanceof FormData) {
+            window.__uploads.push([...init.body.entries()].map(([name, value]) => [name, typeof value === 'string' ? value : value.name]));
+        }
+        return send(input, init);
+    };
+}"""
+
+
+def last_upload_as_file(page) -> str:
+    """The as_file value of the page's last upload, checking that it comes before the file."""
+    fields = page.evaluate("() => window.__uploads.at(-1)")
+    names = [name for name, _value in fields]
+    assert names == ["as_file", "file"], f"the upload's fields are {names}; as_file must come before file"
+    return fields[0][1]
+
+
+def image_loaded(page, image) -> None:
+    page.wait_for_function("img => img.complete && img.naturalWidth > 0", arg=image.element_handle())
+
+
+def discard_and_close(page) -> None:
+    page.once("dialog", lambda dialog: dialog.accept())
+    page.keyboard.press("Escape")
+    expect(page.locator("#edit-panel")).to_be_hidden()
+
+
+# --- edit panel checks ----------------------------------------------------------------------
+
+
+def check_panel_dialog_and_focus(smoke: Smoke):
+    """A named dialog: focus moves in on open and back to the opener on close; Enter on a
+    focused row opens it too."""
+    item = pick(smoke, caption="Behind the scenes at the studio.")
+    with smoke.page() as page:
+        opener = row(page, item["id"]).locator(".row-edit")
+        opener.click()
+        wait_for_panel(page, item["id"])
+        panel = page.locator("#edit-panel")
+        expect(panel).to_have_attribute("role", "dialog")
+        expect(panel).to_have_accessible_name("Edit post")
+        inside = page.evaluate("() => document.querySelector('#edit-panel').contains(document.activeElement)")
+        assert inside, "focus did not move into the panel"
+        expect(page.locator("#caption-input")).to_have_value(detail(smoke, item["id"])["caption_tagged"])
+        page.keyboard.press("Escape")  # nothing changed, so it closes without asking
+        expect(panel).to_be_hidden()
+        expect(opener).to_be_focused()
+        target = row(page, item["id"])
+        target.focus()
+        page.keyboard.press("Enter")
+        wait_for_panel(page, item["id"])
+        page.click("#panel-close")
+        expect(panel).to_be_hidden()
+        expect(target).to_be_focused()
+
+
+def check_time_is_kyiv_not_browser_zone(smoke: Smoke):
+    """Review Focus 5: in a New York browser the panel shows and saves Kyiv wall-clock times."""
+    earliest = first_page(smoke)[0]
+    assert earliest["scheduled_time"][11:16] == "10:00", f"the earliest post is at {earliest['scheduled_time']}; the seed changed"
+    next_day = date.fromisoformat(earliest["scheduled_time"][:10]) + timedelta(days=1)
+    wanted = f"{next_day.isoformat()}T11:30"
+    path = f"/api/posts/{earliest['id']}"
+    context = smoke.new_context(timezone_id="America/New_York", **DESKTOP)
+    try:
+        with smoke.page(context=context) as page:
+            zone = page.evaluate("() => Intl.DateTimeFormat().resolvedOptions().timeZone")
+            assert zone == "America/New_York", f"the browser runs in {zone}"
+            expect(row(page, earliest["id"]).locator(".time")).to_have_text("10:00")
+            open_panel(page, earliest["id"])
+            expect(page.locator("#time-input")).to_have_value(earliest["scheduled_time"][:16])
+            expect(page.locator("#panel-meta")).to_contain_text("10:00")
+            label = page.locator('label[for="time-input"]').inner_text()
+            assert "Kyiv time" in label, f"the time label reads {label!r}"
+            page.fill("#time-input", wanted)
+            with board_call(page, "PATCH", path) as info:
+                page.click("#save")
+            assert_board_call(smoke, info.value)
+            assert info.value.request.post_data_json == {"scheduled_time": wanted}, info.value.request.post_data
+            saved = detail(smoke, earliest["id"])
+            assert saved["scheduled_time"][:16] == wanted, f"saved {saved['scheduled_time']}, wanted {wanted} Kyiv"
+            assert kyiv(saved["scheduled_time"]).utcoffset() == kyiv(earliest["scheduled_time"]).utcoffset(), (
+                f"saved {saved['scheduled_time']} is not in Kyiv's offset"
+            )
+            expect(row(page, earliest["id"]).locator(".time")).to_have_text("11:30")
+    finally:
+        context.close()
+
+
+def check_caption_bold_round_trip(smoke: Smoke):
+    item = pick(smoke, caption="Tip of the day: back up your photos.")
+    path = f"/api/posts/{item['id']}"
+    bold = "Tip of the day: <b>back up</b> your photos."
+    linked = 'Tip of the day: <b>back up</b> your <a href="https://example.com/tips">photos</a>.'
+    final = '<i>Tip</i> of the day: <b>back up</b> your <a href="https://example.com/tips">photos</a>.'
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        caption = page.locator("#caption-input")
+        preview = page.locator("#caption-preview")
+        select_caption_text(page, "back up")
+        page.click('[data-fmt="b"]')
+        expect(caption).to_have_value(bold)
+        expect(preview.locator("b")).to_have_text("back up")
+        select_caption_text(page, "photos")
+        page.click('[data-fmt="link"]')
+        page.fill("#link-url", "example.com/tips")
+        page.click("#link-apply")
+        expect(caption).to_have_value(linked)
+        expect(preview.locator("a")).to_have_attribute("href", "https://example.com/tips")
+        # The same button again takes the tag off the selected text.
+        select_caption_text(page, "your")
+        page.click('[data-fmt="b"]')
+        expect(caption).to_have_value(linked.replace("your", "<b>your</b>"))
+        page.click('[data-fmt="b"]')
+        expect(caption).to_have_value(linked)
+        select_caption_text(page, "Tip")
+        caption.press("Control+i")
+        expect(caption).to_have_value(final)
+        expect(preview.locator("i")).to_have_text("Tip")
+        with board_call(page, "PATCH", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert info.value.request.post_data_json == {"caption": final}, info.value.request.post_data
+        expect(page.locator("#edit-panel")).to_be_hidden()
+        saved = detail(smoke, item["id"])
+        assert saved["caption_tagged"] == final, f"saved {saved['caption_tagged']!r}"
+        assert saved["caption_text"] == item["caption_text"], f"the plain text changed: {saved['caption_text']!r}"
+        page.reload()
+        wait_for_list(page)
+        open_panel(page, item["id"])
+        expect(caption).to_have_value(final)
+        expect(preview.locator("b")).to_have_text("back up")
+
+
+def check_formatted_caption_keeps_entities(smoke: Smoke):
+    """Changing another field leaves the caption alone, and a typo fix keeps every tag."""
+    item = pick(smoke, startswith="Big news:")
+    path = f"/api/posts/{item['id']}"
+    original = detail(smoke, item["id"])["caption_tagged"]
+    for tag in ("<b>Big news:</b>", '<a href="https://example.com">', '<tg-emoji emoji-id="5368324170671202286">'):
+        assert tag in original, f"the seeded formatted caption lacks {tag}: {original!r}"
+    other = BETA if item["channel_id"] == ALPHA else ALPHA
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        preview = page.locator("#caption-preview")
+        expect(preview.locator(".tg-emoji")).to_have_count(1)
+        expect(preview.locator("a")).to_have_attribute("href", "https://example.com")
+        page.select_option("#channel-select", other)
+        with board_call(page, "PATCH", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert info.value.request.post_data_json == {"channel_id": other}, info.value.request.post_data
+        saved = detail(smoke, item["id"])
+        assert saved["channel_id"] == other and saved["caption_tagged"] == original, saved
+        expect(row(page, item["id"]).locator(".channel-chip")).to_have_text(saved["channel_name"])
+        # A typo fix elsewhere in the text, with the channel moved back: every tag stays.
+        open_panel(page, item["id"])
+        edited = original.replace("is live", "is live now")
+        assert edited != original, "the seeded caption no longer says 'is live'"
+        page.fill("#caption-input", edited)
+        page.select_option("#channel-select", item["channel_id"])
+        with board_call(page, "PATCH", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        sent = info.value.request.post_data_json
+        assert sent == {"caption": edited, "channel_id": item["channel_id"]}, info.value.request.post_data
+    saved = detail(smoke, item["id"])
+    assert saved["caption_tagged"] == edited, f"the typo fix lost formatting: {saved['caption_tagged']!r}"
+    assert saved["channel_id"] == item["channel_id"], saved["channel_id"]
+
+
+def check_invalid_tag_blocks_save(smoke: Smoke):
+    item = pick(smoke, caption="Fresh bread, every morning from 8.")
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        caption = page.locator("#caption-input")
+        error = page.locator("#panel-error")
+        save = page.locator("#save")
+        caption.fill("<b>x")
+        expect(error).to_contain_text("<b> is not closed")
+        expect(save).to_be_disabled()
+        expect(caption).to_have_attribute("aria-invalid", "true")
+        caption.fill("<b>x</b>")
+        expect(error).to_be_hidden()
+        expect(save).to_be_enabled()
+        expect(page.locator("#caption-preview b")).to_have_text("x")
+        caption.fill("x" * (CAPTION_LIMIT + 1))
+        expect(error).to_contain_text(f"the limit is {CAPTION_LIMIT}")
+        expect(page.locator("#caption-counter")).to_have_text(f"{CAPTION_LIMIT + 1} / {CAPTION_LIMIT}")
+        expect(save).to_be_disabled()
+        discard_and_close(page)
+    assert detail(smoke, item["id"])["caption_text"] == item["caption_text"], "a refused caption was saved"
+
+
+def check_literal_angle_and_ampersand(smoke: Smoke):
+    item = pick(smoke, caption="Sale ends Sunday at midnight.")
+    path = f"/api/posts/{item['id']}"
+    typed = "I <3 you & AT&T"
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        page.fill("#caption-input", typed)
+        expect(page.locator("#caption-preview")).to_have_text(typed)
+        expect(page.locator("#caption-counter")).to_have_text(f"{len(typed)} / {CAPTION_LIMIT}")
+        expect(page.locator("#panel-error")).to_be_hidden()
+        with board_call(page, "PATCH", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        saved = detail(smoke, item["id"])
+        assert saved["caption_text"] == typed, f"saved {saved['caption_text']!r}"
+        expect(row(page, item["id"]).locator(".snippet")).to_have_text(typed)
+        page.reload()
+        wait_for_list(page)
+        open_panel(page, item["id"])
+        # The editor holds tagged text, so the reloaded caption shows its characters escaped.
+        expect(page.locator("#caption-input")).to_have_value(saved["caption_tagged"])
+        expect(page.locator("#caption-preview")).to_have_text(typed)
+        expect(page.locator("#save")).to_be_disabled()  # nothing changed since the save
+
+
+def check_preview_debounced_and_stale_ignored(smoke: Smoke):
+    item = pick(smoke, caption="Our team says thank you for 10,000 followers!")
+    sent: list[str] = []
+    held: list = []
+    hold = {"next": False}
+
+    def control(route):
+        sent.append(route.request.post_data_json["caption"])
+        if hold["next"]:
+            hold["next"] = False
+            held.append(route)
+        else:
+            route.continue_()
+
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        page.route(lambda url: urlsplit(url).path == "/api/caption/preview", control)
+        caption = page.locator("#caption-input")
+        preview = page.locator("#caption-preview")
+        caption.fill("")
+        caption.press_sequentially("typed quickly", delay=30)
+        page.wait_for_timeout(700)
+        assert sent == ["typed quickly"], f"preview requests while typing: {sent}"
+        expect(preview).to_have_text("typed quickly")
+        # An answer that arrives after a newer one is dropped.
+        hold["next"] = True
+        caption.fill("first <b>draft</b>")
+        page.wait_for_timeout(500)
+        assert len(held) == 1, f"the first preview request was not held: {sent}"
+        caption.fill("second")
+        expect(preview).to_have_text("second")
+        held[0].fulfill(json={"ok": True, "html": "<b>stale</b>", "length": 5, "limit": CAPTION_LIMIT,
+                              "signature_fits": None, "error": None})
+        page.wait_for_timeout(400)
+        expect(preview).to_have_text("second")
+        expect(page.locator("#caption-counter")).to_have_text(f"6 / {CAPTION_LIMIT}")
+        discard_and_close(page)
+
+
+def check_signature_note(smoke: Smoke):
+    item = pick(smoke, caption="New arrivals are in. Come and see them this week.", channel=ALPHA)
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        note = page.locator("#signature-note")
+        suffix = page.locator("#preview-signature")
+        expect(note).to_be_visible()
+        expect(note).to_contain_text("signature")
+        expect(suffix).to_have_text(ALPHA_SIGNATURE)
+        # Caption and signature together no longer fit: the signature is left out.
+        page.fill("#caption-input", "x" * (CAPTION_LIMIT - len(ALPHA_SIGNATURE)))
+        expect(note).to_contain_text("left out")
+        expect(suffix).to_be_hidden()
+        expect(page.locator("#save")).to_be_enabled()
+        page.select_option("#channel-select", BETA)  # Beta has no signature
+        expect(note).to_be_hidden()
+        discard_and_close(page)
+
+
+def check_unschedule_moves_to_queued(smoke: Smoke):
+    item = pick(smoke, caption="Workshop seats are almost gone.")
+    path = f"/api/posts/{item['id']}"
+    before = smoke.api("/api/me")["counts"]
+    with smoke.page() as page:
+        open_panel(page, item["id"])
+        page.click("#unschedule")
+        expect(page.locator("#time-input")).to_have_value("")
+        with board_call(page, "PATCH", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert info.value.request.post_data_json == {"scheduled_time": None}, info.value.request.post_data
+        expect(row(page, item["id"])).to_have_count(0)
+        saved = detail(smoke, item["id"])
+        assert saved["status"] == "queued" and saved["scheduled_time"] is None, saved
+        after = smoke.api("/api/me")["counts"]
+        assert (after["scheduled"], after["queued"]) == (before["scheduled"] - 1, before["queued"] + 1), (before, after)
+        for tab in ("scheduled", "queued"):
+            expect(page.locator(f'[data-tab="{tab}"] .count')).to_have_text(str(after[tab]))
+        page.click('[data-tab="queued"]')
+        wait_for_list(page)
+        expect(row(page, item["id"])).to_have_count(1)
+
+
+def check_post_now_sets_one_minute_ahead(smoke: Smoke):
+    """Post now sets now + 60 s; unsaved changes are saved first, never lost."""
+    item = pick(smoke, status="queued", startswith="Queued idea #1:")
+    path = f"/api/posts/{item['id']}"
+    new_caption = "Queued idea #1, ready to go"
+    with smoke.page("#tab=queued") as page:
+        open_panel(page, item["id"])
+        post_now = page.locator("#post-now")
+        expect(page.locator("#retry")).to_be_hidden()
+        expect(post_now).to_have_text("Post now")
+        page.fill("#caption-input", new_caption)
+        expect(post_now).to_have_text("Save & post now")
+        before = kyiv(smoke.api("/api/me")["now"])
+        with board_call(page, "PATCH", path) as edit, board_call(page, "POST", f"{path}/post-now") as info:
+            post_now.click()
+        after = kyiv(smoke.api("/api/me")["now"])
+        assert_board_call(smoke, edit.value)
+        assert edit.value.request.post_data_json == {"caption": new_caption}, edit.value.request.post_data
+        assert_board_call(smoke, info.value)
+        saved = detail(smoke, item["id"])
+        assert saved["status"] == "scheduled" and saved["caption_text"] == new_caption, saved
+        when = kyiv(saved["scheduled_time"])
+        assert before + timedelta(seconds=59) <= when <= after + timedelta(seconds=61), (
+            f"post now set {saved['scheduled_time']}; the server clock read {before} .. {after}"
+        )
+        expect(page.locator("#edit-panel")).to_be_hidden()
+        expect(page.locator("#toast")).to_contain_text(saved["scheduled_time"][11:16])
+        expect(row(page, item["id"])).to_have_count(0)
+
+
+def check_failed_retry(smoke: Smoke):
+    item = next(i for i in smoke.all_items("failed") if i["failure_reason"].startswith("Forbidden"))
+    path = f"/api/posts/{item['id']}"
+    with smoke.page("#tab=failed") as page:
+        open_panel(page, item["id"])
+        retry = page.locator("#retry")
+        expect(page.locator("#edit-panel")).to_contain_text(item["failure_reason"])
+        expect(retry).to_be_visible()
+        expect(retry).to_be_enabled()
+        expect(page.locator("#post-now")).to_be_hidden()
+        expect(page.locator("#save")).to_be_visible()
+        before = kyiv(smoke.api("/api/me")["now"])
+        with board_call(page, "POST", f"{path}/retry") as info:
+            retry.click()
+        after = kyiv(smoke.api("/api/me")["now"])
+        assert_board_call(smoke, info.value)
+        saved = detail(smoke, item["id"])
+        assert saved["status"] == "scheduled" and saved["retry_count"] == 0 and saved["failure_reason"] is None, saved
+        when = kyiv(saved["scheduled_time"])
+        assert before + timedelta(seconds=9) <= when <= after + timedelta(seconds=11), (
+            f"retry set {saved['scheduled_time']}; the server clock read {before} .. {after}"
+        )
+        expect(page.locator("#edit-panel")).to_be_hidden()
+        expect(row(page, item["id"])).to_have_count(0)
+        expect(page.locator("#toast")).to_contain_text(saved["scheduled_time"][11:16])
+        counts = smoke.api("/api/me")["counts"]
+        expect(page.locator('[data-tab="failed"] .count')).to_have_text(str(counts["failed"]))
+
+
+def check_conflict_reloads_panel(smoke: Smoke):
+    """A 409 shows its message, reloads the panel and refreshes the row."""
+    item = next(i for i in smoke.all_items("failed") if i["failure_reason"].startswith("Bad Request"))
+    path = f"/api/posts/{item['id']}"
+    with smoke.page("#tab=failed", expect_failed_requests=True) as page:
+        open_panel(page, item["id"])
+        board_post(smoke, f"{path}/retry")  # retried from somewhere else meanwhile
+        with board_call(page, "POST", f"{path}/retry") as info, board_call(page, "GET", path) as reload:
+            page.click("#retry")
+        assert_board_call(smoke, info.value, expected=409)
+        body = info.value.json()
+        assert body["error"] == "conflict" and body["status"] == "scheduled", body
+        assert reload.value.ok, f"the reload answered {reload.value.status}"
+        expect(page.locator("#toast")).to_contain_text(body["message"])
+        wait_for_panel(page, item["id"])
+        expect(page.locator("#panel-meta")).to_contain_text("Scheduled")
+        expect(page.locator("#retry")).to_be_hidden()
+        expect(page.locator("#post-now")).to_be_visible()
+        expect(row(page, item["id"])).to_have_count(0)  # no longer a failed post
+
+
+def check_replace_media_and_as_file(smoke: Smoke):
+    item = pick(smoke, caption="Rainy day playlist, link in the bio.", media_type="photo")
+    path = f"/api/posts/{item['id']}/media"
+    with smoke.page() as page:
+        page.evaluate(RECORD_UPLOADS_JS)
+        open_panel(page, item["id"])
+        as_file = page.locator("#as-file")
+        expect(as_file).to_be_visible()
+        as_file.check()
+        choose_upload(page, "sent-as-file")
+        expect(page.locator("#panel-media")).to_contain_text("sent-as-file.png")
+        with board_call(page, "PUT", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert last_upload_as_file(page) == "1"
+        # The server reads as_file only before the file, so "document" proves the order too.
+        saved = detail(smoke, item["id"])
+        assert saved["media_type"] == "document" and saved["media"][0]["exists"], saved["media"]
+        expect(row(page, item["id"]).locator(".type-icon")).to_be_visible()
+        open_panel(page, item["id"])
+        expect(as_file).not_to_be_checked()
+        choose_upload(page, "new-photo")
+        with board_call(page, "PUT", path) as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert last_upload_as_file(page) == "0"
+        saved = detail(smoke, item["id"])
+        assert saved["media_type"] == "photo" and saved["media"][0]["exists"], saved["media"]
+        # The row shows the new picture, not a cached copy of the old one.
+        image = row(page, item["id"]).locator("img.thumb")
+        expect(image).to_have_attribute("src", re.compile(r"&v=\d+$"))
+        image_loaded(page, image)
+        open_panel(page, item["id"])
+        image_loaded(page, page.locator("#panel-media img"))
+
+
+def check_replace_media_on_post_with_missing_file(smoke: Smoke):
+    """Review Focus 3: a post whose file is gone opens with a placeholder and takes new media."""
+    queued = smoke.all_items("queued")
+    missing = [item for item in queued if not detail(smoke, item["id"])["media"][0]["exists"]]
+    assert len(missing) == 1, f"queued posts without a file: {[i['id'] for i in missing]}; the seed has 1"
+    item = missing[0]
+    with smoke.page("#tab=queued") as page:
+        expect(row(page, item["id"]).locator(".type-icon")).to_be_visible()
+        open_panel(page, item["id"])
+        media = page.locator("#panel-media")
+        expect(media).to_contain_text("File no longer available")
+        expect(media.locator("img")).to_have_count(0)
+        choose_upload(page, "replacement")
+        with board_call(page, "PUT", f"/api/posts/{item['id']}/media") as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        saved = detail(smoke, item["id"])
+        assert saved["media"][0]["exists"] and saved["media_type"] == "photo", saved["media"]
+        image = row(page, item["id"]).locator("img.thumb")
+        image_loaded(page, image)
+
+
+def check_album_media_read_only(smoke: Smoke):
+    album = pick(smoke, media_type="album")
+    with smoke.page() as page:
+        open_panel(page, album["id"])
+        items = page.locator("#panel-media .media-strip .media-item")
+        expect(items).to_have_count(album["media_count"])
+        for index in range(album["media_count"]):
+            image = items.nth(index).locator("img")
+            expect(image).to_have_attribute("src", re.compile(rf"^/api/posts/{album['id']}/thumb\?i={index}&"))
+            image_loaded(page, image)
+        for control in ("#media-replace", "#replace-media-input", "#as-file"):
+            expect(page.locator(control)).to_be_hidden()
+        expect(page.locator("#panel-media")).to_contain_text("Album")
+        expect(page.locator("#caption-input")).to_be_editable()
+        expect(page.locator("#save")).to_be_visible()
+
+
+def check_read_only_panel(smoke: Smoke):
+    """Posted and sending posts open read-only; only what `can` allows is offered."""
+    posted = first_page(smoke, "posted")[0]
+    edit_only = ("#save", "#post-now", "#retry", "#unschedule", "#media-replace", '[data-fmt="b"]')
+    with smoke.page("#tab=posted") as page:
+        open_panel(page, posted["id"])
+        for control in edit_only:
+            expect(page.locator(control)).to_be_hidden()
+        expect(page.locator("#delete")).to_be_visible()
+        expect(page.locator("#caption-input")).not_to_be_editable()
+        expect(page.locator("#channel-select")).to_be_disabled()
+        expect(page.locator("#time-input")).to_be_disabled()
+        expect(page.locator("#edit-panel")).to_contain_text("stays in the channel")
+        expect(page.locator("#edit-panel")).to_have_accessible_name("Post details")
+    item = pick(smoke, caption="Morning coffee and a quiet street.")
+
+    def sending(route):
+        response = route.fetch()
+        body = response.json()
+        body.update(status="sending", can={action: False for action in body["can"]})
+        route.fulfill(response=response, json=body)
+
+    with smoke.page() as page:
+        page.route(lambda url: urlsplit(url).path == f"/api/posts/{item['id']}", sending)
+        open_panel(page, item["id"])
+        for control in (*edit_only, "#delete"):
+            expect(page.locator(control)).to_be_hidden()
+        expect(page.locator("#caption-input")).not_to_be_editable()
+        expect(page.locator("#edit-panel")).to_contain_text("being sent")
+
+
+def check_delete_from_panel(smoke: Smoke):
+    """Deleting a posted post asks first (only the record goes); other deletes do not ask."""
+    prompts: list[tuple[str, str]] = []
+    posted = first_page(smoke, "posted")[0]
+    path = f"/api/posts/{posted['id']}"
+    with smoke.page("#tab=posted") as page:
+        open_panel(page, posted["id"])
+        page.once("dialog", lambda dialog: (prompts.append((dialog.type, dialog.message)), dialog.dismiss()))
+        page.click("#delete")
+        expect(page.locator("#edit-panel")).to_be_visible()
+        assert prompts and prompts[0][0] == "confirm" and POSTED_DELETE_PROMPT in prompts[0][1], prompts
+        assert smoke.context.request.get(smoke.base + path).status == 200, "a declined delete went through"
+        page.once("dialog", lambda dialog: dialog.accept())
+        with board_call(page, "DELETE", path) as info:
+            page.click("#delete")
+        assert_board_call(smoke, info.value)
+        expect(page.locator("#edit-panel")).to_be_hidden()
+        expect(row(page, posted["id"])).to_have_count(0)
+        expect(page.locator("#toast")).to_contain_text("deleted")
+        assert smoke.context.request.get(smoke.base + path).status == 404, "the deleted post still opens"
+        counts = smoke.api("/api/me")["counts"]
+        expect(page.locator('[data-tab="posted"] .count')).to_have_text(str(counts["posted"]))
+    item = pick(smoke, caption="Question of the week: which colour should we stock next?")
+    with smoke.page() as page:
+        page.on("dialog", lambda dialog: (prompts.append((dialog.type, dialog.message)), dialog.dismiss()))
+        open_panel(page, item["id"])
+        with board_call(page, "DELETE", f"/api/posts/{item['id']}") as info:
+            page.click("#delete")
+        assert_board_call(smoke, info.value)
+        expect(row(page, item["id"])).to_have_count(0)
+    assert len(prompts) == 1, f"a scheduled post's delete asked: {prompts[1:]}"
+
+
+def check_escape_prompts_when_dirty(smoke: Smoke):
+    item = pick(smoke, caption="Sunset over the river, straight from the camera.")
+    prompts: list[str] = []
+    with smoke.page() as page:
+        panel = page.locator("#edit-panel")
+        open_panel(page, item["id"])
+        caption = page.locator("#caption-input")
+        caption.press("End")
+        caption.press_sequentially(" Draft")
+        page.once("dialog", lambda dialog: (prompts.append(dialog.message), dialog.dismiss()))
+        page.keyboard.press("Escape")
+        expect(panel).to_be_visible()
+        expect(caption).to_have_value(item["caption_text"] + " Draft")
+        assert prompts and DISCARD_PROMPT in prompts[0].lower(), f"prompts: {prompts}"
+        # Back to the saved text: nothing to lose, so no question.
+        caption.fill(item["caption_text"])
+        page.keyboard.press("Escape")
+        expect(panel).to_be_hidden()
+        assert len(prompts) == 1, f"prompts: {prompts}"
+        open_panel(page, item["id"])
+        page.select_option("#channel-select", BETA if item["channel_id"] == ALPHA else ALPHA)
+        page.once("dialog", lambda dialog: (prompts.append(dialog.message), dialog.accept()))
+        page.keyboard.press("Escape")
+        expect(panel).to_be_hidden()
+        assert len(prompts) == 2, f"a changed channel did not ask: {prompts}"
+    saved = detail(smoke, item["id"])
+    assert (saved["caption_text"], saved["channel_id"]) == (item["caption_text"], item["channel_id"]), "a discarded edit was saved"
+
+
+def check_panel_layout(smoke: Smoke):
+    """A side panel from 900 px wide, a bottom sheet below (centred, at most 720 px wide);
+    it fits a 360 px phone."""
+    item = pick(smoke, startswith="Big news:")
+    layouts = (
+        ("side", DESKTOP),
+        ("side", {"viewport": {"width": 900, "height": 700}}),
+        ("sheet", {"viewport": {"width": 899, "height": 700}}),
+        ("sheet", PHONE),
+    )
+    for kind, device in layouts:
+        width, height = device["viewport"]["width"], device["viewport"]["height"]
+        context = smoke.new_context(**device)
+        try:
+            with smoke.page(context=context) as page:
+                open_panel(page, item["id"])
+                box = page.locator("#edit-panel").bounding_box()
+                where = f"{width}x{height}: panel at {box}"
+                assert abs(box["y"] + box["height"] - height) < 1, f"{where} does not reach the bottom"
+                if kind == "side":
+                    assert abs(box["x"] + box["width"] - width) < 1 and box["y"] < 1, f"{where} is not a side panel"
+                    assert 360 <= box["width"] <= 560, f"{where} has an odd width"
+                else:
+                    centred = abs(box["x"] - (width - box["width"]) / 2) < 1
+                    assert centred and abs(box["width"] - min(width, 720)) < 1 and box["y"] > 0, f"{where} is not a bottom sheet"
+                problems = page.evaluate(PANEL_FIT_JS)
+                assert not problems, f"{width}px: {problems[0]} ({len(problems)} problems)"
+                save = page.locator("#save").bounding_box()
+                assert save and save["y"] + save["height"] <= height, f"{width}px: Save is off screen at {save}"
+        finally:
+            context.close()
+
+
 def check_signout_post_succeeds(smoke: Smoke):
     """Sign-out is a fetch POST from the page; the server's Origin check must accept it."""
     with smoke.page() as page:
@@ -609,6 +1324,27 @@ CHECKS = [
     check_unauthorized_shows_run_web,
     check_list_fits_phone_width,
     check_failed_tab_readable_on_phone,
+    # Edit panel. From the time check on, checks change posts: each picks posts no
+    # earlier check changed in a way that matters to it, so keep this order.
+    check_panel_dialog_and_focus,
+    check_panel_layout,
+    check_time_is_kyiv_not_browser_zone,  # needs the seeded earliest post at 10:00
+    check_caption_bold_round_trip,
+    check_formatted_caption_keeps_entities,
+    check_invalid_tag_blocks_save,
+    check_literal_angle_and_ampersand,
+    check_preview_debounced_and_stale_ignored,
+    check_signature_note,
+    check_unschedule_moves_to_queued,
+    check_post_now_sets_one_minute_ahead,
+    check_failed_retry,
+    check_conflict_reloads_panel,
+    check_replace_media_and_as_file,
+    check_replace_media_on_post_with_missing_file,
+    check_album_media_read_only,
+    check_read_only_panel,
+    check_escape_prompts_when_dirty,
+    check_delete_from_panel,
 ]
 # Sign-out ends the session, so it runs after everything else, before the error tally.
 FINAL_CHECKS = [check_signout_post_succeeds, check_no_js_errors]
@@ -629,12 +1365,53 @@ SHOTS = (
 )
 
 
+# The open panel: (name, device, colour scheme, post, what to show).
+PANEL_SHOTS = (
+    ("panel-desktop-light", DESKTOP, "light", "formatted", None),
+    ("panel-desktop-dark", DESKTOP, "dark", "formatted", None),
+    ("panel-mobile-light", PHONE, "light", "formatted", None),
+    ("panel-mobile-light-scrolled", PHONE, "light", "formatted", "scrolled"),
+    ("panel-mobile-dark", PHONE, "dark", "formatted", None),
+    ("panel-failed-retry-mobile-light", PHONE, "light", "failed", None),
+    ("panel-failed-retry-desktop-dark", DESKTOP, "dark", "failed", None),
+    ("panel-invalid-tag-mobile-light", PHONE, "light", "formatted", "invalid"),
+    ("panel-invalid-tag-desktop-light", DESKTOP, "light", "formatted", "invalid"),
+    ("panel-album-desktop-light", DESKTOP, "light", "album", None),
+    ("panel-posted-mobile-dark", PHONE, "dark", "posted", None),
+    ("panel-focus-desktop-light", DESKTOP, "light", "formatted", "focus"),
+)
+
+
 def take_screenshots(smoke: Smoke) -> None:
     for name, device, scheme, hash_ in SHOTS:
         context = smoke.new_context(color_scheme=scheme, **device)
         try:
             with smoke.page(hash_, context=context) as page:
                 page.wait_for_load_state("networkidle")
+                smoke.shot(page, name)
+        finally:
+            context.close()
+    posts = {
+        "formatted": ("#tab=scheduled", pick(smoke, startswith="Big news:")["id"]),
+        "album": ("#tab=scheduled", pick(smoke, media_type="album")["id"]),
+        "failed": ("#tab=failed", first_page(smoke, "failed")[0]["id"]),
+        "posted": ("#tab=posted", first_page(smoke, "posted")[0]["id"]),
+    }
+    for name, device, scheme, post, state in PANEL_SHOTS:
+        hash_, post_id = posts[post]
+        context = smoke.new_context(color_scheme=scheme, **device)
+        try:
+            with smoke.page(hash_, context=context) as page:
+                open_panel(page, post_id)
+                page.wait_for_load_state("networkidle")
+                if state == "invalid":
+                    page.fill("#caption-input", "<b>Big news: the new site is live.")
+                    expect(page.locator("#panel-error")).to_be_visible()
+                elif state == "scrolled":
+                    page.locator(".panel-body").evaluate("node => node.scrollTo(0, node.scrollHeight)")
+                elif state == "focus":
+                    page.locator("#caption-input").focus()
+                    page.keyboard.press("Shift+Tab")
                 smoke.shot(page, name)
         finally:
             context.close()

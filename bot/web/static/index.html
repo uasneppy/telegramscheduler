@@ -27,6 +27,10 @@
   <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></symbol>
   <symbol id="i-album" viewBox="0 0 24 24"><rect x="7" y="7" width="14" height="14" rx="2"/><path d="M3 15V5a2 2 0 0 1 2-2h10"/><path d="m21 17-3.5-3.5L11 20"/></symbol>
   <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
 </svg>
 
 <div id="app">
@@ -75,6 +79,107 @@
     <p id="list-status" aria-live="polite"></p>
     <div id="list-sentinel" aria-hidden="true"></div>
   </main>
+
+  <!-- The edit panel: a side panel from 900 px wide, a bottom sheet below. While it is
+       open the header, tabs and list are inert; the dock (banner and toast) stays live. -->
+  <div id="panel-scrim" class="panel-scrim" hidden></div>
+  <section id="edit-panel" class="panel" role="dialog" aria-labelledby="panel-title" tabindex="-1" data-state="closed" hidden>
+    <header class="panel-head">
+      <div class="panel-heading">
+        <h2 id="panel-title" class="panel-title">Edit post</h2>
+        <div id="panel-meta" class="panel-meta"></div>
+      </div>
+      <button id="panel-close" class="icon-button" type="button" aria-label="Close" title="Close">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-close"/></svg>
+      </button>
+    </header>
+
+    <div class="panel-body">
+      <p id="panel-loading" class="panel-loading" role="status">Loading…</p>
+      <div id="panel-notices" class="panel-notices"></div>
+
+      <div id="panel-fields" class="panel-fields" hidden>
+        <section class="panel-section" aria-labelledby="media-heading">
+          <h3 id="media-heading" class="section-label">Media</h3>
+          <div id="panel-media" class="panel-media">
+            <div id="media-view" class="media-view"></div>
+            <p id="media-caption" class="media-caption"></p>
+            <div id="media-replace" class="media-replace">
+              <div class="media-replace-row">
+                <input id="replace-media-input" class="visually-hidden" type="file" aria-describedby="media-staged">
+                <label for="replace-media-input" class="button file-button">
+                  <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-upload"/></svg>
+                  <span>Replace media…</span>
+                </label>
+                <label class="check">
+                  <input id="as-file" type="checkbox">
+                  <span>Send as a file <span class="check-note">(original quality)</span></span>
+                </label>
+              </div>
+              <div id="media-staged" class="media-staged" hidden>
+                <span id="media-file-name" class="media-file-name"></span>
+                <button id="media-unstage" class="button button-quiet button-small" type="button">Keep current media</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel-section" aria-labelledby="caption-label">
+          <div class="caption-head">
+            <label id="caption-label" class="section-label" for="caption-input">Caption</label>
+            <div id="caption-toolbar" class="toolbar" role="toolbar" aria-label="Formatting" aria-controls="caption-input">
+              <button class="tool" type="button" data-fmt="b" aria-label="Bold" title="Bold (Ctrl+B)"><b>B</b></button>
+              <button class="tool" type="button" data-fmt="i" aria-label="Italic" title="Italic (Ctrl+I)"><i>I</i></button>
+              <button class="tool" type="button" data-fmt="u" aria-label="Underline" title="Underline (Ctrl+U)"><u>U</u></button>
+              <button class="tool" type="button" data-fmt="link" aria-label="Link" title="Link (Ctrl+K)" aria-expanded="false" aria-controls="link-row">
+                <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-link"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="link-row" class="link-row" hidden>
+            <label class="visually-hidden" for="link-url">Link address</label>
+            <input id="link-url" class="field" type="url" inputmode="url" placeholder="https://example.com" autocomplete="off" spellcheck="false">
+            <button id="link-apply" class="button" type="button">Add link</button>
+          </div>
+          <textarea id="caption-input" class="field caption-input" rows="6" spellcheck="true" aria-describedby="caption-counter signature-note"></textarea>
+          <div class="caption-meta">
+            <p id="signature-note" class="signature-note" hidden></p>
+            <p id="caption-counter" class="caption-counter">– / 1024</p>
+          </div>
+          <h3 class="section-label">Preview</h3>
+          <div class="preview-card">
+            <div id="caption-preview" class="caption-preview" aria-busy="false"></div>
+            <p id="preview-signature" class="preview-signature" hidden></p>
+          </div>
+        </section>
+
+        <section class="panel-section panel-where" aria-label="Channel and time">
+          <div class="where-field">
+            <label class="section-label" for="channel-select">Channel</label>
+            <select id="channel-select" class="field"></select>
+          </div>
+          <div class="where-field">
+            <label class="section-label" for="time-input">Publish at <span class="label-note">(Kyiv time)</span></label>
+            <div class="time-row">
+              <input id="time-input" class="field" type="datetime-local" step="60" aria-describedby="time-hint">
+              <button id="unschedule" class="button" type="button">Unschedule</button>
+            </div>
+            <p id="time-hint" class="field-hint"></p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <footer class="panel-foot">
+      <p id="panel-error" class="panel-error" role="alert" hidden></p>
+      <div class="panel-actions">
+        <button id="delete" class="button button-danger" type="button">Delete</button>
+        <button id="post-now" class="button" type="button">Post now</button>
+        <button id="retry" class="button" type="button">Retry</button>
+        <button id="save" class="button button-primary" type="button">Save</button>
+      </div>
+    </footer>
+  </section>
 
   <div class="dock">
     <div id="banner" class="banner" role="alert" hidden>

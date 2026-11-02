@@ -10,14 +10,16 @@ sign-in link works once and expires after 5 minutes, like the one /web sends in
 Telegram: restart the script for a new link. Scheduler calls are logged instead
 of creating jobs, and nothing is ever sent to Telegram.
 
-Seed (user 1, channels -1001 Alpha and -1002 Beta):
+Seed (user 1, channels -1001 Alpha with a caption signature, -1002 Beta without):
 - 130 scheduled posts from tomorrow 10:00 Kyiv, every 2 h up to 18:00, over 14
   days. Alpha and Beta share their slots; Beta skips the first slot and the last
   nine, so each 50-row page of the Scheduled list ends in the middle of a pair
   of posts with the same time. Among them: a 3-image album, a recurring post, a
   PNG sent as a file (document_image), a PDF document and a GIF animation.
-- 8 queued, 3 failed (with reasons) and 12 posted posts (3 of them with their
-  file already deleted, like published media after the 7-day cleanup).
+- 8 queued posts (the last one with its file gone from disk, so replacing the
+  media of a post whose file is missing can be tried), 3 failed (with reasons)
+  and 12 posted posts (3 of them with their file already deleted, like
+  published media after the 7-day cleanup).
 - Captions: plain, formatted (bold, a link and a custom emoji), Ukrainian
   ("Привіт, світ"), "AT&T <3", an empty one and one longer than two lines.
 """
@@ -56,6 +58,7 @@ BASE_URL = f"http://{HOST}:{PORT}"
 USER_ID = 1
 ALPHA, BETA = "-1001", "-1002"
 CHANNELS = ((ALPHA, "Alpha"), (BETA, "Beta"))
+ALPHA_SIGNATURE = "Alpha News · @alpha_news"
 
 DAYS = 14
 SLOT_HOURS = (10, 12, 14, 16, 18)
@@ -234,9 +237,11 @@ def _seed_scheduled(names: dict) -> int:
 def _seed_queued(names: dict) -> int:
     for n in range(8):
         channel = (ALPHA, BETA)[n % 2]
+        path = _photo([f"Queued #{n + 1}", names[channel]], n)
+        if n == 7:  # a file that went missing; the post can still get new media
+            os.remove(path)
         _insert_post(
-            channel_id=channel, scheduled_time=None, media_type="photo",
-            file_path=_photo([f"Queued #{n + 1}", names[channel]], n),
+            channel_id=channel, scheduled_time=None, media_type="photo", file_path=path,
             **_caption(f"Queued idea #{n + 1}: {PLAIN_CAPTIONS[(n + 5) % len(PLAIN_CAPTIONS)]}"),
         )
     return 8
@@ -278,6 +283,7 @@ def seed(empty: bool) -> str:
         return "user 1 only: no channels, no posts"
     for channel_id, name in CHANNELS:
         assert Database.add_user_channel(USER_ID, channel_id, name)
+    assert Database.set_channel_signature(USER_ID, ALPHA, ALPHA_SIGNATURE)
     names = dict(CHANNELS)
     counts = (_seed_scheduled(names), _seed_queued(names), _seed_failed(names), _seed_posted(names))
     return "{} scheduled, {} queued, {} failed, {} posted".format(*counts)
