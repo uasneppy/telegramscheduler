@@ -12,6 +12,7 @@
 //   state.js    the shared `state` and `el` objects
 //   api.js      fetch with the board's rules, the JSON helpers, ApiError
 //   time.js     Kyiv ISO strings -> the times and days shown
+//   keys.js     the letter of a Ctrl/Cmd shortcut on any keyboard layout
 //   list.js     tabs, filters, hash, rows, loading, counts, banner, toast
 //   panel.js    the edit panel
 //   actions.js  selection and the bulk bar, deletes with Undo, the skipped-posts summary

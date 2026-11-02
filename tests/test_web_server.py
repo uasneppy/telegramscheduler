@@ -30,7 +30,7 @@ EXPECTED_CSP = (
 )
 INLINE_SCRIPT = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>", re.IGNORECASE)
 # The board's front-end ES modules, served under /static/.
-STATIC_MODULES = ("actions.js", "api.js", "list.js", "main.js", "panel.js", "state.js", "time.js")
+STATIC_MODULES = ("actions.js", "api.js", "keys.js", "list.js", "main.js", "panel.js", "state.js", "time.js")
 IMPORT_FROM = re.compile(r"""\bfrom\s+['"]\./([\w.-]+)['"]""")
 
 

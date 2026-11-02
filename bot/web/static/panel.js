@@ -8,6 +8,7 @@
 // the panel and refreshes the post's row and the tab counts.
 import { POSTED_DELETE_QUESTION, offerUndo } from './actions.js';
 import { ApiError, apiJson, getJson, sendJson } from './api.js';
+import { shortcutLetter } from './keys.js';
 import {
   KNOWN_STATUSES, MEDIA_TYPES, ROW_THUMB_W, THUMB_TYPES, activeChannels, badge, channelTone, findRow,
   icon, loadMe, make, mediaUrl, refreshRow, removeRow, selectedTab, showToast, thumbUrl,
@@ -21,8 +22,11 @@ const UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
 const PANEL_THUMB_W = 512;
 const STRIP_THUMB_W = 240;
 const STATUS_LABELS = { queued: 'Queued', scheduled: 'Scheduled', sending: 'Sending', failed: 'Failed', posted: 'Posted' };
-// Ctrl/Cmd + key in the caption editor.
+// Ctrl/Cmd + key in the caption editor, by the key's letter on any layout (keys.js).
 const SHORTCUTS = { b: 'b', i: 'i', u: 'u', k: 'link' };
+// Media types of a post sent as a file: new media for it is sent as a file too, unless
+// "Send as a file" is unticked.
+const SENT_AS_FILE = new Set(['document', 'document_image', 'document_video']);
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 const LINK_SCHEMES = /^(https?|tg):\/\//i;
 const DISCARD_QUESTION = 'Discard your unsaved changes to this post?';
@@ -137,7 +141,7 @@ function applyDetail(panel, detail, edits = null) {
   panel.signatureFits = detail.signature_fits ?? null;
   panel.file = null;
   el.mediaInput.value = '';
-  el.asFile.checked = false;
+  el.asFile.checked = SENT_AS_FILE.has(detail.media_type); // starts as the post is sent now
   closeLinkRow();
   el.captionInput.value = panel.baseline.caption;
   renderChannelOptions(detail);
@@ -507,7 +511,7 @@ function applyLink() {
 
 function onCaptionKeydown(event) {
   if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
-  const action = SHORTCUTS[event.key.toLowerCase()];
+  const action = SHORTCUTS[shortcutLetter(event)];
   if (!action || el.captionInput.readOnly) return;
   event.preventDefault();
   if (action === 'link') openLinkRow();
@@ -616,16 +620,27 @@ function renderSignature(panel) {
   setText(el.previewSignature, signature || '');
 }
 
+// What saving with no time does. A failed post stays Failed without a time (spec 6.1);
+// any other post goes to, or stays in, Queued.
+function noTimeHint(panel) {
+  const { detail } = panel;
+  if (detail.status === 'failed') {
+    return detail.can.retry
+      ? 'No time: saving keeps the post in Failed. Retry sends it right away.'
+      : 'No time: saving keeps the post in Failed.';
+  }
+  return panel.baseline.time
+    ? 'No time: saving moves the post to Queued.'
+    : 'No time: the post waits in Queued. Pick a time to schedule it.';
+}
+
 function renderTimeHint(panel) {
   const { detail } = panel;
   const parts = [];
   if (detail.can && detail.can.edit) {
-    if (el.timeInput.value === '' && !timeIncomplete()) {
-      parts.push(panel.baseline.time
-        ? 'No time: saving moves the post to Queued.'
-        : 'No time: the post waits in Queued. Pick a time to schedule it.');
-    }
-    if (detail.can.retry) parts.push('Retry sends it at this time if that is still ahead, otherwise right away.');
+    const noTime = el.timeInput.value === '' && !timeIncomplete();
+    if (noTime) parts.push(noTimeHint(panel));
+    else if (detail.can.retry) parts.push('Retry sends it at this time if that is still ahead, otherwise right away.');
   }
   if (state.me && hasIsoDate(state.me.now)) {
     parts.push(`In Kyiv it is now ${dayLabel(dayKey(state.me.now))}, ${hhmm(state.me.now)}.`);

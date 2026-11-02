@@ -741,6 +741,39 @@ def discard_and_close(page) -> None:
     expect(page.locator("#edit-panel")).to_be_hidden()
 
 
+# Ctrl + a letter on the Ukrainian layout: the letter's (event.key, event.code, Windows
+# virtual key code). Cyrillic letters sit on the keys of the Latin ones (И on B, Я on Z);
+# a non-Latin layout reports the US key's virtual code, which is what Chromium's own
+# editing shortcuts (Ctrl+Z undoing in a text field) go by.
+UKRAINIAN = {
+    "b": ("и", "KeyB", 66), "i": ("ш", "KeyI", 73), "u": ("г", "KeyU", 85), "k": ("л", "KeyK", 75),
+    "z": ("я", "KeyZ", 90),
+}
+# Records every keydown as the page's handlers left it: a listener on window runs after the
+# board's own (on the element and on document), so `prevented` says whether the board took the key.
+WATCH_KEYS_JS = """() => {
+    window.__keys = [];
+    window.addEventListener('keydown', (event) => window.__keys.push(
+        {key: event.key, code: event.code, repeat: event.repeat, prevented: event.defaultPrevented}));
+}"""
+
+
+def press_on_layout(cdp, key: str, code: str, vk: int, repeats: int = 0) -> None:
+    """Press Ctrl+<key> as the keyboard sends it: trusted events with this key, code and virtual
+    key code (Playwright's own keyboard always types the US layout). `repeats` adds the
+    auto-repeat keydowns of a key held down."""
+    event = {"modifiers": 2, "key": key, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    cdp.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", **event, "autoRepeat": False})
+    for _ in range(repeats):
+        cdp.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", **event, "autoRepeat": True})
+    cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", **event})
+
+
+def keys_seen(page, key: str) -> list[dict]:
+    """The keydowns of `key` recorded by WATCH_KEYS_JS, in order."""
+    return page.evaluate("(key) => window.__keys.filter((k) => k.key === key)", key)
+
+
 # --- edit panel checks ----------------------------------------------------------------------
 
 
@@ -1115,7 +1148,8 @@ def check_replace_media_and_as_file(smoke: Smoke):
         assert saved["media_type"] == "document" and saved["media"][0]["exists"], saved["media"]
         expect(row(page, item["id"]).locator(".type-icon")).to_be_visible()
         open_panel(page, item["id"])
-        expect(as_file).not_to_be_checked()
+        expect(as_file).to_be_checked()  # the post is a file now, so new media would be one too
+        as_file.uncheck()  # back to a photo
         choose_upload(page, "new-photo")
 
         def with_notice(route):
@@ -1169,6 +1203,124 @@ def check_replace_media_on_post_with_missing_file(smoke: Smoke):
         assert saved["media"][0]["exists"] and saved["media_type"] == "photo", saved["media"]
         image = row(page, item["id"]).locator("img.thumb")
         image_loaded(page, image)
+
+
+def check_send_as_file_starts_from_the_post(smoke: Smoke):
+    """"Send as a file" starts ticked for a post that is a file now (an image, a video or any other
+    file sent as a file), so new media keeps that form unless it is unticked; a photo starts
+    unticked. The uploads are answered in the page with the post as stored, so no post changes."""
+    items = first_page(smoke)
+    photo = pick(smoke, media_type="photo")
+    image_file = pick(smoke, media_type="document_image")
+    document = pick(smoke, media_type="document")
+    video_file = next(i for i in items if i["media_type"] == "photo" and i["id"] != photo["id"])
+
+    def as_video_file(route):
+        # The seed has no video sent as a file: this photo post's detail says it is one.
+        response = route.fetch()
+        body = response.json()
+        body["media_type"] = "document_video"
+        for media in body["media"]:
+            media["media_type"] = "document_video"
+        route.fulfill(response=response, json=body)
+
+    def answered_upload(route):
+        if route.request.method != "PUT":
+            route.continue_()
+            return
+        route.fulfill(json=detail(smoke, int(urlsplit(route.request.url).path.split("/")[3])))
+
+    with smoke.page() as page:
+        page.evaluate(RECORD_UPLOADS_JS)
+        # Both routes stay until the page closes (see check_replace_media_and_as_file).
+        page.route(lambda url: re.fullmatch(r"/api/posts/\d+/media", urlsplit(url).path) is not None, answered_upload)
+        page.route(lambda url: urlsplit(url).path == f"/api/posts/{video_file['id']}", as_video_file)
+        panel = page.locator("#edit-panel")
+        as_file = page.locator("#as-file")
+        for item, ticked in ((photo, False), (document, True), (video_file, True)):
+            open_panel(page, item["id"])
+            if ticked:
+                expect(as_file).to_be_checked()
+            else:
+                expect(as_file).not_to_be_checked()
+            page.keyboard.press("Escape")  # nothing changed, so it closes without asking
+            expect(panel).to_be_hidden()
+        # New media for an image sent as a file goes as a file too, without touching the box...
+        open_panel(page, image_file["id"])
+        expect(as_file).to_be_checked()
+        choose_upload(page, "still-a-file")
+        with board_call(page, "PUT", f"/api/posts/{image_file['id']}/media") as info:
+            page.click("#save")
+        assert_board_call(smoke, info.value)
+        assert last_upload_as_file(page) == "1", "new media for a post sent as a file was sent as a photo"
+        expect(panel).to_be_hidden()
+        # ...and unticking the box sends it as a photo.
+        open_panel(page, document["id"])
+        as_file.uncheck()
+        choose_upload(page, "now-a-photo")
+        with board_call(page, "PUT", f"/api/posts/{document['id']}/media"):
+            page.click("#save")
+        assert last_upload_as_file(page) == "0", "an unticked box still sent the media as a file"
+    for item in (image_file, document):
+        assert detail(smoke, item["id"])["media_type"] == item["media_type"], f"post {item['id']} changed"
+
+
+def check_unschedule_hint_by_status(smoke: Smoke):
+    """After Unschedule the hint says what saving does: a scheduled post moves to Queued, a failed
+    post stays in Failed (spec 6.1), where Retry sends it. Nothing is saved."""
+    failed = first_page(smoke, "failed")[0]
+    assert failed["scheduled_time"], "the failed post has no time to clear; the seed changed"
+    with smoke.page("#tab=failed") as page:
+        open_panel(page, failed["id"])
+        page.click("#unschedule")
+        hint = page.locator("#time-hint")
+        expect(hint).to_contain_text("No time: saving keeps the post in Failed. Retry sends it right away.")
+        expect(hint).not_to_contain_text("Queued")
+        discard_and_close(page)
+    scheduled = [item for item in first_page(smoke) if not item["overdue"]][1]
+    with smoke.page() as page:
+        open_panel(page, scheduled["id"])
+        page.click("#unschedule")
+        expect(page.locator("#time-hint")).to_contain_text("No time: saving moves the post to Queued.")
+        discard_and_close(page)
+    assert detail(smoke, failed["id"])["scheduled_time"] == failed["scheduled_time"], "a discarded change was saved"
+
+
+def check_caption_shortcuts_on_other_layouts(smoke: Smoke):
+    """Ctrl+B, I, U and K format the caption on a Ukrainian layout too (Ctrl+И, Ш, Г, Л: the same
+    keys), and the browser's own action for them (Ctrl+U is view-source) does not run; the
+    Latin keys still work. Nothing is saved."""
+    item = pick(smoke, caption="Behind the scenes at the studio.")
+    with smoke.page() as page:
+        page.evaluate(WATCH_KEYS_JS)
+        cdp = page.context.new_cdp_session(page)
+        open_panel(page, item["id"])
+        caption = page.locator("#caption-input")
+        expected = item["caption_text"]
+        for word, letter in (("Behind", "b"), ("scenes", "i"), ("studio", "u")):
+            key, code, vk = UKRAINIAN[letter]
+            select_caption_text(page, word)
+            press_on_layout(cdp, key, code, vk)
+            pressed = keys_seen(page, key)[-1]
+            assert pressed["prevented"], f"Ctrl+{key.upper()} (Ctrl+{letter.upper()} on a Ukrainian layout) was left to the browser"
+            expected = expected.replace(word, f"<{letter}>{word}</{letter}>", 1)
+            expect(caption).to_have_value(expected)
+        key, code, vk = UKRAINIAN["k"]
+        select_caption_text(page, "the")
+        press_on_layout(cdp, key, code, vk)
+        assert keys_seen(page, key)[-1]["prevented"], "Ctrl+Л (Ctrl+K) was left to the browser"
+        expect(page.locator("#link-row")).to_be_visible()
+        expect(page.locator("#link-url")).to_be_focused()
+        page.keyboard.press("Escape")  # closes just the link field
+        expect(page.locator("#link-row")).to_be_hidden()
+        expect(caption).to_be_focused()
+        # The Latin keys, as before.
+        select_caption_text(page, "at")
+        caption.press("Control+b")
+        expected = expected.replace(" at ", " <b>at</b> ", 1)
+        expect(caption).to_have_value(expected)
+        discard_and_close(page)
+    assert detail(smoke, item["id"])["caption_text"] == item["caption_text"], "a discarded caption was saved"
 
 
 def check_write_in_flight_keeps_panel(smoke: Smoke):
@@ -2097,6 +2249,58 @@ def check_undo_shortcut(smoke: Smoke):
         assert len(restores) == 1, restores
 
 
+def check_undo_shortcut_on_other_layouts(smoke: Smoke):
+    """Ctrl+Z undoes a delete on a Ukrainian layout too (Ctrl+Я, the same key), once however long
+    it is held; in the caption editor it stays the editor's own undo. The key printed Z counts,
+    not the key's place: AZERTY's W and Dvorak's ; (where QWERTY has Z) do nothing, AZERTY's Z does."""
+    upcoming = [item for item in first_page(smoke) if not item["overdue"]]
+    item, other, again = upcoming[33], upcoming[34], upcoming[35]
+    restores: list[str] = []
+    ya, ya_code, ya_vk = UKRAINIAN["z"]
+    with smoke.page() as page:
+        page.evaluate(WATCH_KEYS_JS)
+        cdp = page.context.new_cdp_session(page)
+        page.on("request", lambda r: r.method == "POST" and r.url.endswith("/restore") and restores.append(r.url))
+        row(page, item["id"]).locator(".row-delete").click()
+        expect(row(page, item["id"])).to_have_count(0)
+        expect(page.locator("#toast .undo")).to_be_visible()
+        # In the caption editor Ctrl+Я is the editor's undo: the board leaves it alone.
+        open_panel(page, other["id"])
+        caption = page.locator("#caption-input")
+        caption.press("End")
+        caption.press_sequentially(" draft")
+        typed = caption.input_value()
+        press_on_layout(cdp, ya, ya_code, ya_vk)
+        page.wait_for_timeout(300)
+        assert not restores, f"Ctrl+Я in the caption editor restored the post: {restores}"
+        assert not keys_seen(page, ya)[-1]["prevented"], "Ctrl+Я in the caption editor was blocked"
+        expect(caption).not_to_have_value(typed)  # the editor's own undo took the last word back
+        discard_and_close(page)
+        # AZERTY W and Dvorak ;. The W goes without its virtual key code: Ctrl+W (87) closes
+        # the tab before any page sees it, and the board reads only key and code.
+        for key, code, vk in (("w", "KeyZ", 0), (";", "KeyZ", 186)):
+            press_on_layout(cdp, key, code, vk)
+        page.wait_for_timeout(300)
+        assert not restores, f"Ctrl+W (AZERTY) or Ctrl+; (Dvorak) restored the post: {restores}"
+        expect(page.locator("#toast .undo")).to_be_enabled()
+        # Held down: one restore, not one per repeated keydown.
+        with board_call(page, "POST", f"/api/posts/{item['id']}/restore") as info:
+            press_on_layout(cdp, ya, ya_code, ya_vk, repeats=3)
+        assert_board_call(smoke, info.value)
+        expect(row(page, item["id"])).to_have_count(1)
+        page.wait_for_timeout(300)
+        assert len(restores) == 1, f"a held Ctrl+Я sent {len(restores)} restores"
+        assert keys_seen(page, ya)[-4]["prevented"], "the Ctrl+Я that pressed Undo was left to the browser"
+        # AZERTY's Z key sits where QWERTY has W: it is Ctrl+Z all the same.
+        row(page, again["id"]).locator(".row-delete").click()
+        expect(row(page, again["id"])).to_have_count(0)
+        with board_call(page, "POST", f"/api/posts/{again['id']}/restore"):
+            press_on_layout(cdp, "z", "KeyW", 90)
+        expect(row(page, again["id"])).to_have_count(1)
+    for post in (item, again):
+        assert detail(smoke, post["id"])["status"] == "scheduled", f"post {post['id']} did not come back"
+
+
 def check_keyboard_row_delete_focus(smoke: Smoke):
     """A row deleted from the keyboard hands focus to the next row (the previous one at the end
     of the list), a failed delete hands it back to the Delete button, and the panel's Delete
@@ -2233,6 +2437,190 @@ def check_bulk_unknown_outcome_reloads(smoke: Smoke):
         assert len(sent) == 3 and sent[-1]["action"] == "restore", f"requests: {[b['action'] for b in sent]}"
 
 
+# Every control of the bulk bar that acts on the selection (Move waits for a channel anyway).
+BAR_ACTIONS = ("#bulk-select-all", "#bulk-delete", "#bulk-move", *SHIFT_CONTROLS)
+
+
+def first_list_page(url: str) -> bool:
+    """A list request for the first page: a reload, not the next page of infinite scroll."""
+    return "/api/posts?" in url and "cursor=" not in urlsplit(url).query
+
+
+def wait_until(page, done, what: str, timeout_ms: int = TIMEOUT_MS) -> None:
+    """Let the page run until `done()` (checked here, in Python) is true."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while not done():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        page.wait_for_timeout(50)
+
+
+def check_bulk_bar_waits_for_the_reload(smoke: Smoke):
+    """After a bulk call with an unknown outcome the bar stays disabled until the list is reloaded
+    and the message is up, so a second press cannot send the shift (or anything else) again from
+    the old rows; the same after an Undo (bulk restore); a reload that fails frees the bar too.
+    Each lost answer is applied by the server first; the reload is held in the page."""
+    upcoming = [item for item in first_page(smoke) if not item["overdue"]]
+    sent: list[dict] = []
+    held: list = []
+    hold = {"list": False}
+    lose = {"shift", "restore"}
+
+    def lost_answer(route):
+        body = route.request.post_data_json
+        sent.append(body)
+        if body["action"] not in lose:
+            route.continue_()
+            return
+        route.fetch()  # the server applies it, the answer is lost
+        route.fulfill(status=500, json={"error": "internal", "message": "Internal error"})
+
+    def list_reload(route):
+        if hold["list"]:
+            held.append(route)
+        else:
+            route.continue_()
+
+    def actions() -> list[str]:
+        return [body["action"] for body in sent]
+
+    def watch(page) -> None:
+        page.route(lambda url: urlsplit(url).path == "/api/posts/bulk", lost_answer)
+        page.route(first_list_page, list_reload)
+
+    # Shift with its answer lost: while the list reloads, nothing in the bar works.
+    chosen = upcoming[36:38]
+    toast = None
+    with smoke.page(expect_failed_requests=True) as page:
+        watch(page)
+        toast = page.locator("#toast")
+        select_rows(page, [item["id"] for item in chosen])
+        page.fill("#bulk-shift-amount", "1")
+        page.select_option("#bulk-shift-unit", "hours")
+        wait_for_list(page)
+        hold["list"] = True
+        page.click("#bulk-shift-apply")
+        wait_until(page, lambda: len(held) == 1, "the reload after the lost answer")
+        page.locator("#bulk-shift-apply").click(force=True)  # a second press while the old rows show
+        page.wait_for_timeout(300)
+        assert actions() == ["shift"], f"a second press during the reload sent {actions()}"
+        for control in BAR_ACTIONS:
+            expect(page.locator(control)).to_be_disabled()
+        expect(toast).not_to_contain_text("check it")  # said once the list is back
+        hold["list"] = False
+        held.pop().continue_()
+        expect(toast).to_contain_text("The list was reloaded: check it before trying again.")
+        for control in BAR_ACTIONS[1:]:
+            expect(page.locator(control)).to_be_enabled()
+        for item in chosen:
+            saved = kyiv(detail(smoke, item["id"])["scheduled_time"])
+            assert saved == kyiv(item["scheduled_time"]) + timedelta(hours=1), f"post {item['id']} is at {saved}"
+            expect(row(page, item["id"]).locator(".time")).to_have_text(saved.strftime("%H:%M"))
+            expect(row(page, item["id"]).locator(".row-select")).to_be_checked()
+        expect(page.locator("#bulk-shift-apply")).to_be_focused()  # back on the button pressed
+
+        # The same, but the reload fails as well: the bar is free again, never stuck disabled.
+        hold["list"] = True
+        page.click("#bulk-shift-apply")
+        wait_until(page, lambda: len(held) == 1, "the second reload")
+        expect(page.locator("#bulk-delete")).to_be_disabled()
+        hold["list"] = False
+        held.pop().abort()
+        expect(toast).to_contain_text("Refresh the list and check it before trying again.")
+        for control in BAR_ACTIONS[1:]:
+            expect(page.locator(control)).to_be_enabled()
+        assert actions() == ["shift", "shift"], f"requests: {actions()}"
+        page.click("#bulk-clear")
+
+    # Undo (bulk restore) with its answer lost, while another post is selected: the bar waits too.
+    chosen, other = upcoming[38:40], upcoming[40]
+    with smoke.page(expect_failed_requests=True) as page:
+        watch(page)
+        toast = page.locator("#toast")
+        select_rows(page, [item["id"] for item in chosen])
+        with bulk_call(page):
+            page.click("#bulk-delete")
+        for item in chosen:
+            expect(row(page, item["id"])).to_have_count(0)
+        select_rows(page, [other["id"]])
+        expect(page.locator("#bulk-delete")).to_be_enabled()
+        wait_for_list(page)
+        hold["list"] = True
+        toast.locator(".undo").click()
+        wait_until(page, lambda: len(held) == 1, "the reload after the lost restore")
+        page.locator("#bulk-delete").click(force=True)
+        page.wait_for_timeout(300)
+        assert actions()[-2:] == ["delete", "restore"], f"a press during the reload sent {actions()[-1]!r}"
+        for control in BAR_ACTIONS:
+            expect(page.locator(control)).to_be_disabled()
+        hold["list"] = False
+        held.pop().continue_()
+        expect(toast).to_contain_text("The list was reloaded: check it before trying again.")
+        expect(page.locator("#bulk-delete")).to_be_enabled()
+        for item in chosen:
+            expect(row(page, item["id"])).to_have_count(1)
+        expect(row(page, other["id"]).locator(".row-select")).to_be_checked()
+        page.click("#bulk-clear")
+    for item in (*chosen, other):
+        assert detail(smoke, item["id"])["status"] == "scheduled", f"post {item['id']} is not scheduled"
+
+
+def check_bulk_unreadable_answer_reloads(smoke: Smoke):
+    """A 2xx whose body breaks off (the connection dropped mid-answer) means the server acted but
+    the page cannot tell how: like no answer, the list is reloaded and the page says to check it,
+    instead of offering to try again."""
+    upcoming = [item for item in first_page(smoke) if not item["overdue"]]
+    chosen = upcoming[41:43]
+    sent: list[dict] = []
+
+    def cut_off(route):
+        body = route.request.post_data_json
+        if body["action"] != "shift":
+            route.continue_()
+            return
+        sent.append(body)
+        text = route.fetch().text()  # the server applies it...
+        # ...and only the first half of its JSON answer arrives.
+        route.fulfill(status=200, content_type="application/json", body=text[: len(text) // 2])
+
+    with smoke.page(expect_failed_requests=True) as page:
+        page.route(lambda url: urlsplit(url).path == "/api/posts/bulk", cut_off)
+        select_rows(page, [item["id"] for item in chosen])
+        page.fill("#bulk-shift-amount", "1")
+        page.select_option("#bulk-shift-unit", "hours")
+        page.click("#bulk-shift-apply")
+        toast = page.locator("#toast")
+        expect(toast).to_contain_text("The list was reloaded: check it before trying again.")
+        expect(toast).not_to_contain_text("Try again")
+        for item in chosen:
+            saved = kyiv(detail(smoke, item["id"])["scheduled_time"])
+            assert saved == kyiv(item["scheduled_time"]) + timedelta(hours=1), f"post {item['id']} is at {saved}"
+            expect(row(page, item["id"]).locator(".time")).to_have_text(saved.strftime("%H:%M"))
+            expect(row(page, item["id"]).locator(".row-select")).to_be_checked()
+        expect(page.locator("#bulk-shift-apply")).to_be_enabled()
+        page.wait_for_timeout(300)
+        assert len(sent) == 1, f"{len(sent)} shift requests were sent"
+        page.click("#bulk-clear")
+
+
+def check_shift_amount_ignores_wheel(smoke: Smoke):
+    """The mouse wheel over the focused shift amount (the board's only number field) never changes
+    the number; the page scrolls instead."""
+    with smoke.page() as page:
+        select_rows(page, row_ids(page)[:1])
+        amount = page.locator("#bulk-shift-amount")
+        amount.fill("3")
+        expect(amount).to_be_focused()
+        box = amount.bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        for delta in (-100, -100, 100, -100):
+            page.mouse.wheel(0, delta)
+            page.wait_for_timeout(100)
+        expect(amount).to_have_value("3")
+        expect(page.locator("#bulk-shift-apply")).to_be_enabled()
+        page.click("#bulk-clear")
+
+
 def check_signout_post_succeeds(smoke: Smoke):
     """Sign-out is a fetch POST from the page; the server's Origin check must accept it."""
     with smoke.page() as page:
@@ -2277,6 +2665,7 @@ CHECKS = [
     check_panel_layout,
     check_time_is_kyiv_not_browser_zone,  # needs the seeded earliest post at 10:00
     check_caption_bold_round_trip,
+    check_caption_shortcuts_on_other_layouts,
     check_formatted_caption_keeps_entities,
     check_invalid_tag_blocks_save,
     check_literal_angle_and_ampersand,
@@ -2286,8 +2675,10 @@ CHECKS = [
     check_post_now_sets_one_minute_ahead,
     check_failed_retry,
     check_conflict_reloads_panel,
+    check_unschedule_hint_by_status,
     check_replace_media_and_as_file,
     check_replace_media_on_post_with_missing_file,
+    check_send_as_file_starts_from_the_post,
     check_write_in_flight_keeps_panel,
     check_album_media_read_only,
     check_read_only_panel,
@@ -2298,6 +2689,7 @@ CHECKS = [
     # the shift check on they change posts, each picking posts no earlier check needs.
     check_bulk_select_shows_bar,
     check_bulk_bar_first_in_tab_order,
+    check_shift_amount_ignores_wheel,
     check_keyboard_open_and_focus_return,
     check_mobile_layout,
     check_bulk_selection_capped_at_500,
@@ -2309,9 +2701,12 @@ CHECKS = [
     check_bulk_move_to_channel,
     check_single_delete_and_undo,
     check_undo_shortcut,
+    check_undo_shortcut_on_other_layouts,
     check_keyboard_row_delete_focus,
     check_bulk_delete_and_undo,
     check_bulk_unknown_outcome_reloads,
+    check_bulk_bar_waits_for_the_reload,
+    check_bulk_unreadable_answer_reloads,
 ]
 # Sign-out ends the session, so it runs after everything else, before the error tally.
 FINAL_CHECKS = [check_signout_post_succeeds, check_no_js_errors]

@@ -10,6 +10,7 @@
 // left (a pending post whose time has passed returns to Queued), so the list and the
 // counts are fetched again after it.
 import { ApiError, sendJson } from './api.js';
+import { shortcutLetter } from './keys.js';
 import {
   TAB_OF_STATUS, activeChannels, announce, findRow, loadMe, make, refreshAll, removeRow, rowItem, rowLabel,
   selectedTab, showToast,
@@ -33,6 +34,7 @@ const NON_TEXT_INPUTS = new Set(['button', 'checkbox', 'color', 'file', 'image',
 
 let moveChoicesKey = '';
 let undoButton = null; // the Undo of the toast shown last; Ctrl+Z presses it while it is up
+let reloadsAfterUnknown = 0; // reloads after an unknown outcome still running; the bar waits for them
 
 function posts(count) {
   return `${count} ${count === 1 ? 'post' : 'posts'}`;
@@ -47,26 +49,42 @@ function quietFailure(error) {
   return error.name === 'AbortError' || error.status === 401; // 401: the signed-out view says it all
 }
 
-// No answer, or a server error: the server commits post by post, so some posts may
-// have changed before it failed, and the page cannot tell which.
+// No answer, a server error, or an answer that broke off: the server commits post by
+// post, so some posts may have changed (after a 2xx, all of them may have), and the
+// page cannot tell which.
 function outcomeUnknown(error) {
-  return error instanceof ApiError && (error.status === 0 || error.status >= 500);
+  return error instanceof ApiError && (error.status === 0 || error.status >= 500 || error.unreadable);
 }
 
 // After a bulk call with an unknown outcome: show what is stored now instead of the
 // rows as they were, and say so, so the person checks before trying again. Nothing is
-// sent again; the selection keeps the rows still shown.
+// sent again; the selection keeps the rows still shown. Until the reload has finished
+// and the message is up, the bar stays disabled, so nothing can be sent from the rows
+// as they were (a second Shift would move the posts twice as far). It is freed however
+// the reload ends.
 async function reloadAfterUnknown(error, action, count, atLeast = 0) {
-  const reason = error.status === 0
-    ? 'The board could not be reached'
-    : `The board ran into an error (error ${error.status})`;
-  const done = DONE_WORDS[action];
-  const maybe = count === 1 ? `the post may or may not have been ${done}` : `some posts may have been ${done} and some not`;
-  const fresh = await refreshAll({ atLeast });
-  const check = fresh
-    ? 'The list was reloaded: check it before trying again.'
-    : 'Refresh the list and check it before trying again.';
-  showToast(`${reason}, so ${maybe}. ${check}`);
+  reloadsAfterUnknown += 1;
+  renderBar();
+  try {
+    let reason = `The board ran into an error (error ${error.status})`;
+    if (error.status === 0) reason = 'The board could not be reached';
+    else if (error.unreadable) reason = "The board's answer did not arrive in full";
+    const done = DONE_WORDS[action];
+    const maybe = count === 1 ? `the post may or may not have been ${done}` : `some posts may have been ${done} and some not`;
+    let fresh = false;
+    try {
+      fresh = await refreshAll({ atLeast });
+    } catch (reloadError) {
+      console.error(reloadError); // a bug in this page; the person is still told to check
+    }
+    const check = fresh
+      ? 'The list was reloaded: check it before trying again.'
+      : 'Refresh the list and check it before trying again.';
+    showToast(`${reason}, so ${maybe}. ${check}`);
+  } finally {
+    reloadsAfterUnknown -= 1;
+    renderBar();
+  }
 }
 
 function setText(node, text) {
@@ -179,7 +197,7 @@ function renderBar() {
   el.bulkBar.hidden = count === 0;
   document.body.classList.toggle('has-selection', count > 0);
   if (count === 0) return;
-  const busy = state.bulkBusy !== '';
+  const busy = state.bulkBusy !== '' || reloadsAfterUnknown > 0;
   setText(el.bulkCount, `${count} selected`);
   // At the limit the button says so, instead of offering more.
   const full = count >= BULK_MAX;
@@ -216,10 +234,11 @@ function focusAfterBar(preferred = null) {
 // Run one bulk action on the selection. `after(doneIds)` brings the list up to date and
 // returns what to say about the posts that changed ('' for none). Posts the server
 // skipped are listed in the summary with its reasons; the rest of the batch stands.
-// A 400 changed nothing, so the selection stays for another try; after no answer or a
-// server error the list is reloaded first (see reloadAfterUnknown).
+// A 400 changed nothing, so the selection stays for another try; after no answer, a
+// server error or an answer that broke off the list is reloaded first, and the bar
+// stays disabled until that is done (see reloadAfterUnknown).
 async function runBulk(action, extra, after) {
-  if (state.bulkBusy || state.selected.size === 0 || state.signedOut) return;
+  if (state.bulkBusy || reloadsAfterUnknown > 0 || state.selected.size === 0 || state.signedOut) return;
   const items = new Map(state.selected);
   const ids = [...items.keys()];
   const pressed = document.activeElement; // disabled while the call is out, which drops its focus
@@ -230,11 +249,14 @@ async function runBulk(action, extra, after) {
   try {
     ({ results } = await sendJson('/api/posts/bulk', 'POST', { action, ids, ...extra }));
   } catch (error) {
-    state.bulkBusy = '';
-    renderBar();
-    if (quietFailure(error)) return;
-    if (outcomeUnknown(error)) await reloadAfterUnknown(error, action, ids.length);
-    else showToast(errorMessage(error));
+    try {
+      if (quietFailure(error)) return;
+      if (outcomeUnknown(error)) await reloadAfterUnknown(error, action, ids.length);
+      else showToast(errorMessage(error));
+    } finally {
+      state.bulkBusy = ''; // only now: the old rows are gone and the person was told to check
+      renderBar();
+    }
     // Focus goes back to the button pressed while the bar is still up.
     if (!el.bulkBar.hidden && el.bulkBar.contains(pressed) && !pressed.disabled && focusLost()) pressed.focus();
     else focusAfterBar();
@@ -353,9 +375,11 @@ function typingIn(node) {
 }
 
 // Ctrl+Z / Cmd+Z while an Undo toast is up, unless focus is in a field that has its own
-// undo (the caption editor, say) or takes typing.
+// undo (the caption editor, say) or takes typing. On any keyboard layout: Ctrl+Я on the
+// Ukrainian one is the same key (keys.js). Held down, it presses Undo once: the button
+// is disabled from the first press on.
 function onUndoShortcut(event) {
-  if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || event.key.toLowerCase() !== 'z') return;
+  if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey || shortcutLetter(event) !== 'z') return;
   if (!undoButton || !undoButton.isConnected || undoButton.disabled || el.toast.hidden) return;
   if (typingIn(document.activeElement)) return;
   event.preventDefault();
@@ -466,6 +490,12 @@ export function bindActions() {
   el.bulkShiftAmount.addEventListener('keydown', (event) => {
     if (event.key === 'Enter') bulkShift();
   });
+  // A wheel turned over the focused amount would change the number (Chromium steps a
+  // focused number field) without a look at it: the field lets go of focus instead, so
+  // the wheel scrolls the page and the number stays as typed.
+  el.bulkShiftAmount.addEventListener('wheel', () => {
+    if (document.activeElement === el.bulkShiftAmount) el.bulkShiftAmount.blur();
+  }, { passive: true });
   el.bulkShiftApply.addEventListener('click', bulkShift);
   el.bulkSummaryClose.addEventListener('click', hideSummary);
   el.bulkSummary.addEventListener('keydown', (event) => {

@@ -9,10 +9,13 @@ export function setSignedOutHandler(handler) {
 }
 
 export class ApiError extends Error {
-  constructor(status, message, body = null) {
+  constructor(status, message, body = null, { unreadable = false } = {}) {
     super(message);
     this.status = status; // 0 for a network failure
     this.body = body;     // the JSON error body, when there was one (a 409 carries `status`)
+    // A 2xx whose body could not be read (the connection dropped mid-answer, say): the
+    // server did act, but what it did is unknown.
+    this.unreadable = unreadable;
   }
 }
 
@@ -37,7 +40,8 @@ export async function request(path, options = {}) {
 }
 
 // The JSON answer of a request; anything else is an ApiError carrying the server's
-// message (for a 4xx) and its error body. `verb` words the message for a 5xx.
+// message (for a 4xx) and its error body. `verb` words the message for a 5xx. A 2xx
+// whose body cannot be read is an ApiError marked `unreadable`.
 export async function apiJson(path, options = {}, verb = 'load') {
   const response = await request(path, options);
   let body = null;
@@ -50,7 +54,7 @@ export async function apiJson(path, options = {}, verb = 'load') {
     const message = response.status >= 500 || !body || !body.message
       ? `The board could not ${verb} this (error ${response.status}). Try again.`
       : body.message;
-    throw new ApiError(response.status, message, body);
+    throw new ApiError(response.status, message, body, { unreadable: response.ok });
   }
   return body;
 }

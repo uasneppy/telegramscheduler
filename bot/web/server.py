@@ -66,6 +66,7 @@ _JS = "text/javascript; charset=utf-8"
 _STATIC_FILES = {
     "actions.js": _JS,
     "api.js": _JS,
+    "keys.js": _JS,
     "list.js": _JS,
     "main.js": _JS,
     "panel.js": _JS,

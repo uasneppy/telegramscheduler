@@ -24,7 +24,9 @@ export const state = {
   // The selected posts: id -> the list item as its row last showed it, in the order they
   // were selected. A refresh keeps it; another tab, channel or search clears it.
   selected: new Map(),
-  bulkBusy: '',      // the bulk action in flight ('delete', 'move_channel', 'shift'), else ''
+  // The bulk action in flight from the bar ('delete', 'move_channel', 'shift'), else ''.
+  // It stays set through the reload after an unknown outcome (actions.js).
+  bulkBusy: '',
   panel: null,       // the open edit panel (see openPanel); null while it is closed
   // Post id -> a counter bumped each time the board replaces the post's media. It
   // goes into thumbnail URLs: a thumbnail is cached for an hour under the post's
