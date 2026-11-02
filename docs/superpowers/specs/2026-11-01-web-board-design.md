@@ -68,7 +68,7 @@ bot/web/
 
 ### 3.2 Wiring
 
-- `main.py` `post_init`: after creating `PostScheduler`, call `start_web(application.bot, scheduler)`. It returns the `AppRunner`, or `None` when the board is off or could not start, and `post_init` keeps the result in `application.bot_data["web_runner"]`. `post_shutdown`: call `stop_web(runner)` before stopping the scheduler.
+- `main.py` `post_init`: after creating `PostScheduler`, if `config.WEB_BASE_URL` is set, import `bot.web.server` there and call `start_web(application.bot, scheduler)`; otherwise log "Web board disabled: WEB_BASE_URL is not set." and import nothing. `start_web` returns the `AppRunner`, or `None` when the board could not start, and `post_init` keeps the result (`None` when the board is off) in `application.bot_data["web_runner"]`. If `bot.web.server` cannot be imported (aiohttp missing) the error is logged and the bot carries on without the board. `post_shutdown`: if there is a runner, call `stop_web(runner)` before stopping the scheduler.
 - `start_web` creates an `aiohttp.web.AppRunner` + `TCPSite` on the running loop. The app holds a reference to the scheduler. Apart from the admin error reports (section 9), only the `/web` command handler sends Telegram messages.
 - If startup validation fails or the port is in use, the error is logged and the bot continues **without** the board. A web failure never prevents the bot from running.
 - `/web` is registered in `main.py` as a `CommandHandler`. It is always registered; when the board is not running it replies "The web board is not enabled on this server." When the board is running, `BotCommand("web", "Open the web board")` is added to the command menu and a line is added to `/help`.
@@ -92,6 +92,7 @@ Startup validation (the board is not started, with a logged reason, if any fails
 
 - Add `aiohttp` to `Dockerfile`, `requirements.txt`, `pyproject.toml`, the CI install line, and regenerate `uv.lock`: `aiohttp>=3.10,<4` in the Dockerfile, `pyproject.toml` and CI, `aiohttp==3.14.5` in `requirements.txt` and the lock file.
 - Pillow is already declared (`pyproject.toml`, `Dockerfile`) and is used for thumbnails.
+- With `WEB_BASE_URL` unset neither package is imported, so a deployment that does not use the board needs neither: only `bot.web.server` and `bot.web.api` import aiohttp, `main.py` imports `bot.web.server` only when the board is on, and `media.py` imports Pillow only inside the functions that decode an image. `tests/test_web_lazy_imports.py` proves it in a subprocess that refuses both imports.
 
 ### 3.5 Threading
 

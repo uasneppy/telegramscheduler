@@ -224,6 +224,9 @@ python main.py
 > [!TIP]
 > The bot does **not** read `.env` by itself. That file is only for Docker Compose. To reuse it for a native run, load it into your shell first: `set -a; source .env; set +a`.
 
+> [!NOTE]
+> `aiohttp` and `pillow` are used only by the optional [web board](#-web-board): `aiohttp` for its web server and `pillow` for its thumbnails. A bot that leaves `WEB_BASE_URL` unset never imports them and starts without them. Install them before you turn the board on. The Docker image already contains both.
+
 ### 4. Connect your first channel
 
 1. Open your bot in Telegram and send `/start`.
@@ -417,7 +420,7 @@ These open from **Schedule now**, `/schedule`, or the end of guided captioning.
 
 An optional page for working with your whole schedule in a browser instead of Telegram buttons. It runs inside the bot process and talks to the live scheduler, so what you change on the board is what the bot publishes, with no restart: moving or deleting a post moves or cancels its scheduled job.
 
-**It is off by default.** Until you set `WEB_BASE_URL` the bot opens no port, and `/web` only answers that the board is not enabled. With the board off the bot behaves as before; the only difference is that its database gains two small tables and one extra column on `posts`.
+**It is off by default.** Until you set `WEB_BASE_URL` the bot opens no port, and `/web` only answers that the board is not enabled. With the board off the bot behaves as before and does not import aiohttp or Pillow. The only differences are two small tables and one extra column on `posts` in its database, and a `/web` command that replies that the board is not enabled.
 
 ### What it does
 
@@ -433,7 +436,7 @@ Two limits to know about: album posts are view-only for media (caption, time, ch
 
 ### Enable it
 
-Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart:
+Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)):
 
 ```bash
 WEB_BASE_URL=https://board.example.com   # your public https address, no path
@@ -441,7 +444,7 @@ WEB_PORT=8080                            # optional, 8080 is the default
 ```
 
 ```bash
-docker compose up -d --build   # the image needs aiohttp, so rebuild after updating
+docker compose up -d --build   # the image contains aiohttp and Pillow; rebuild after updating
 docker compose logs bot        # "Web board listening on …", or the reason it did not start
 ```
 

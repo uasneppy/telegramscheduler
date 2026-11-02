@@ -478,7 +478,8 @@ def test_post_init_adds_web_menu_entry_only_when_board_started(main_module, monk
         return runner
 
     monkeypatch.setattr(main_module, "PostScheduler", FakeSchedulerService)
-    monkeypatch.setattr(main_module, "start_web", fake_start_web)
+    monkeypatch.setattr(config, "WEB_BASE_URL", BASE)
+    monkeypatch.setattr(server, "start_web", fake_start_web)  # post_init imports it from here when the board is on
     application = _application()
     asyncio.run(main_module.post_init(application))
 
@@ -487,16 +488,55 @@ def test_post_init_adds_web_menu_entry_only_when_board_started(main_module, monk
     assert "web" in application.bot.commands
     assert "help" in application.bot.commands
 
-    async def disabled(bot, scheduler):
+    async def could_not_start(bot, scheduler):
         return None
 
-    monkeypatch.setattr(main_module, "start_web", disabled)
+    monkeypatch.setattr(server, "start_web", could_not_start)
     application = _application()
     asyncio.run(main_module.post_init(application))
 
     assert application.bot_data["web_runner"] is None
     assert "web" not in application.bot.commands
     assert "start" in application.bot.commands
+
+
+def test_post_init_with_board_off_does_not_start_it(main_module, monkeypatch, caplog):
+    async def must_not_run(bot, scheduler):
+        raise AssertionError("start_web must not be called when WEB_BASE_URL is unset")
+
+    monkeypatch.setattr(main_module, "PostScheduler", FakeSchedulerService)
+    monkeypatch.setattr(config, "WEB_BASE_URL", None)
+    monkeypatch.setattr(server, "start_web", must_not_run)
+    application = _application()
+    with caplog.at_level(logging.INFO):
+        asyncio.run(main_module.post_init(application))
+
+    assert application.bot_data["web_runner"] is None
+    assert "web" not in application.bot.commands and "help" in application.bot.commands
+    assert "Web board disabled: WEB_BASE_URL is not set." in caplog.text
+
+
+def test_post_init_carries_on_when_the_web_server_module_cannot_be_imported(main_module, monkeypatch, caplog):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def refuse_server(name, *args, **kwargs):
+        if name == "bot.web.server":
+            raise ModuleNotFoundError("No module named 'aiohttp'", name="aiohttp")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(main_module, "PostScheduler", FakeSchedulerService)
+    monkeypatch.setattr(config, "WEB_BASE_URL", BASE)
+    monkeypatch.setattr(builtins, "__import__", refuse_server)
+    application = _application()
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(main_module.post_init(application))
+    monkeypatch.undo()
+
+    assert application.bot_data["web_runner"] is None
+    assert "web" not in application.bot.commands and "start" in application.bot.commands
+    assert "Web board not started" in caplog.text and "aiohttp" in caplog.text
 
 
 def test_post_shutdown_stops_board_before_scheduler(main_module, monkeypatch):
@@ -507,7 +547,7 @@ def test_post_shutdown_stops_board_before_scheduler(main_module, monkeypatch):
         assert stopping is runner
         events.append("web.stop")
 
-    monkeypatch.setattr(main_module, "stop_web", fake_stop_web)
+    monkeypatch.setattr(server, "stop_web", fake_stop_web)  # post_shutdown imports it from here
     application = _application()
     application.bot_data.update(web_runner=runner, scheduler=FakeSchedulerService(events=events))
     asyncio.run(main_module.post_shutdown(application))
@@ -515,7 +555,11 @@ def test_post_shutdown_stops_board_before_scheduler(main_module, monkeypatch):
     assert events == ["web.stop", "scheduler.stop"]
 
 
-def test_post_shutdown_without_board(main_module):
+def test_post_shutdown_without_board(main_module, monkeypatch):
+    async def must_not_run(stopping):
+        raise AssertionError("stop_web must not be called without a runner")
+
+    monkeypatch.setattr(server, "stop_web", must_not_run)
     events = []
     application = _application()
     application.bot_data.update(web_runner=None, scheduler=FakeSchedulerService(events=events))

@@ -27,7 +27,7 @@ from bot.handlers import (
 from bot.database import init_database
 from bot.scheduler import PostScheduler
 from bot.web.command import web_command
-from bot.web.server import start_web, stop_web
+import config
 from config import BOT_TOKEN, DATABASE_PATH, UPLOADS_DIR, ALLOWED_USER_IDS, ADMIN_CHAT_ID
 
 # Configure logging
@@ -66,9 +66,20 @@ async def post_init(application):
     # Store scheduler in application context
     application.bot_data['scheduler'] = scheduler
 
-    # Web board (opt-in via WEB_BASE_URL). start_web never raises: a board that
-    # cannot start is logged and the bot carries on without it (runner is None).
-    runner = await start_web(application.bot, scheduler)
+    # Web board (opt-in via WEB_BASE_URL). The web server module, and with it aiohttp,
+    # is imported only when the board is switched on, so a deployment without the board
+    # needs neither aiohttp nor Pillow. start_web never raises: a board that cannot
+    # start is logged and the bot carries on without it (runner is None).
+    runner = None
+    if config.WEB_BASE_URL:
+        try:
+            from bot.web.server import start_web
+        except ImportError as e:
+            logger.error(f"Web board not started: a required package is missing ({e}). Install aiohttp.")
+        else:
+            runner = await start_web(application.bot, scheduler)
+    else:
+        logger.info("Web board disabled: WEB_BASE_URL is not set.")
     application.bot_data['web_runner'] = runner
 
     # Register the command menu Telegram shows when the user types "/".
@@ -93,7 +104,11 @@ async def post_init(application):
 
 async def post_shutdown(application):
     """Shut the web board and the scheduler down cleanly when the application stops"""
-    await stop_web(application.bot_data.get('web_runner'))
+    runner = application.bot_data.get('web_runner')
+    if runner is not None:
+        # A runner exists only if post_init imported the web server module.
+        from bot.web.server import stop_web
+        await stop_web(runner)
     scheduler = application.bot_data.get('scheduler')
     if scheduler:
         scheduler.stop()

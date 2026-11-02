@@ -7,6 +7,8 @@ uploaded file may be written, so it is deliberately strict:
   regular file inside the real uploads folder;
 * thumbnails decode only JPEG, PNG and WebP (Pillow sniffs the content, not the
   extension) and refuse decompression bombs;
+* Pillow is imported only when a thumbnail is made, so a bot that runs without
+  the board (and the nightly cleanup) does not need it installed;
 * an upload's stored name is a fresh uuid plus a whitelisted extension, so no
   part of a client-supplied file name ever reaches the file system.
 
@@ -27,8 +29,6 @@ import uuid
 import warnings
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-
-from PIL import Image
 
 from bot.utils import (
     check_storage_quota,
@@ -140,13 +140,15 @@ def resolve_media_path(file_path: str | None) -> str | None:
 # -------------------------------------------------------------- thumbnails
 
 
-def _open_image(real_path: str) -> Image.Image:
-    """Open an image header; a decompression-bomb warning becomes an error.
+def _open_image(real_path: str):
+    """Open an image header (a PIL Image); a decompression-bomb warning becomes an error.
 
     Image.open() is where Pillow checks the pixel count (a warning past
     MAX_IMAGE_PIXELS, DecompressionBombError past twice that), before any pixel
     is decoded.
     """
+    from PIL import Image  # here, not at module level: see the module docstring
+
     with _OPEN_LOCK, warnings.catch_warnings():
         warnings.simplefilter("error", Image.DecompressionBombWarning)
         return Image.open(real_path, formats=_THUMB_FORMATS)
@@ -177,6 +179,8 @@ def get_thumbnail(file_path: str, width: int = 160) -> str | None:
     os.makedirs(THUMBS_DIR, exist_ok=True)
     temp = os.path.join(THUMBS_DIR, f"{key}.{uuid.uuid4().hex}.tmp")
     try:
+        from PIL import Image  # inside the try: without Pillow there is simply no thumbnail
+
         source = _open_image(real)
         try:
             source.thumbnail((width, width), Image.Resampling.LANCZOS)
