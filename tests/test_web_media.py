@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shutil
+import sys
 import time
 import warnings
 
@@ -306,6 +308,57 @@ def test_thumbnail_failures(tmp_path):
 
     # Nothing, not even a temp file, is left behind by the failures.
     assert os.listdir(THUMBS_DIR) == []
+
+
+def _block_pillow(monkeypatch):
+    """Make Pillow unimportable (import and find_spec both see it missing) and its warning due again."""
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    monkeypatch.setattr(media, "_pillow_warned", False)
+
+
+def _pillow_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_thumbnail_without_pillow_gives_none_and_warns_once(monkeypatch, caplog):
+    path = _make_image(_upload_path("whole.png"), size=(600, 600))
+    _block_pillow(monkeypatch)
+
+    assert media.pillow_available() is False
+    with caplog.at_level(logging.DEBUG):
+        assert get_thumbnail(path) is None
+        assert get_thumbnail(path) is None  # a second request: still no thumbnail, no second warning
+
+    assert _pillow_warnings(caplog) == [media.PILLOW_MISSING_WARNING]
+    assert "Pillow" in media.PILLOW_MISSING_WARNING and "pip install pillow" in media.PILLOW_MISSING_WARNING
+    assert os.listdir(THUMBS_DIR) == []  # nothing left behind
+
+
+def test_pillow_warning_is_shared_between_start_up_and_thumbnails(monkeypatch, caplog):
+    path = _make_image(_upload_path("whole.png"), size=(600, 600))
+    _block_pillow(monkeypatch)
+
+    with caplog.at_level(logging.INFO):
+        media.warn_pillow_missing()  # what start_web does
+        assert get_thumbnail(path) is None
+
+    assert _pillow_warnings(caplog) == [media.PILLOW_MISSING_WARNING]
+
+
+def test_other_thumbnail_failures_are_not_blamed_on_pillow(monkeypatch, caplog):
+    monkeypatch.setattr(media, "_pillow_warned", False)
+    corrupt = _upload_path("corrupt.jpg")
+    os.makedirs(os.path.dirname(corrupt), exist_ok=True)
+    with open(corrupt, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0 this is not a jpeg at all")
+
+    assert media.pillow_available() is True
+    with caplog.at_level(logging.DEBUG):
+        assert get_thumbnail(corrupt) is None
+        assert get_thumbnail(_upload_path("missing.jpg")) is None
+
+    assert _pillow_warnings(caplog) == []
+    assert media._pillow_warned is False
 
 
 def test_thumbnail_decompression_bomb(monkeypatch):

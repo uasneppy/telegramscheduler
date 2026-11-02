@@ -12,12 +12,12 @@ import textwrap
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Runs first in every subprocess: a finder in front of the normal ones that refuses the two packages.
-BLOCKER = textwrap.dedent(
+# Runs first in every subprocess: a finder in front of the normal ones that refuses the named packages.
+BLOCKER_TEMPLATE = textwrap.dedent(
     """
     import sys
 
-    BLOCKED = ("aiohttp", "PIL")
+    BLOCKED = __NAMES__
 
     class Blocker:
         def find_spec(self, name, path=None, target=None):
@@ -28,6 +28,13 @@ BLOCKER = textwrap.dedent(
     sys.meta_path.insert(0, Blocker())
     """
 )
+
+
+def blocker(*names):
+    return BLOCKER_TEMPLATE.replace("__NAMES__", repr(names))
+
+
+BLOCKER = blocker("aiohttp", "PIL")
 
 BOARD_OFF = BLOCKER + textwrap.dedent(
     """
@@ -115,3 +122,57 @@ def test_the_blocker_really_blocks_the_board_itself(tmp_path):
 
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip() == blocked, (module, result.stdout, result.stderr)
+
+
+# Only Pillow is missing and the board is on: it starts, and says so once.
+BOARD_ON_WITHOUT_PILLOW = blocker("PIL") + textwrap.dedent(
+    """
+    import asyncio
+    import io
+    import logging
+
+    stream = io.StringIO()
+    logging.basicConfig(stream=stream, level=logging.INFO, format="%(levelname)s %(message)s")
+
+    from bot.database import init_database
+    from bot.web.server import start_web, stop_web
+
+    init_database()
+
+    class Bot:
+        async def send_message(self, chat_id, text):
+            pass
+
+    class Scheduler:
+        async def schedule_single_post(self, post_id, scheduled_time):
+            pass
+
+        async def cancel_post_job(self, post_id):
+            pass
+
+    async def main():
+        runner = await start_web(
+            Bot(), Scheduler(), base_url="http://localhost:8080", host="127.0.0.1", port=0, allowed_user_ids={1}
+        )
+        assert runner is not None, stream.getvalue()
+        await stop_web(runner)
+
+    asyncio.run(main())
+
+    log = stream.getvalue().splitlines()
+    pillow = [line for line in log if "illow" in line]
+    assert pillow == [
+        "WARNING Pillow is not installed: web board thumbnails are disabled (pip install pillow)."
+    ], log
+    assert any("Web board listening" in line for line in log), log
+    assert "PIL" not in sys.modules
+    print("ok")
+    """
+)
+
+
+def test_board_on_without_pillow_warns_once_and_starts(tmp_path):
+    result = run_python(BOARD_ON_WITHOUT_PILLOW, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"

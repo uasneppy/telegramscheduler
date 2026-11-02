@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
 from datetime import timedelta
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import config
 from bot.database import Database
 from bot.scheduler import PostScheduler
 from bot.utils import get_current_kyiv_time
-from bot.web import auth, queries, server
+from bot.web import auth, media, queries, server
 from bot.web.auth import consume_login_token, create_login_token
 from bot.web.command import web_command
 from bot.web.housekeeping import purge_web_data
@@ -189,6 +190,60 @@ def test_start_stop_serves_index():
                 await session.get(f"http://127.0.0.1:{port}/")
 
     asyncio.run(scenario())
+
+
+def _start_and_stop(**kwargs):
+    """Start the board on a free port, check it answers, stop it; returns whether a runner came back."""
+    async def scenario():
+        runner = await start_web(FakeBot(), FakeScheduler(), host="127.0.0.1", port=0, **kwargs)
+        if runner is None:
+            return False
+        port = runner.addresses[0][1]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/") as response:
+                assert response.status == 200
+        await stop_web(runner)
+        return True
+
+    return asyncio.run(scenario())
+
+
+def _pillow_records(caplog):
+    return [r for r in caplog.records if "illow" in r.getMessage()]
+
+
+def test_start_web_warns_once_and_still_starts_when_pillow_is_missing(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    monkeypatch.setattr(media, "_pillow_warned", False)
+
+    with caplog.at_level(logging.INFO):
+        assert _start_and_stop(base_url="http://localhost:8080", allowed_user_ids={1}) is True
+
+    records = _pillow_records(caplog)
+    assert [(r.levelno, r.getMessage()) for r in records] == [(logging.WARNING, media.PILLOW_MISSING_WARNING)]
+    assert any("Web board listening" in r.getMessage() for r in caplog.records)  # non-fatal: it started
+
+
+def test_start_web_says_nothing_about_pillow_when_it_is_installed(monkeypatch, caplog):
+    monkeypatch.setattr(media, "_pillow_warned", False)
+
+    with caplog.at_level(logging.DEBUG):
+        assert _start_and_stop(base_url="http://localhost:8080", allowed_user_ids={1}) is True
+
+    assert _pillow_records(caplog) == []
+    assert media._pillow_warned is False
+
+
+def test_start_web_does_not_check_pillow_when_the_board_is_off_or_misconfigured(monkeypatch, caplog):
+    monkeypatch.setitem(sys.modules, "PIL", None)
+    monkeypatch.setattr(media, "_pillow_warned", False)
+    monkeypatch.setattr(config, "WEB_BASE_URL", None)
+
+    with caplog.at_level(logging.DEBUG):
+        assert _start() is None  # board off
+        assert _start(base_url=BASE, allowed_user_ids=set()) is None  # refused: empty allowlist
+
+    assert _pillow_records(caplog) == []
 
 
 def test_stop_web_accepts_none():

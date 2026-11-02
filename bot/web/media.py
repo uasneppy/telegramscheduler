@@ -8,7 +8,10 @@ uploaded file may be written, so it is deliberately strict:
 * thumbnails decode only JPEG, PNG and WebP (Pillow sniffs the content, not the
   extension) and refuse decompression bombs;
 * Pillow is imported only when a thumbnail is made, so a bot that runs without
-  the board (and the nightly cleanup) does not need it installed;
+  the board (and the nightly cleanup) does not need it installed. With the board
+  on and Pillow missing, the board still runs, without thumbnails: `start_web`
+  warns about it at start-up, and a thumbnail request does if nothing has yet
+  (one warning per process in all);
 * an upload's stored name is a fresh uuid plus a whitelisted extension, so no
   part of a client-supplied file name ever reaches the file system.
 
@@ -19,6 +22,7 @@ Everything here blocks (disk, Pillow). Callers run `get_thumbnail`,
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -63,12 +67,35 @@ _FLUSH_BYTES = 256 * 1024
 
 _EXTENSION = re.compile(r"\.[a-z0-9]{1,9}")
 
+PILLOW_MISSING_WARNING = "Pillow is not installed: web board thumbnails are disabled (pip install pillow)."
+# The warning is logged once per process, whether the start-up check or a thumbnail request finds the gap first.
+_pillow_warning_lock = threading.Lock()
+_pillow_warned = False
+
 
 def _remove_quietly(path: str) -> None:
     try:
         os.remove(path)
     except OSError:
         pass
+
+
+def pillow_available() -> bool:
+    """Whether Pillow can be imported; looked up without importing it."""
+    try:
+        return importlib.util.find_spec("PIL") is not None
+    except ImportError:  # the import system itself refused the lookup
+        return False
+
+
+def warn_pillow_missing() -> None:
+    """Log PILLOW_MISSING_WARNING at WARNING, the first time only in this process."""
+    global _pillow_warned
+    with _pillow_warning_lock:
+        if _pillow_warned:
+            return
+        _pillow_warned = True
+    logger.warning(PILLOW_MISSING_WARNING)
 
 
 # ------------------------------------------------------------------ items
@@ -192,6 +219,10 @@ def get_thumbnail(file_path: str, width: int = 160) -> str | None:
         finally:
             source.close()
         os.replace(temp, cached)
+    except ImportError:  # Pillow is missing (or not usable): not a problem with this one file
+        _remove_quietly(temp)
+        warn_pillow_missing()
+        return None
     except Exception as exc:  # corrupt data raises many types; any failure means "no thumbnail"
         logger.debug("No thumbnail for %s: %s: %s", real, type(exc).__name__, exc)
         _remove_quietly(temp)

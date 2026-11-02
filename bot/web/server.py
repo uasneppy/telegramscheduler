@@ -46,7 +46,7 @@ from aiohttp.http_exceptions import HttpProcessingError
 from aiohttp.web_protocol import RequestPayloadError
 
 import config
-from bot.web import api, auth, queries
+from bot.web import api, auth, media, queries
 from bot.web.errors import WebError, not_found
 from bot.web.service import SchedulerLike
 from bot.web.settings import origin_of, validate_web_config
@@ -495,6 +495,11 @@ async def start_web(
     if problem:
         logger.error("Web board not started: %s", problem)
         return None
+
+    # Pillow only makes the board's thumbnails: without it the board still runs, so this warns
+    # (once) and carries on, and nothing is said when it is installed.
+    if not media.pillow_available():
+        media.warn_pillow_missing()
 
     runner = None
     try:
