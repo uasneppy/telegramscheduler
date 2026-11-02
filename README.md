@@ -595,7 +595,7 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "pillow>=11.3.0" "aiohttp>=3.10,<4" pytest
 
 python -m compileall -q main.py config.py bot/   # compile check
-pytest tests/ -q                                 # 396 tests, no network needed
+pytest tests/ -q                                 # 400 tests, no network needed
 docker build -t telegram-scheduler:dev .         # image build
 ```
 
