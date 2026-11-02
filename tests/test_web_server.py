@@ -267,6 +267,16 @@ def test_login_origin_compares_normalized_base_url():
     asyncio.run(scenario())
 
 
+def test_login_origin_accepts_punycode_of_unicode_base_url():
+    # Browsers send an international host in its punycode form.
+    async def scenario():
+        async with app_client(_app(base_url="https://пример.укр")) as client:
+            response = await sign_in(client, 1, "https://xn--e1afmkfd.xn--j1amh")
+            assert response.status == 303
+
+    asyncio.run(scenario())
+
+
 def test_login_user_not_allowed():
     async def scenario():
         async with app_client(_app(allowed={1})) as client:
