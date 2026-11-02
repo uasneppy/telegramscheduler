@@ -243,7 +243,7 @@ All configuration comes from environment variables, which are read in [`config.p
 |---|---|---|---|
 | `BOT_TOKEN` | **yes** | — | Bot token from @BotFather. Docker Compose refuses to start without it. |
 | `ALLOWED_USER_IDS` | strongly recommended | *(empty)* | Comma-separated numeric Telegram user IDs allowed to use the bot, e.g. `123456789,987654321`. **If empty, anyone who finds the bot can use it** (a warning is logged at startup). A non-numeric entry stops startup with an error. |
-| `ADMIN_CHAT_ID` | no | *(unset)* | Chat (e.g. your own user ID) that receives the last 1,500 characters of the traceback for any unhandled error. When unset, errors only go to the log. |
+| `ADMIN_CHAT_ID` | no | *(unset)* | Chat (e.g. your own user ID) that receives the last 1,500 characters of the traceback for any unhandled error. [Web board](#-web-board) errors answered with `500` go there too, rate limited to one message per 30 seconds. When unset, errors only go to the log. |
 | `DATA_DIR` | no | `/data` | Directory for `bot_data.db` and `uploads/`. The Dockerfile sets it to `/data`. Set it to a writable path when running natively. |
 | `MAX_USER_STORAGE_MB` | no | `2048` | Per-user quota for stored media, in MB. `0` = unlimited. A non-integer value falls back to `2048`. |
 | `TELEGRAM_CHANNEL_ID` | no | *(unset)* | Legacy. `config.py` still reads it, but nothing uses it: channels are managed per user via `/channels`. |
@@ -436,7 +436,7 @@ Two limits to know about: album posts are view-only for media (caption, time, ch
 
 ### Enable it
 
-Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)). The lines below work in both places: Docker Compose reads `export` lines in `.env` too.
+Set `WEB_BASE_URL` in `.env` (or the environment of a native run) and restart. A native run needs `aiohttp` and `pillow` installed first (see [Run natively](#3b-run-natively)); if only Pillow is missing, the bot logs a warning at startup and the board runs without thumbnails. The lines below work in both places: Docker Compose reads `export` lines in `.env` too.
 
 ```bash
 export WEB_BASE_URL=https://board.example.com   # your public https address, no path
@@ -595,7 +595,7 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install "python-telegram-bot==20.8" "apscheduler>=3.11.0" "pytz>=2025.2" "pillow>=11.3.0" "aiohttp>=3.10,<4" pytest
 
 python -m compileall -q main.py config.py bot/   # compile check
-pytest tests/ -q                                 # 411 tests, no network needed
+pytest tests/ -q                                 # 453 tests, no network needed
 docker build -t telegram-scheduler:dev .         # image build
 ```
 

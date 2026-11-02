@@ -1,7 +1,7 @@
 # Web board for the Telegram scheduler bot - design
 
 - **Date:** 2026-11-01
-- **Status:** draft, awaiting review
+- **Status:** implemented and merged (PR #7)
 - **Scope:** sub-project 1 of a larger "control everything from the web" effort: the web foundation plus the **posts board** (view, edit, delete).
 
 ## 1. Goal and success criteria
@@ -114,7 +114,7 @@ Startup validation (the board is not started, with a logged reason, if any fails
 - **Allowlist re-check:** the session middleware verifies on every request that the session's user is still in `ALLOWED_USER_IDS`. Once the bot has restarted with the user removed from the env, their next request gets `403` even with a valid session, so no session needs to be revoked.
 - **Per-user scoping:** `user_id` comes only from the session. Every post id and channel id from the browser is ownership-checked in `service.py` (including the target channel of a move). A post that belongs to someone else and a post that does not exist both return `404`.
 - **CSRF:** every non-GET request must carry an `Origin` header equal to the origin of `WEB_BASE_URL`, and every non-GET `/api` request must also carry the custom header `X-Board: 1` (not settable cross-site without a CORS preflight, which the server never grants). `SameSite=Lax` is the third layer.
-- **XSS:** caption previews are produced server-side (`captions.py`): all text is HTML-escaped, only the tags `b i u s code pre a blockquote br span` are emitted (`br` stands for a newline outside `pre`; `span` carries `class="tg-spoiler"` for spoilers and `class="tg-emoji"` for custom emoji; links get `rel="noopener noreferrer" target="_blank"`), and `href` is restricted to `http`, `https`, `tg`. The front end writes API strings with `textContent` / `setAttribute`, never `innerHTML` on raw data. Strict headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on `/api`.
+- **XSS:** caption previews are produced server-side (`captions.py`): all text is HTML-escaped, only the tags `b i u s code pre a blockquote br span` are emitted (`br` stands for a newline outside `pre`; `span` carries `class="tg-spoiler"` for spoilers and `class="tg-emoji"` for custom emoji; an expandable blockquote is `<blockquote class="tg-expandable">`; links get `rel="noopener noreferrer" target="_blank"`), and `href` is restricted to `http`, `https`, `tg`. The front end writes API strings with `textContent` / `setAttribute`, never `innerHTML` on raw data. Strict headers on every response: `Content-Security-Policy: default-src 'self'; img-src 'self' data:; media-src 'self'; script-src 'self'; style-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on `/api`.
 - **Media serving:** by post id only, never by client-supplied path. The resolved real path must lie inside the real `UPLOADS_DIR`, otherwise `404`. Only a fixed set of image, video and audio content types is served inline; everything else (documents, HTML, SVG) is sent with `Content-Disposition: attachment`, and every media response carries `Content-Security-Policy: sandbox`, so an uploaded HTML or SVG file can never run script on the board's origin.
 - **Brute force:** failed token attempts are limited globally to 20 per 5 minutes (`429` beyond). Tokens are 256-bit, so this is a guardrail rather than the defense.
 - **Logging:** the aiohttp access log is disabled or redacted so `?t=` never reaches logs. Every state-changing request is logged (user id, action, post ids).
@@ -323,7 +323,9 @@ The publish path itself is unchanged, so it is covered by the existing behaviour
 
 ## 13. Open items to settle in the implementation plan
 
-1. **Auto-detected entities:** the carry-over rule in 6.5 preserves them regardless of how Telegram treats explicit entities. If a real-bot check shows Telegram re-detects them anyway, the carry-over can be simplified.
-2. **Photo size fallback:** confirm the exact threshold at which a photo is stored as `document` (Telegram's photo-send limit) against the Bot API docs when writing `media.py`.
-3. **aiohttp pin and `uv.lock`:** choose the exact version and regenerate the lock file.
-4. **Thumbnail cache cleanup:** the 14-day purge in the 03:00 job is the initial policy; adjust if the cache grows noticeably.
+All four were settled in the implementation:
+
+1. **Auto-detected entities:** resolved: the carry-over rule in 6.5 is implemented (`captions._carried_entities`) and preserves them regardless of how Telegram treats explicit entities. Whether Telegram would re-detect them anyway was not checked against a real bot; if it does, the carry-over could be simplified.
+2. **Photo size fallback:** resolved: a photo above 10 MB (`PHOTO_MAX_BYTES`, Telegram's photo limit) is stored as `document` (6.6).
+3. **aiohttp pin and `uv.lock`:** resolved: `aiohttp==3.14.5` in `requirements.txt` and `uv.lock`, `aiohttp>=3.10,<4` elsewhere (3.4).
+4. **Thumbnail cache cleanup:** resolved: the 03:00 job purges cached thumbnails older than 14 days (`media.purge_old_thumbnails`, section 5).
