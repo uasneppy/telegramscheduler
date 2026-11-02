@@ -7,6 +7,7 @@ import re
 import socket
 import sys
 import time
+import types
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -232,6 +233,50 @@ def test_start_web_says_nothing_about_pillow_when_it_is_installed(monkeypatch, c
 
     assert _pillow_records(caplog) == []
     assert media._pillow_warned is False
+
+
+def test_start_web_still_starts_with_a_stub_pil_module(monkeypatch, caplog):
+    # A stand-in PIL module without a spec (a test double, a half-removed install): find_spec
+    # raises ValueError for it instead of answering, which must not stop the board either.
+    stub = types.ModuleType("PIL")
+    assert stub.__spec__ is None
+    monkeypatch.setitem(sys.modules, "PIL", stub)
+    monkeypatch.setattr(media, "_pillow_warned", False)
+
+    assert media.pillow_available() is False
+    with caplog.at_level(logging.INFO):
+        assert _start_and_stop(base_url="http://localhost:8080", allowed_user_ids={1}) is True
+
+    records = _pillow_records(caplog)
+    assert [(r.levelno, r.getMessage()) for r in records] == [(logging.WARNING, media.PILLOW_MISSING_WARNING)]
+
+
+def test_start_web_runner_shuts_down_within_dockers_grace_period(monkeypatch):
+    # `docker stop` kills the container 10 s after SIGTERM. The runner waits for open
+    # connections at most 5 s (aiohttp's default is 60 s), so post_shutdown still reaches
+    # scheduler.stop() in time.
+    created = []
+    real_runner = server.web.AppRunner
+
+    def recording_runner(app, **kwargs):
+        created.append(kwargs)
+        return real_runner(app, **kwargs)
+
+    monkeypatch.setattr(server.web, "AppRunner", recording_runner)
+
+    async def scenario():
+        runner = await start_web(
+            FakeBot(), FakeScheduler(),
+            base_url="http://localhost:8080", host="127.0.0.1", port=0, allowed_user_ids={1},
+        )
+        assert runner is not None
+        try:
+            return runner._shutdown_timeout  # what runner.cleanup() waits for open connections
+        finally:
+            await stop_web(runner)
+
+    assert asyncio.run(scenario()) == 5
+    assert created == [{"access_log": None, "shutdown_timeout": 5}]
 
 
 def test_start_web_does_not_check_pillow_when_the_board_is_off_or_misconfigured(monkeypatch, caplog):
@@ -592,6 +637,53 @@ def test_post_init_carries_on_when_the_web_server_module_cannot_be_imported(main
     assert application.bot_data["web_runner"] is None
     assert "web" not in application.bot.commands and "start" in application.bot.commands
     assert "Web board not started" in caplog.text and "aiohttp" in caplog.text
+
+
+def _board_start_errors(caplog):
+    return [r for r in caplog.records if r.levelno == logging.ERROR and "Web board not started" in r.getMessage()]
+
+
+def test_post_init_carries_on_when_start_web_raises(main_module, monkeypatch, caplog):
+    # Spec 3.2: starting the board never stops the bot. An exception out of post_init would
+    # make python-telegram-bot exit, and the container would restart in a loop.
+    async def broken(bot, scheduler):
+        raise RuntimeError("the board broke while starting")
+
+    monkeypatch.setattr(main_module, "PostScheduler", FakeSchedulerService)
+    monkeypatch.setattr(config, "WEB_BASE_URL", BASE)
+    monkeypatch.setattr(server, "start_web", broken)
+    application = _application()
+    with caplog.at_level(logging.INFO):
+        asyncio.run(main_module.post_init(application))
+
+    assert application.bot_data["web_runner"] is None
+    assert "web" not in application.bot.commands and "start" in application.bot.commands
+    errors = _board_start_errors(caplog)
+    assert len(errors) == 1 and errors[0].exc_info and errors[0].exc_info[0] is RuntimeError  # with its traceback
+
+
+def test_post_init_carries_on_when_the_web_server_module_fails_to_load(main_module, monkeypatch, caplog):
+    # Not a missing package: the module itself raises while it is imported.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken_server(name, *args, **kwargs):
+        if name == "bot.web.server":
+            raise RuntimeError("module code broke")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(main_module, "PostScheduler", FakeSchedulerService)
+    monkeypatch.setattr(config, "WEB_BASE_URL", BASE)
+    application = _application()
+    with caplog.at_level(logging.INFO), monkeypatch.context() as patch:
+        patch.setattr(builtins, "__import__", broken_server)
+        asyncio.run(main_module.post_init(application))
+
+    assert application.bot_data["web_runner"] is None
+    assert "web" not in application.bot.commands and "start" in application.bot.commands
+    errors = _board_start_errors(caplog)
+    assert len(errors) == 1 and errors[0].exc_info and errors[0].exc_info[0] is RuntimeError
 
 
 def test_post_shutdown_stops_board_before_scheduler(main_module, monkeypatch):

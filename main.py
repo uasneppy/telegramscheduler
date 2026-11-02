@@ -68,16 +68,19 @@ async def post_init(application):
 
     # Web board (opt-in via WEB_BASE_URL). The web server module, and with it aiohttp,
     # is imported only when the board is switched on, so a deployment without the board
-    # needs neither aiohttp nor Pillow. start_web never raises: a board that cannot
-    # start is logged and the bot carries on without it (runner is None).
+    # needs neither aiohttp nor Pillow. Starting the board never stops the bot (spec 3.2):
+    # a board that cannot start, for whatever reason, is logged and the bot carries on
+    # without it (runner is None). An exception out of post_init would make
+    # python-telegram-bot exit, and the container would restart in a loop.
     runner = None
     if config.WEB_BASE_URL:
         try:
             from bot.web.server import start_web
+            runner = await start_web(application.bot, scheduler)
         except ImportError as e:
             logger.error(f"Web board not started: a required package is missing ({e}). Install aiohttp.")
-        else:
-            runner = await start_web(application.bot, scheduler)
+        except Exception:
+            logger.exception("Web board not started: it failed while starting; the bot carries on without it")
     else:
         logger.info("Web board disabled: WEB_BASE_URL is not set.")
     application.bot_data['web_runner'] = runner

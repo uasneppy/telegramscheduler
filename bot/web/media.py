@@ -84,7 +84,9 @@ def pillow_available() -> bool:
     """Whether Pillow can be imported; looked up without importing it."""
     try:
         return importlib.util.find_spec("PIL") is not None
-    except ImportError:  # the import system itself refused the lookup
+    except (ImportError, ValueError):
+        # ImportError: the import system itself refused the lookup. ValueError: a PIL
+        # module without a spec is already loaded (a stand-in, not the real package).
         return False
 
 

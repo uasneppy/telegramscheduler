@@ -466,6 +466,11 @@ def _admin_reporter(bot: _AdminBot, chat_id, clock: Callable[[], float] = time.m
 
 # --- start / stop -------------------------------------------------------------------
 
+# How long stopping the board waits for open requests to finish (aiohttp's default is 60 s).
+# `docker stop` kills the container 10 s after SIGTERM, and post_shutdown stops the
+# scheduler only after the board, so the board's share has to stay well inside that.
+SHUTDOWN_TIMEOUT_SECONDS = 5
+
 
 async def start_web(
     bot: _AdminBot,
@@ -509,7 +514,7 @@ async def start_web(
             scheduler, base_url, allowed_user_ids,
             on_error=_admin_reporter(bot, chat_id) if chat_id else None,
         )
-        runner = web.AppRunner(app, access_log=None)
+        runner = web.AppRunner(app, access_log=None, shutdown_timeout=SHUTDOWN_TIMEOUT_SECONDS)
         await runner.setup()
         await web.TCPSite(runner, host, port).start()
     except Exception as exc:
