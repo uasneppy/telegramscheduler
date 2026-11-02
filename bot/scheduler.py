@@ -611,21 +611,31 @@ class PostScheduler:
                     job = self.scheduler.get_job(job_id)
                     
                     if not job:
-                        # Check how many times this post has already been rescheduled
+                        # Check how many times this post has already been rescheduled.
+                        # The list above may be stale: the web board (which writes from
+                        # other threads) or the post's own job can have deleted,
+                        # unscheduled or claimed the post since. Every write below is
+                        # conditional on the post still being pending with a time, and
+                        # 0 here means it no longer is - leave it as it is.
                         current_retry = Database.increment_retry_count(post_id)
                         max_monitor_reschedules = 5
 
-                        if current_retry > max_monitor_reschedules:
+                        if current_retry == 0:
+                            logger.info(f"Post {post_id} changed since the overdue check - leaving it alone")
+                        elif current_retry > max_monitor_reschedules:
                             # Post is stuck in a loop - give up and mark as failed
                             logger.error(
                                 f"Post {post_id} has been rescheduled {current_retry} times without posting. "
                                 f"Marking as failed to stop infinite loop."
                             )
-                            Database.mark_post_as_failed(
+                            failed = Database.fail_overdue_post(
                                 post_id,
                                 f"Exceeded max reschedule attempts ({max_monitor_reschedules}). "
                                 f"Post fired but was never marked as sent — check file path and channel access."
                             )
+                            if not failed:
+                                logger.info(f"Post {post_id} changed since the overdue check - not marked failed")
+                                continue
                             try:
                                 await self.bot.send_message(
                                     chat_id=user_id,
@@ -645,10 +655,15 @@ class PostScheduler:
                                 f"(attempt {current_retry}/{max_monitor_reschedules})"
                             )
 
-                            # Schedule immediately with a small delay
+                            # Schedule immediately with a small delay. The time is
+                            # stored first and the job armed only if that write
+                            # applied; a board delete or unschedule committing after
+                            # it cancels the job itself once its write is done.
                             new_time = get_current_kyiv_time() + timedelta(seconds=10)
+                            if not Database.reschedule_overdue_post(post_id, new_time):
+                                logger.info(f"Post {post_id} changed since the overdue check - not rescheduled")
+                                continue
                             self._schedule_single_post(post_id, new_time)
-                            Database.update_post_schedule(post_id, new_time)
 
                             # Only notify user on first reschedule to avoid spam
                             if current_retry == 1:

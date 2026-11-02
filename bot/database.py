@@ -703,29 +703,86 @@ class Database:
     
     @staticmethod
     def increment_retry_count(post_id: int) -> int:
-        """Increment retry count for a post and return new count"""
+        """Increment the monitor's retry count for a post and return the new count.
+
+        Only a post that is still pending with a scheduled time is counted. A post
+        deleted, unscheduled or claimed for sending since the monitor read it (the
+        web board writes from other threads) is left untouched and 0 is returned.
+        """
         conn = Database.get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute('''
             UPDATE posts
             SET retry_count = retry_count + 1,
-                last_retry_at = ?,
-                status = 'pending'
-            WHERE id = ?
+                last_retry_at = ?
+            WHERE id = ? AND status = 'pending' AND scheduled_time IS NOT NULL
         ''', (kyiv_now_iso(), post_id))
-        
+        changed = cursor.rowcount > 0
+
         # Get the new retry count
         cursor.execute('SELECT retry_count FROM posts WHERE id = ?', (post_id,))
         result = cursor.fetchone()
-        retry_count = result[0] if result else 0
-        
+        retry_count = result[0] if changed and result else 0
+
         conn.commit()
         conn.close()
-        
-        logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
+
+        if changed:
+            logger.info(f"Incremented retry count for post {post_id} to {retry_count}")
+        else:
+            logger.info(f"Post {post_id} is no longer scheduled and pending - retry count left as is")
         return retry_count
-    
+
+    @staticmethod
+    def reschedule_overdue_post(post_id: int, scheduled_time: datetime) -> bool:
+        """Set a new time for an overdue post while it is still pending with a scheduled time.
+
+        The monitor's reschedule write: unlike update_post_schedule it never undoes
+        a delete, an unschedule or a send claim that committed after the monitor
+        read the post. Returns whether the row changed.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE posts
+            SET scheduled_time = ?
+            WHERE id = ? AND status = 'pending' AND scheduled_time IS NOT NULL
+        ''', (serialize_dt(scheduled_time), post_id))
+
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+
+        if changed:
+            logger.info(f"Updated scheduled time for post {post_id} to {scheduled_time}")
+        return changed
+
+    @staticmethod
+    def fail_overdue_post(post_id: int, failure_reason: str) -> bool:
+        """Mark an overdue post failed while it is still pending with a scheduled time.
+
+        The monitor's give-up write, conditional for the same reason as
+        reschedule_overdue_post. Returns whether the row changed.
+        """
+        conn = Database.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE posts
+            SET status = 'failed', failure_reason = ?
+            WHERE id = ? AND status = 'pending' AND scheduled_time IS NOT NULL
+        ''', (failure_reason, post_id))
+
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+
+        if changed:
+            logger.warning(f"Marked post {post_id} as failed: {failure_reason}")
+        return changed
+
     @staticmethod
     def reschedule_all_posts_from_today(user_id: int, start_hour: int, end_hour: int, interval_hours: int, channel_id: Optional[str] = None) -> int:
         """Reschedule all pending posts starting from today with custom hours, interleaving channels"""
