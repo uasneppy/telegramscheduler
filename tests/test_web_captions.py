@@ -131,6 +131,67 @@ def test_rejects_bad_tags(tagged):
     assert info.value.message
 
 
+def _refused(tagged):
+    """The CaptionError message for saving `tagged`; the preview must report the same message."""
+    with pytest.raises(CaptionError) as info:
+        tagged_to_caption(tagged)
+    result = preview(tagged)
+    assert result["ok"] is False and result["html"] is None
+    assert result["error"] == info.value.message
+    return info.value.message
+
+
+@pytest.mark.parametrize(
+    "href, scheme",
+    [
+        ("javascript:alert(1)", "javascript"),
+        ("JaVa\tScript:alert(1)", "javascript"),
+        (" \x01java\nscript:alert(1)", "javascript"),
+        ("&#106;avascript:alert(1)", "javascript"),
+        ("java&#9;script:alert(1)", "javascript"),
+        ("DATA:text/html;base64,PHNjcmlwdD4=", "data"),
+        ("vbscript:msgbox(1)", "vbscript"),
+    ],
+)
+def test_rejects_script_and_data_links(href, scheme):
+    assert _refused(f'<a href="{href}">x</a>') == f"Links to {scheme}: addresses are not allowed."
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "https://x.co",
+        "HTTP://x.co/a?b=javascript:1",
+        "tg://user?id=1",
+        "mailto:a@b.co",
+        "x.co/page",
+        "javascript.example.com",
+        "data.example.com/x",
+        "ftp://x.co",
+    ],
+)
+def test_still_accepts_other_links(href):
+    assert tagged_to_caption(f'<a href="{href}">x</a>') == (
+        "x",
+        [{"type": "text_link", "offset": 0, "length": 1, "url": href}],
+    )
+    assert preview(f'<a href="{href}">x</a>')["ok"] is True
+
+
+@pytest.mark.parametrize("emoji_id", ["abc", "12a", "-5", "1.5", "1 2", "١٢٣", "²"])
+def test_rejects_custom_emoji_id_that_is_not_digits(emoji_id):
+    message = _refused(f'Hi <tg-emoji emoji-id="{emoji_id}">😀</tg-emoji>')
+    assert message == 'A custom emoji id is a number: write <tg-emoji emoji-id="DIGITS">.'
+
+
+def test_custom_emoji_id_of_digits_is_accepted():
+    entity = {"type": "custom_emoji", "offset": 3, "length": 2, "custom_emoji_id": "5368324170671202286"}
+    for emoji_id in ("5368324170671202286", " 5368324170671202286 "):
+        tagged = f'Hi <tg-emoji emoji-id="{emoji_id}">😀</tg-emoji>'
+        assert tagged_to_caption(tagged) == ("Hi 😀", [entity])
+        assert preview(tagged)["ok"] is True
+
+
 @pytest.mark.parametrize("tagged", ["", "  \n", "<b> </b>"])
 def test_empty_is_none(tagged):
     assert tagged_to_caption(tagged) == (None, None)
